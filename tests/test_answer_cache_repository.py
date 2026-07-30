@@ -1,0 +1,100 @@
+"""
+Tests for answer_cache_repository.py: `normalize_question`/`compute_question_hash`'s
+insensitivity (this is what makes trivially-reworded repeat questions hit the
+same cache entry) and the get/save upsert logic. DB-touching calls are
+exercised against a `MagicMock` session — same "no live Postgres needed"
+approach `tests/test_application_repository.py` uses.
+"""
+
+from unittest.mock import MagicMock
+
+from app.services.answer_cache_repository import (
+    compute_question_hash,
+    get_cached_answer,
+    normalize_question,
+    save_answer,
+)
+
+
+# ---------- normalize_question / compute_question_hash ----------
+
+def test_normalize_question_is_case_insensitive():
+    assert normalize_question("What is your Notice Period?") == normalize_question("what is your notice period?")
+
+
+def test_normalize_question_ignores_punctuation():
+    assert normalize_question("What's your notice period?") == normalize_question("whats your notice period")
+
+
+def test_normalize_question_collapses_whitespace():
+    assert normalize_question("  What   is\tyour notice period?  ") == normalize_question("What is your notice period?")
+
+
+def test_compute_question_hash_is_deterministic():
+    q = "Do you require visa sponsorship?"
+    assert compute_question_hash(q) == compute_question_hash(q)
+
+
+def test_compute_question_hash_matches_across_trivial_rewording():
+    a = compute_question_hash("Do you require visa sponsorship?")
+    b = compute_question_hash("do you require visa sponsorship")
+    assert a == b
+
+
+def test_compute_question_hash_differs_for_different_questions():
+    a = compute_question_hash("What is your notice period?")
+    b = compute_question_hash("What is your expected salary?")
+    assert a != b
+
+
+# ---------- get_cached_answer ----------
+
+def test_get_cached_answer_returns_none_on_miss():
+    db = MagicMock()
+    db.query.return_value.filter.return_value.first.return_value = None
+
+    result = get_cached_answer(db, "user-1", "What is your notice period?")
+
+    assert result is None
+
+
+def test_get_cached_answer_returns_the_matching_row():
+    db = MagicMock()
+    fake_entry = MagicMock(answer="30 days", confidence=0.9)
+    db.query.return_value.filter.return_value.first.return_value = fake_entry
+
+    result = get_cached_answer(db, "user-1", "What is your notice period?")
+
+    assert result is fake_entry
+
+
+# ---------- save_answer ----------
+
+def test_save_answer_inserts_a_new_row_when_nothing_cached_yet():
+    db = MagicMock()
+    db.query.return_value.filter.return_value.first.return_value = None
+
+    save_answer(db, "user-1", "What is your notice period?", answer="30 days", source="deterministic", confidence=0.9)
+
+    db.add.assert_called_once()
+    added = db.add.call_args[0][0]
+    assert added.user_id == "user-1"
+    assert added.answer == "30 days"
+    assert added.source == "deterministic"
+    assert added.confidence == 0.9
+    assert added.question_hash == compute_question_hash("What is your notice period?")
+    db.commit.assert_called_once()
+
+
+def test_save_answer_overwrites_an_existing_cached_row_instead_of_duplicating():
+    db = MagicMock()
+    existing = MagicMock(answer="old answer", source="llm", confidence=0.6)
+    db.query.return_value.filter.return_value.first.return_value = existing
+
+    save_answer(db, "user-1", "What is your notice period?", answer="45 days", source="deterministic", confidence=0.9)
+
+    db.add.assert_not_called()  # updated in place, not inserted again
+    assert existing.answer == "45 days"
+    assert existing.source == "deterministic"
+    assert existing.confidence == 0.9
+    db.commit.assert_called_once()

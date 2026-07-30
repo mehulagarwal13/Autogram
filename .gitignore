@@ -1,0 +1,23 @@
+# Environment variables
+.env
+
+# Python virtual environment
+venv/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# VS Code settings (optional)
+.vscode/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Playwright artifacts
+trace.zip
+*.trace
+screenshot*.png
+test-results/
+playwright-report/

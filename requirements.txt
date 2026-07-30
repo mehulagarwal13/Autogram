@@ -1,0 +1,35 @@
+fastapi
+uvicorn[standard]
+python-multipart
+pydantic
+pdfplumber
+python-docx
+sqlalchemy
+openai
+python-dotenv
+sentence-transformers
+httpx
+psycopg2-binary
+alembic
+pgvector
+apscheduler>=3.10,<4.0
+pyjwt
+email-validator
+pytest
+cryptography      # field-level encryption for candidate profile PII (phone, address)
+
+# --- Optional: OCR fallback for scanned/image PDFs ---
+# Uncomment the two lines below AND install the Tesseract engine binary
+# (https://github.com/tesseract-ocr/tesseract) to enable OCR.
+# pypdfium2
+# pytesseract
+
+# --- Auto-apply platform ---
+playwright            # Phase 2: browser automation engine (automation/browser/*)
+# After installing, download the browser binary once:
+#   playwright install chromium
+
+# --- Auto-apply platform (Phase 4+, not yet wired up — see ARCHITECTURE.md) ---
+# redis               # Phase 4: apply-job queue
+# celery              # Phase 4: async worker (or arq, still under evaluation)
+# langgraph           # Phase 6: AI agent orchestration layer
