@@ -229,3 +229,84 @@ def test_no_db_or_user_id_skips_the_cache_entirely_without_erroring():
     engine = ApplicationAnswerEngine(profile=_profile(), llm_fn=_llm_returning(["An honest answer."]))
     result = engine.answer("Why do you want to work here?")
     assert result.answer == "An honest answer."
+
+
+# ---------- model-reported per-answer confidence ----------
+# Both specs require the model to report its own honest confidence per answer
+# so the 0.80 review gate in automation/ats/base.py has a real number to act
+# on. Previously every LLM answer was stamped with one flat constant, which
+# made any such gate either a no-op or a blanket shutoff.
+
+def _llm_returning_objects(entries: list[dict]):
+    def fake_llm_fn(*, task, prompt, system=None, **overrides):
+        return json.dumps({"answers": entries})
+    return fake_llm_fn
+
+
+def test_uses_the_confidence_the_model_reported():
+    engine = ApplicationAnswerEngine(
+        profile=_profile(),
+        llm_fn=_llm_returning_objects([{"answer": "A well-grounded answer.", "confidence": 0.91}]),
+    )
+
+    result = engine.answer("Why do you want to work here?")
+
+    assert result.answer == "A well-grounded answer."
+    assert result.confidence == 0.91
+    assert result.source == "llm"
+
+
+def test_a_bare_string_answer_still_works_and_falls_back_to_the_flat_confidence():
+    """Backward compatibility: a model that ignores the new schema (or any
+    caller/test written against the original contract) must still produce a
+    usable answer rather than failing the whole batch."""
+    engine = ApplicationAnswerEngine(
+        profile=_profile(), llm_fn=_llm_returning(["A plain string answer."]),
+    )
+
+    result = engine.answer("Why do you want to work here?")
+
+    assert result.answer == "A plain string answer."
+    assert result.confidence == answer_engine_module.LLM_CONFIDENCE
+
+
+def test_an_out_of_range_confidence_is_clamped_not_trusted():
+    """A model must not be able to claim its way past the review gate."""
+    engine = ApplicationAnswerEngine(
+        profile=_profile(),
+        llm_fn=_llm_returning_objects([{"answer": "Overconfident.", "confidence": 7.5}]),
+    )
+    assert engine.answer("Why here?").confidence == 1.0
+
+    engine = ApplicationAnswerEngine(
+        profile=_profile(),
+        llm_fn=_llm_returning_objects([{"answer": "Negative.", "confidence": -3}]),
+    )
+    assert engine.answer("Why here?").confidence == 0.0
+
+
+def test_a_non_numeric_confidence_falls_back_instead_of_crashing():
+    engine = ApplicationAnswerEngine(
+        profile=_profile(),
+        llm_fn=_llm_returning_objects([{"answer": "Fine answer.", "confidence": "high"}]),
+    )
+
+    result = engine.answer("Why do you want to work here?")
+
+    assert result.answer == "Fine answer."
+    assert result.confidence == answer_engine_module.LLM_CONFIDENCE
+
+
+def test_per_answer_confidence_is_kept_aligned_across_a_batch():
+    engine = ApplicationAnswerEngine(
+        profile=_profile(),
+        llm_fn=_llm_returning_objects([
+            {"answer": "Grounded.", "confidence": 0.95},
+            {"answer": "Guessing.", "confidence": 0.2},
+        ]),
+    )
+
+    results = engine.answer_batch(["Why here?", "Describe a conflict you resolved."])
+
+    assert [r.answer for r in results] == ["Grounded.", "Guessing."]
+    assert [r.confidence for r in results] == [0.95, 0.2]

@@ -36,6 +36,7 @@ algorithm change.
 from __future__ import annotations
 
 import re
+from functools import lru_cache
 
 # Canonical CandidateProfile attribute -> known label/placeholder/name
 # synonyms across ATS platforms. Keys match real `app.models.db_models
@@ -128,11 +129,35 @@ def _normalize_name_or_id_variants(value: str) -> list[str]:
     return [contiguous] if contiguous == split else [contiguous, split]
 
 
+@lru_cache(maxsize=512)
+def _synonym_pattern(synonym: str) -> re.Pattern[str]:
+    """A synonym must match on WORD BOUNDARIES, not as a bare substring.
+
+    Plain containment produced a genuinely dangerous false positive on a live
+    Lever form: the label "Are you legally authorized to work in the United
+    States?" matched the `state` synonym — "state" sits inside "States" — and
+    resolved to `('state', 0.9)`. That's above the 0.85 auto-submit bar, so the
+    candidate's home state would have been typed into a work-authorization
+    question and submitted. "province" inside "provincial", "city" inside
+    "capacity", and "currency" inside "concurrency" are the same failure
+    waiting to happen.
+
+    This does NOT loosen the "simple and explainable" contract in the module
+    docstring, and it does not change the deliberate `name="company"` behaviour
+    described there — a synonym still has to appear verbatim in the signal,
+    just as whole words rather than as any character run."""
+    return re.compile(rf"\b{re.escape(synonym)}\b")
+
+
+def _matches_synonym(normalized: str, synonyms: list[str]) -> bool:
+    return any(_synonym_pattern(synonym).search(normalized) for synonym in synonyms)
+
+
 def _first_matching_attribute(normalized: str) -> str | None:
     if not normalized:
         return None
     for attribute, synonyms in FIELD_SYNONYMS.items():
-        if any(synonym in normalized for synonym in synonyms):
+        if _matches_synonym(normalized, synonyms):
             return attribute
     return None
 
@@ -140,7 +165,7 @@ def _first_matching_attribute(normalized: str) -> str | None:
 def _first_matching_attribute_any_variant(normalized_variants: list[str]) -> str | None:
     for attribute, synonyms in FIELD_SYNONYMS.items():
         for normalized in normalized_variants:
-            if normalized and any(synonym in normalized for synonym in synonyms):
+            if normalized and _matches_synonym(normalized, synonyms):
                 return attribute
     return None
 

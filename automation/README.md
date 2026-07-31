@@ -556,3 +556,319 @@ All of the above is covered by `automation/tests/test_phase8_audit_fixes.py`
 the CountryPickerHandler virtualized+alias case from item 4) — like every
 other test in this module, not executed in this environment (no Playwright
 runner available here); traced by hand against the real implementation.
+
+## Option-aware answering
+
+`ApplicationAnswerEngine` used to receive questions as bare strings, which
+meant it was answering fixed-choice controls blind: it could only produce
+prose, and nothing stopped it proposing a choice the form doesn't offer.
+Prose is useless for a `<select>`, and an invented choice is worse than
+useless — `field_handlers` would try to select a value the DOM has no option
+for and report a `FieldFailure`.
+
+**What flows now.** `ATSAdapter._fill_questions_via_answer_engine()` describes
+each pending control once, reads its real choices via
+`field_handlers.read_field_options()`, and passes them as
+`answer_engine.Question(text, options)`. The engine then:
+
+- appends `_OPTION_PROMPT` to its system prompt (only when the batch actually
+  contains options — a prose-only form produces byte-for-byte the prompt it
+  did before), instructing the model to answer with one listed option
+  verbatim, matched on MEANING rather than wording;
+- re-resolves whatever comes back against the real option list in
+  `_match_option` and replaces it with the verbatim option string. **Prompting
+  is not the mechanism — this is.** A model that ignores the instruction
+  cannot get an invented choice onto the page;
+- declines (empty answer, `0.0` confidence) when the answer resolves to
+  nothing, or to two options equally — the existing
+  `ANSWER_REVIEW_CONFIDENCE_THRESHOLD` path then leaves the field for a human
+  rather than filling a near-miss.
+
+`_match_option` is three tiers, tightest first: exact equality, then
+case/whitespace-normalized equality, then containment **only when exactly one
+option matches** (so `"Yes"` resolves against `["Yes, now or in the future",
+"No"]`, but not against `["Yes, I am authorized", "Yes, with sponsorship"]`).
+Ambiguity is never broken by picking the first or longest candidate — same
+"never guess between plausible matches" rule `FieldMapper` follows.
+
+Deterministic answers get snapped to the form's own wording too
+(`requires_sponsorship=False` + `["YES", "NO"]` → `"NO"`). A profile fact that
+*can't* be mapped mechanically (`"US Citizen"` against `["Yes", "No"]`) falls
+through to the LLM, which can read it semantically — that widens what gets
+answered without widening what can be typed, since the LLM's answer is
+option-validated on the way back out. **Demographic answers are the exception
+that never falls through**: an unmappable stored demographic goes to a human,
+because inferring one is exactly what that path exists to prevent.
+
+`AnswerResult.available_options` echoes the list back on every result,
+including declined ones, so a review UI can show a human the real choices
+instead of making them re-read the form.
+
+**How each widget's options get read.** Native `<select>` reads from
+`el.options`; radio-flavored groups (native radio, `role="radio"`, button
+choices) reuse `RadioHandler`'s own group resolution, so the engine sees
+exactly the options the handler will later select among. Neither touches the
+page.
+
+Custom dropdowns (react-select, ARIA combobox/listbox) are **probed**:
+`_probe_dropdown_options()` clicks the trigger, waits for the popup, reads the
+options, and presses Escape. It never clicks an option, so it cannot change
+the field's value.
+
+That probe was deliberately left out of the first version of this work, on the
+principle that a pre-answer read should be side-effect-free — and that was
+wrong in a way worth recording. On a real Greenhouse posting
+(`job-boards.greenhouse.io`), *every* screening dropdown is exactly this kind
+of widget, so refusing to open them meant the engine answered all of them
+blind and the feature didn't reach the case it was built for. Clicking a
+trigger open and pressing Escape is what a human applicant does before
+deciding, and `_DropdownHandler` re-opens the widget from scratch at fill time
+regardless. Two honest limits remain: a **searchable** dropdown that fetches
+options as you type shows only its initial results here, and a **virtualized**
+list only materializes its visible window — so for a long list (countries,
+universities) these options are a sample, not the full set. That's fine for
+the screening questions this exists for, and is why `_match_option` treats
+"not in the list" as a reason to ask a human rather than proof the answer is
+wrong.
+
+**Cache.** Keyed by question TEXT alone, so the same question can return with
+a different option set. A cached answer is re-resolved against the current
+form's options and a hit that resolves to nothing is treated as a **miss** —
+one extra LLM call is cheaper than handing the page a value it has no option
+for.
+
+## Answers, not commentary
+
+Observed on a live Greenhouse posting: the salary field received *"The
+candidate profile does not specify CTC expectations."* and the preferred-name
+field *"My preferred name is not specified in the profile; please use the
+candidate's..."*. Both were typed into the employer's form and read by a human
+as the candidate's own words.
+
+Two causes, both now fixed:
+
+1. **`_SYSTEM_PROMPT` asked for it.** It said to "answer honestly and
+   generically instead of making one up" when a fact was missing — so the
+   model wrote an honest, generic sentence about the fact being missing. It
+   now says the opposite: if you don't have what the question asks for, return
+   `null` and let a human fill it in. It also now distinguishes value
+   questions from prose questions — "Navikenz", not "My most recent employer
+   is Navikenz" (the other thing that posting got wrong).
+2. **The confidence gate couldn't catch it.** The model rated that answer
+   above `ANSWER_REVIEW_CONFIDENCE_THRESHOLD` (0.80), because as a *sentence*
+   it was accurate. Self-reported confidence can't police form-of-answer, so
+   `_META_COMMENTARY_PATTERNS` does it in code — same "the prompt asks, the
+   code decides" split as `_match_option`. A match is discarded outright, at
+   `0.0` confidence, before option matching even runs.
+
+The pattern list is deliberately conservative — each entry is phrasing that
+could only ever be commentary addressed to the operator. Note `"the candidate
+profile"` is listed but plain `"the candidate"` is not: *"the ideal candidate
+for this role..."* is a legitimate opening for a real free-text answer.
+
+`Question` is a `str` subclass rather than a dataclass, deliberately: a
+question has been a bare string for this class's whole existence, and every
+ATS adapter test double duck-types `answer_batch(list[str])`. Being a real
+string means all of that keeps working untouched while option-aware code
+reads `.options` off the same object.
+
+Covered by `automation/tests/test_answer_engine_options.py` (26 tests, most of
+which simulate a model *ignoring* the instructions — the whole point is that
+the DOM's option list and the pattern check, not the model's word, decide what
+may be typed) and `automation/tests/test_read_field_options.py` (10 tests
+against real rendered widgets, including a Greenhouse-shaped dropdown whose
+options only exist once opened, and assertions that probing leaves it closed
+and unset).
+
+Unlike the Phase 8 work above, these were executed. Pre-existing failures
+elsewhere in the suite are unrelated to this change and reproduce identically
+at `HEAD`.
+
+## Three bugs only a real form exposed
+
+Validated against the live posting at `job-boards.greenhouse.io` (read the
+options, fill the dropdowns; never submitted). Option-reading was necessary
+but nowhere near sufficient — the fill path was broken on that markup in three
+independent ways, and every existing fixture was too tidy to show any of them.
+The shared pattern: **helpers that search the whole `page` where they should
+search the field's own widget.** Fine with one dropdown on the page, wrong with
+nine.
+
+**1. A decoy option container.** `_LISTBOX_SELECTOR`'s `div[class*='dropdown' i]`
+branch matches intl-tel-input's phone-country wrapper (`div.iti--inline-dropdown`),
+which sits on every Greenhouse application, is permanently visible, and holds
+244 country options — all hidden. `_find_listbox_container()` returns the FIRST
+visible match, so both the probe and `_find_matching_option()` inspected that
+decoy, found no visible options, and concluded the dropdown was empty; the real
+`select__menu-list` was two nodes further down the same query. Fixed with
+`_option_containers()`, which returns every visible container that actually
+holds visible options, and callers that scan all of them.
+
+**2. Page-global search-input lookup.** Every react-select question is an
+`input[role='combobox'][aria-autocomplete='list']`, so that form has nine
+`_SEARCH_INPUT_SELECTOR` matches, all visible. `_DropdownHandler.fill()` called
+`_find_search_input(page)`, got the first one, and typed every answer into
+question 1. Fixed with `_field_search_input(field)` — the field itself, then
+inside it, then its immediate shell — before any page-wide fallback.
+
+**3. The value isn't on the element the label points at.** `<label for=...>`
+resolves to react-select's `input`, which has no children, is set to
+`opacity: 0` once a value is chosen, and has its `value` cleared by the
+library. All three lookups in `_read_dropdown_displayed_value()` therefore came
+back empty on a dropdown that had just been filled *correctly*: `verify()`
+failed, `fill_field()` burned all three attempts re-selecting an
+already-selected option, and reported `verification_failed`. The chosen text is
+one hop up, in a sibling `select__single-value`. Fixed with
+`_display_value_scopes()`, which also checks the widget's `control`/`container`
+ancestor.
+
+That third fix is deliberately narrow: ancestor scopes are used ONLY with the
+explicit `_DISPLAY_VALUE_SELECTOR`, never with a broad `inner_text()`. On this
+very form `select__container` includes the question's own label, and
+`_values_match` is substring-tolerant in both directions — so reading a
+container's whole text would let the label *"...If not, are you willing to
+relocate..."* satisfy a check for the value `"No"`. There's a regression test
+for exactly that.
+
+Fixing (1) and (3) also fixed a pre-existing suite failure,
+`test_ats_pattern_fixtures.py::test_lever_style_dropdown_selects_referral`,
+which had been failing at `HEAD`.
+
+Pinned by `automation/tests/test_dropdown_live_form_shapes.py` — two
+react-select widgets plus the phone-widget decoy, rather than the single tidy
+dropdown the other fixtures use. The four fill/verify tests in it were
+confirmed to FAIL at `HEAD` and pass after the fix.
+
+**Live result.** All three screening dropdowns on that posting now read
+`('Yes', 'No')`, fill with the intended value, and verify — `filled: True`,
+`actual='Yes'`/`'No'`, no retries. The probe leaves each widget closed and
+unset.
+
+## Unlabeled questions (Lever) + a dangerous synonym match
+
+Found by running the sweep against a live Lever posting
+(`jobs.lever.co/AIFund/.../apply`) whose four required screening questions came
+out completely empty.
+
+**They were structurally unreachable, not mis-filled.** That page has ten
+`<label>` elements and every one belongs to a standard field (resume, name,
+email, phone, location, company, URLs). The screening questions have no
+`<label>`, no `aria-label`, no `aria-labelledby`, and no `id` a label could
+point at — the question text is a plain sibling `<div class="text">`:
+
+```html
+<li class="application-question custom-question">
+  <div>Are you legally authorized to work in the United States?✱</div>
+  <div class="application-field required-field">
+    <input type="text" name="cards[<uuid>][field2]" placeholder="Type your response" required>
+  </div>
+</li>
+```
+
+So `_fill_questions_by_label` was blind to them and
+`_fill_questions_by_name_or_placeholder` had only `cards[<uuid>][field2]` and
+`"Type your response"` to work with, neither of which matches anything.
+`_fill_questions_by_nearby_text` (pass 1b) recovers the text by walking up a
+few ancestors and taking the first whose text reads like a question **while
+that ancestor still contains exactly one control** — which is what stops it at
+the `<ul>` instead of scooping up the whole form. Recovered questions join the
+SAME batched answer-engine call as the labeled ones, so this costs no extra LLM
+call. Matches are scored `NEARBY_TEXT_MATCH_CONFIDENCE` (0.55), deliberately
+below the auto-submit bar: proximity-recovered text is a weaker signal than a
+real label.
+
+Two things about that page worth keeping in mind: there are **five** screening
+inputs, not the four that are visible, and Lever ships a hidden
+`cards[<uuid>][baseTemplate]` decoy input whose ancestor chain jumps straight to
+the whole form — the single-control guard is what rejects it.
+
+**Pass 1b runs before pass 2, which needed an explicit precedence guard.**
+`FieldMapper`'s tiers are name/id (0.97) > label (0.9) > placeholder (0.75) >
+nearby text (0.55), but 1b has to run early to make the single batched engine
+call. Without a guard that ordering silently outranks a stronger signal: a bare
+`<input name="linkedin_url">` with no label would be claimed by 1b on proximity
+text, marked examined, and queued for the engine — and with no engine injected
+the pending list is discarded, leaving the field EMPTY when pass 2 would have
+filled it deterministically. 1b now checks `map_field(name=, placeholder=)`
+first and leaves any such field completely untouched.
+
+**The synonym bug this exposed is the more serious finding.** `FieldMapper`
+matched synonyms by plain substring containment, so:
+
+```
+"Are you legally authorized to work in the United States?"  ->  ('state', 0.9)
+```
+
+`"state"` sits inside `"States"`. At 0.9 — above the 0.85 auto-submit bar — the
+candidate's home state would have been typed into a work-authorization question
+and submitted. Matching is now anchored to word boundaries
+(`_synonym_pattern`), which fixes it without loosening the "simple and
+explainable" contract or changing the deliberate `name="company"` behaviour:
+
+```
+"...authorized to work in the United States?"  ->  ('work_authorization', 0.9)
+"...require visa sponsorship...United States?" ->  ('requires_sponsorship', 0.9)
+"State" / "State/Province"                     ->  ('state', 0.9)   # unchanged
+```
+
+`"province"` in `"provincial"`, `"city"` in `"capacity"`, and `"currency"` in
+`"concurrency"` were the same failure waiting to happen.
+
+**Status.** The synonym fix is verified (21/21 mapper tests) and the text
+recovery is confirmed correct at the DOM level — each real input yields exactly
+its own question. The end-to-end pairing on the live form is NOT yet confirmed:
+a run mis-paired two questions with their inputs, and that harness passed
+`profile=None`, so whether the fault is the code or the stub is still open. Not
+claimed as working until that's separated.
+
+## Human-paced input
+
+`automation/utils/human_input.py`, called from `field_handlers`, so all ten
+handlers and all ten adapters inherit it rather than each fill path
+re-implementing it: scroll into view → settle 500–1200ms → click → settle
+200–500ms → clear → type character by character at 30–90ms → pause 2s before
+the next field.
+
+**The reason is correctness first, realism second.** Playwright's `fill()` sets
+the value and dispatches one `input` event. Plenty of ATS fields accept that,
+but a control listening for real keystrokes — an autocomplete that filters as
+you type, a react-select search box, a masked phone input, a character counter
+gating the Submit button — sees a single bulk mutation and either ignores it or
+lands in an inconsistent state. `press_sequentially()` produces a genuine
+`keydown`/`keypress`/`input`/`keyup` stream per character, which is what those
+widgets are written against. The secondary benefit is that filling thirty
+fields in under a second is a traffic pattern no applicant produces, and some
+boards throttle on it.
+
+Three deliberate limits:
+
+- **Per-chunk, not per-character, delays.** `press_sequentially` takes ONE
+  delay for the whole string, so a literal per-character random delay would
+  mean one round-trip per character — ~500 for a cover-letter answer, costing
+  far more in IPC than it buys. Typing in 8-character chunks with a freshly
+  rolled delay each time gives varying cadence at a fraction of the overhead.
+- **`MAX_TYPED_CHARS` (400) falls back to `fill()`.** A 2,000-character cover
+  letter at 60ms/char is two minutes of typing for a `<textarea>` with no
+  keystroke-sensitive behaviour — the correctness argument simply doesn't apply
+  to long-form prose, and the cost is real.
+- **`input[type=date]` is never typed.** It renders as segmented day/month/year
+  spinners whose keystroke handling follows the browser locale, so typing
+  `1990-05-14` lands the parts in a different order per locale. `fill()` sets
+  the unambiguous ISO value the element actually stores.
+
+The field must also be cleared before typing (`press_sequentially` appends —
+otherwise re-filling a pre-populated field yields `"AdaAda"`), and every step
+degrades to a plain `fill()` on error, since `fill_field()`'s verify step is
+what ultimately decides success.
+
+Controlled by `AUTOMATION_HUMAN_PACING` (**on by default**; any of
+`0`/`false`/`no`/`off` disables it). `automation/tests/conftest.py` sets it to
+`0` — the suite fills hundreds of fields and 2s apiece alone would add over an
+hour. `automation/tests/test_human_input.py` re-enables it per-test and asserts
+on the recorded `keydown`/`input` event stream rather than wall-clock timing,
+which would be flaky.
+
+**Live result.** The same three dropdowns fill and verify correctly with pacing
+ON, at roughly 7s per field including the option probe and the inter-field
+pause. Budget ~2–3s per field: a 30-field form goes from seconds to about two
+minutes.

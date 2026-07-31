@@ -24,7 +24,8 @@ couldn't resolve get answered instead of just left blank.
 from __future__ import annotations
 
 import logging
-from concurrent.futures import ThreadPoolExecutor
+import threading
+from concurrent.futures import Future
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Response
 from sqlalchemy.orm import Session
@@ -49,13 +50,41 @@ router = APIRouter(prefix="/applications", tags=["applications"])
 # calling thread. `_run_application` already runs off the request thread via
 # FastAPI's `BackgroundTasks`, but that alone isn't a hard guarantee of "no
 # event loop nearby" in every deployment/runner — so Playwright is launched
-# on a dedicated plain `concurrent.futures` worker thread instead, which
-# never has an asyncio loop associated with it, period. This is the
-# officially recommended way to run Playwright's sync API from inside any
-# asyncio-based app. One process-wide executor is enough; each submitted run
-# still executes one at a time per call, just off of whatever thread
-# `_run_application` itself happened to land on.
-_PLAYWRIGHT_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="playwright-run")
+# on a dedicated plain thread instead, which never has an asyncio loop
+# associated with it, period. This is the officially recommended way to run
+# Playwright's sync API from inside any asyncio-based app.
+#
+# Deliberately NOT a shared `ThreadPoolExecutor`: `sync_playwright().start()`
+# spins up its own internal asyncio loop + greenlet dispatcher that keeps
+# "pumping" on whatever thread called it for as long as that Playwright
+# driver stays open — and a `copilot_review`/`needs_review`/`manual_required`
+# run leaves its browser (and driver) open ON PURPOSE (see
+# `ApplicationFlowManager._finish_browser_session`/`should_keep_browser_open`)
+# so a human can look at it, for as long as it takes someone to call
+# `close_review_session()`. On a small reusable pool, that permanently pins
+# one of the pool's threads into a "loop already running" state; the next
+# unrelated run that happens to land on that recycled thread then hits this
+# exact error — not a flake, a guaranteed failure once enough review sessions
+# pile up (4 of them exhausts a 4-worker pool for good). A fresh,
+# never-recycled thread per run means a held-open review session just parks
+# its own thread forever instead of poisoning one everyone else shares.
+def _run_on_dedicated_thread(fn):
+    """Runs `fn()` to completion on a brand-new thread that's used exactly
+    once and then discarded, returning its result or re-raising its
+    exception on the calling thread. See the module-level comment above for
+    why this can't be a shared/reusable thread pool."""
+    future: Future = Future()
+
+    def _target() -> None:
+        if not future.set_running_or_notify_cancel():
+            return
+        try:
+            future.set_result(fn())
+        except BaseException as e:  # noqa: BLE001 - propagate exactly as-is to the caller
+            future.set_exception(e)
+
+    threading.Thread(target=_target, name="playwright-run", daemon=True).start()
+    return future.result()
 
 
 def _get_owned_application(db: Session, application_id: str, user: User) -> Application:
@@ -82,6 +111,26 @@ def _pick_resume_document_id(db: Session, profile_id: str, requested_document_id
     return default.document_id
 
 
+# Every value `Application.status` can hold (see db_models.VALID_APPLICATION_STATUSES)
+# bucketed into exactly what POST /start does about it:
+#   - RETRYABLE: nothing actually succeeded — safe to re-run on the same row.
+#     `needs_review` (confidence too low to trust) belongs here for the same
+#     reason `failed` and `manual_required` (CAPTCHA) do: no successful
+#     outcome happened, there's nothing to conflict with.
+#   - IN_PROGRESS: a run is either about to start, actively running, or
+#     (`copilot_review`) sitting with its browser deliberately left open for
+#     a human to submit — see ApplicationFlowManager.should_keep_browser_open.
+#     Retrying here could race an in-flight run or blow away a live review
+#     session, so it's rejected instead.
+#   - COMPLETED: the job was actually applied to — retrying would risk a
+#     double-apply, which ARCHITECTURE.md's idempotency rule exists to
+#     prevent.
+# The three sets are exhaustive and disjoint over VALID_APPLICATION_STATUSES.
+RETRYABLE_STATUSES = frozenset({"failed", "manual_required", "needs_review"})
+IN_PROGRESS_STATUSES = frozenset({"pending", "processing", "copilot_review"})
+COMPLETED_STATUSES = frozenset({"applied"})
+
+
 @router.post("/start", response_model=ApplicationResponse, status_code=202)
 def start_application(
     body: ApplicationStartRequest,
@@ -91,16 +140,25 @@ def start_application(
     db: Session = Depends(get_db),
 ):
     """Idempotent per (user, job_url) — ARCHITECTURE.md's "never double-apply"
-    rule. If an attempt already exists for this job, it's returned as-is
-    (200, nothing new started) rather than starting a second run; retrying a
-    failed/needs_review application is a distinct feature (Phase 4+, not yet
-    built)."""
+    rule — except a RETRYABLE_STATUSES attempt never actually succeeded, so
+    there's nothing to double-apply: it's retried on the same row instead of
+    inserting a second one. An IN_PROGRESS_STATUSES or COMPLETED_STATUSES
+    attempt is rejected with 409 rather than silently doing nothing, so a
+    caller can't mistake "no-op" for "started"."""
     job_url = str(body.job_url)
-
     existing = application_repository.get_by_user_and_url(db, user.user_id, job_url)
-    if existing:
-        response.status_code = 200
-        return existing
+
+    if existing is not None:
+        if existing.status in IN_PROGRESS_STATUSES:
+            raise HTTPException(status_code=409, detail="Application is already in progress.")
+        if existing.status in COMPLETED_STATUSES:
+            raise HTTPException(status_code=409, detail="Application has already been completed.")
+        if existing.status not in RETRYABLE_STATUSES:
+            # No known status falls outside the three sets above, but if a
+            # new one is ever added without updating them, fail safe by
+            # leaving the row untouched rather than guessing.
+            response.status_code = 200
+            return existing
 
     profile = profile_repository.get_by_user_id(db, user.user_id)
     if not profile:
@@ -116,14 +174,22 @@ def start_application(
             detail="No resume on file. Upload one with POST /profile/documents/upload first.",
         )
 
-    application = application_repository.create_application(
-        db,
-        user_id=user.user_id,
-        job_url=job_url,
-        autopilot_enabled=body.autopilot_enabled,
-        company=body.company,
-        position=body.position,
-    )
+    if existing is None:
+        application = application_repository.create_application(
+            db,
+            user_id=user.user_id,
+            job_url=job_url,
+            autopilot_enabled=body.autopilot_enabled,
+            company=body.company,
+            position=body.position,
+        )
+    else:
+        # Retry: same row (same application_id/created_at/job_url_hash), so
+        # the unique constraint stays satisfied and its AutomationRun
+        # history from apply_run_result is kept.
+        application = application_repository.retry_application(
+            db, existing, company=body.company, position=body.position, autopilot_enabled=body.autopilot_enabled,
+        )
 
     background_tasks.add_task(
         _run_application, application.application_id, resume_document_id, body.job_description,
@@ -243,10 +309,12 @@ def _run_application(application_id: str, resume_document_id: str, job_descripti
             headless=False if not application.autopilot_enabled else None,
             answer_engine=answer_engine,
         )
-        # See _PLAYWRIGHT_EXECUTOR's docstring: Playwright's sync API must
-        # run on a thread that was never touched by asyncio, hence the
-        # dedicated executor rather than calling manager.run() directly here.
-        result = _PLAYWRIGHT_EXECUTOR.submit(manager.run).result()
+        # See _run_on_dedicated_thread's docstring: Playwright's sync API
+        # must run on a thread that was never touched by asyncio AND won't
+        # be handed to some other run later if this one leaves its browser
+        # open for review, hence the fresh one-off thread rather than a
+        # shared pool or calling manager.run() directly here.
+        result = _run_on_dedicated_thread(manager.run)
         application_repository.apply_run_result(db, application, result)
     except Exception:
         logger.exception("Background application run crashed for %s", application_id)

@@ -61,8 +61,8 @@ from playwright.sync_api import Error as PlaywrightError, Locator
 
 from app.core.crypto import decrypt_field
 from automation.browser.selectors import find_file_upload_input, find_upload_trigger_button
-from automation.forms.answer_engine import ApplicationAnswerEngine
-from automation.forms.field_handlers import FieldFailure, describe_field, fill_field
+from automation.forms.answer_engine import ApplicationAnswerEngine, Question
+from automation.forms.field_handlers import FieldFailure, describe_field, fill_field, read_field_options
 from automation.forms.field_mapper import FieldMapper
 from automation.interfaces import CandidateProfile, ProfileDocument
 
@@ -72,6 +72,17 @@ logger = logging.getLogger(__name__)
 # three fill paths) so later passes never double-process — and double-count
 # toward `ApplicationFlowManager`'s confidence score — the same field.
 _AUTOMATION_EXAMINED_ATTR = "data-automation-examined"
+
+# A per-pass stable identity for each candidate field, written once up front by
+# `_stamp_candidates()`.
+#
+# This exists because `_AUTOMATION_EXAMINED_ATTR` appears in the very selector
+# the sweep iterates (`_MAPPABLE_FIELD_SELECTOR_TEMPLATE`), and `Locator.all()`
+# does NOT snapshot elements — see `_stamp_candidates`. Addressing candidates
+# by a unique attribute of their own instead means writing the examined marker
+# can never change what an in-flight locator points at, so marking is free to
+# happen at the correct time (after the fill) rather than early.
+_AUTOMATION_CANDIDATE_ATTR = "data-automation-candidate"
 
 # Fields the name/placeholder pass can meaningfully fill by calling
 # `.fill()`/`.select_option()` on. Deliberately excludes checkbox/radio
@@ -116,6 +127,18 @@ _ENCRYPTED_PROFILE_PROPERTIES = frozenset({"phone", "address"})
 # submission. Deliberately a narrow keyword list, not "check every
 # checkbox" — gated by required-ness too (see `_fill_consent_checkboxes`) so
 # an optional, non-required opt-in ("Send me job alerts") is never touched.
+# A GENERATED answer (as opposed to one read straight out of the candidate's
+# profile) is only auto-filled when the answer engine reports at least this
+# much confidence in it; below this, the field is left blank for a human.
+#
+# 0.80 is not arbitrary — it is the threshold both specs independently settled
+# on for "take this action yourself vs. hand it to a human." Note this gates
+# only `_fill_questions_via_answer_engine`: deterministic answers come from
+# real profile columns at `DETERMINISTIC_CONFIDENCE` and are unaffected, as
+# are cache hits, which carry forward whatever confidence they were stored
+# with.
+ANSWER_REVIEW_CONFIDENCE_THRESHOLD = 0.80
+
 _CONSENT_CHECKBOX_KEYWORDS = (
     "i agree", "agree to", "i consent", "consent to", "i acknowledge",
     "acknowledge that", "i accept", "accept the", "terms and conditions",
@@ -374,9 +397,12 @@ class ATSAdapter(ABC):
 
     def _fill_known_questions(self) -> list[FieldFillResult]:
         """Generic, cross-ATS sweep of the page: every `<label>`'s text
-        first (Phase 5 — `FieldMapper`), then — if an `ApplicationAnswerEngine`
-        was injected (Phase 6) — every labeled-but-unmatched question that
-        pass collected, batched into one call, then — for anything still not
+        first (Phase 5 — `FieldMapper`), then every UNLABELED control whose
+        question text can be recovered from the surrounding markup
+        (`_fill_questions_by_nearby_text` — this is the only pass that reaches
+        Lever's screening questions), then — if an `ApplicationAnswerEngine`
+        was injected (Phase 6) — every unmatched question those two passes
+        collected, batched into one call, then — for anything still not
         examined — every remaining input/select/textarea's `name`/
         `placeholder` attributes directly, which catches fields an ATS
         renders with no `<label>` at all, then finally any required
@@ -385,6 +411,7 @@ class ATSAdapter(ABC):
         left unfilled — not reported as failures, just not this run's to
         answer (or, with no engine injected, exactly Phase 5's behavior)."""
         results = self._fill_questions_by_label()
+        results.extend(self._fill_questions_by_nearby_text())
         results.extend(self._fill_questions_via_answer_engine())
         results.extend(self._fill_questions_by_name_or_placeholder())
         results.extend(self._fill_consent_checkboxes())
@@ -525,13 +552,40 @@ class ATSAdapter(ABC):
         """Phase 6: batches every labeled-but-unmatched question collected
         during the label pass into ONE `ApplicationAnswerEngine.answer_batch()`
         call, then fills whatever it could answer. Returns `[]` immediately
-        (no-op) if no engine was injected, or nothing was collected."""
+        (no-op) if no engine was injected, or nothing was collected.
+
+        Each question carries the control's real choices when it has any (a
+        `<select>`, a radio group), so the engine picks among strings the DOM
+        actually offers instead of writing prose at a dropdown — see
+        `automation/README.md`'s "Option-aware answering"."""
         pending = self._pending_answer_engine_questions
         self._pending_answer_engine_questions = []
         if not self.answer_engine or not pending:
             return []
 
-        questions = [text for text, _ in pending]
+        # Introspect each control ONCE, up front, for two reasons: the
+        # resulting `Field` is reused verbatim for the fill below (no second
+        # round-trip), and a fixed-choice control's real options go INTO the
+        # question. Without that the engine is answering blind — it can only
+        # write prose, which is useless for a <select>, and nothing stops it
+        # proposing a choice the DOM doesn't have. `read_field_options` is
+        # read-only and returns `()` for anything that isn't a fixed-choice
+        # widget, which is exactly the old free-text behavior.
+        # Describe FIRST, then mark. The collecting passes deliberately leave
+        # these unmarked precisely so this describe still resolves — marking a
+        # field whose locator is predicated on the examined attribute makes it
+        # resolve to zero elements and stalls `describe_field` for the full
+        # Playwright timeout. See `_stamp_candidates`.
+        fields = [
+            describe_field(input_locator, label=text, page=self.page, profile_attribute="answer_engine")
+            for text, input_locator in pending
+        ]
+        for _text, input_locator in pending:
+            self._mark_examined(input_locator)
+        questions = [
+            Question(text=text, options=read_field_options(field))
+            for (text, _), field in zip(pending, fields)
+        ]
         try:
             answers = self.answer_engine.answer_batch(questions)
         except Exception as e:  # noqa: BLE001 - a broken AnswerEngine call must never abort the whole sweep
@@ -545,17 +599,204 @@ class ATSAdapter(ABC):
             ]
 
         results: list[FieldFillResult] = []
-        for (text, input_locator), answer_result in zip(pending, answers):
+        for (text, _input_locator), field, answer_result in zip(pending, fields, answers):
             profile_path = f"answer_engine:{answer_result.source}"
+            field.profile_attribute = profile_path
             if not answer_result.answer:
                 results.append(FieldFillResult(field_key=text, profile_path=profile_path, value_used=None, confidence=0.0, filled=False))
                 continue
 
-            field = describe_field(input_locator, label=text, page=self.page, profile_attribute=profile_path)
+            # A generated answer the engine itself isn't confident in must not
+            # be typed into a real application on the candidate's behalf —
+            # leave the field empty so a human answers it. Reported as
+            # unfilled, which correctly drags the run's aggregate confidence
+            # down and routes it to review rather than auto-submit.
+            if answer_result.confidence < ANSWER_REVIEW_CONFIDENCE_THRESHOLD:
+                logger.info(
+                    "%s: leaving %r for a human — generated answer confidence %.2f is below %.2f.",
+                    self.name, text, answer_result.confidence, ANSWER_REVIEW_CONFIDENCE_THRESHOLD,
+                )
+                results.append(FieldFillResult(
+                    field_key=text, profile_path=profile_path, value_used=None,
+                    confidence=0.0, filled=False,
+                ))
+                continue
+
             outcome = fill_field(field, answer_result.answer, context=self._fill_context())
             results.append(FieldFillResult(
                 field_key=text, profile_path=profile_path, value_used=answer_result.answer,
                 confidence=answer_result.confidence if outcome.filled else 0.0, filled=outcome.filled, failure=outcome.failure,
+            ))
+
+        return results
+
+    #: JS that recovers the question text for a control with no `<label>`.
+    #: Walks up a few ancestors and returns the first one whose text (minus
+    #: the form controls themselves) reads like a question — but ONLY while
+    #: that ancestor contains exactly one control, which is what keeps it from
+    #: climbing out of the question and scooping up the whole form's text.
+    _NEARBY_QUESTION_TEXT_JS = """
+    el => {
+      let cur = el;
+      for (let i = 0; i < 5 && cur.parentElement; i++) {
+        cur = cur.parentElement;
+        if (cur.querySelectorAll('input, textarea, select').length !== 1) break;
+        const clone = cur.cloneNode(true);
+        clone.querySelectorAll('input, textarea, select, button').forEach(n => n.remove());
+        const text = (clone.textContent || '').replace(/\\s+/g, ' ').trim();
+        if (text.length >= 10 && text.length <= 400) return text;
+      }
+      return '';
+    }
+    """
+
+    def _nearby_question_text(self, input_locator) -> str:
+        """The question text sitting next to an unlabeled control, or ""."""
+        try:
+            return (input_locator.evaluate(self._NEARBY_QUESTION_TEXT_JS) or "").strip()
+        except PlaywrightError:
+            return ""
+
+    def _has_own_label_or_aria(self, input_locator) -> bool:
+        """True if pass 1 (or an ARIA name) already had a shot at this control
+        — those are not this pass's business."""
+        try:
+            return bool(input_locator.evaluate(
+                "el => !!(el.getAttribute('aria-label') || el.getAttribute('aria-labelledby')"
+                " || el.closest('label') || (el.id && document.querySelector(`label[for=\"${el.id}\"]`)))"
+            ))
+        except PlaywrightError:
+            return False
+
+    def _stamp_candidates(self, selector: str) -> list[Locator]:
+        """Resolve `selector` ONCE and return locators that don't depend on it.
+
+        `Locator.all()` cannot be used for this. It returns a list of
+        `Locator`s, each of which re-resolves its own selector against the live
+        DOM on every call — `repr()` shows them as `"<selector> >> nth=0"`.
+        Nothing is snapshotted. When the selector excludes
+        `[data-automation-examined]` (as the sweep's does) and the loop writes
+        that attribute, two things break at once:
+
+        1. The locator for the element just marked resolves to ZERO elements,
+           so the next `describe_field()`/`fill_field()` call on it waits out
+           Playwright's full 30s default timeout and the field is reported as
+           unfillable — with the element sitting in the DOM the whole time.
+        2. Every LATER index shifts, because the match set shrank. With
+           candidates [e0, e1, e2], marking e0 makes `nth=1` resolve to e2, so
+           e1 is silently never examined at all.
+
+        Stamping each match with its own unique `_AUTOMATION_CANDIDATE_ATTR`
+        and addressing it by that gives locators whose resolution is
+        independent of the examined marker, which is what makes it safe to mark
+        at the right time (after the fill) instead of before.
+
+        Old stamps are cleared first so a second sweep of the same page (a
+        multi-step form) can't inherit stale ids.
+        """
+        try:
+            count = self.page.evaluate(
+                """([selector, stampAttr]) => {
+                    document.querySelectorAll('[' + stampAttr + ']')
+                        .forEach(el => el.removeAttribute(stampAttr));
+                    const matches = Array.from(document.querySelectorAll(selector));
+                    matches.forEach((el, i) => el.setAttribute(stampAttr, String(i)));
+                    return matches.length;
+                }""",
+                [selector, _AUTOMATION_CANDIDATE_ATTR],
+            )
+        except PlaywrightError as e:
+            logger.debug("Could not stamp candidate fields (%s) — skipping this pass.", e)
+            return []
+        return [
+            self.page.locator(f'[{_AUTOMATION_CANDIDATE_ATTR}="{index}"]')
+            for index in range(int(count or 0))
+        ]
+
+    def _fill_questions_by_nearby_text(self) -> list[FieldFillResult]:
+        """Pass 1b: screening questions whose control has NO `<label>`, no
+        `aria-label`, no `aria-labelledby` and no `id` a label could point at
+        — so pass 1 is structurally blind to them and pass 2 has nothing but a
+        machine-generated `name` to go on.
+
+        This is not a hypothetical shape. On a live Lever posting all four
+        required screening questions render as:
+
+            <div class="text">Are you legally authorized to work ...?</div>
+            <input type="text" name="cards[<uuid>][field2]"
+                   placeholder="Type your response" required>
+
+        Ten `<label>` elements on that page, every one of them a standard
+        field (resume, name, email, phone, location, company, URLs), and not
+        one of them attached to a screening question. `FieldMapper` sees
+        `name="cards[<uuid>][field2]"` / `placeholder="Type your response"`,
+        matches nothing, and all four required fields are left empty — which
+        is exactly what the form looked like.
+
+        Recovering the text makes them answerable: a `FieldMapper` hit fills
+        from the profile, and anything else joins the SAME batched answer-engine
+        call as the labeled questions (this pass runs before
+        `_fill_questions_via_answer_engine`, so it costs no extra LLM call).
+
+        Confidence comes from `NEARBY_TEXT_MATCH_CONFIDENCE` (0.55), not the
+        0.9 a real `<label>` earns — recovered-by-proximity text is a weaker
+        signal, and 0.55 sits below the auto-submit bar on purpose."""
+        results: list[FieldFillResult] = []
+        selector = _MAPPABLE_FIELD_SELECTOR_TEMPLATE.format(marker=_AUTOMATION_EXAMINED_ATTR)
+        candidates = self._stamp_candidates(selector)
+
+        for input_locator in candidates:
+            if self._has_own_label_or_aria(input_locator):
+                continue
+            question = self._nearby_question_text(input_locator)
+            if not question:
+                continue
+
+            # PRECEDENCE GUARD. `FieldMapper`'s tiers are name/id (0.97) >
+            # label (0.9) > placeholder (0.75) > nearby text (0.55), but this
+            # pass runs BEFORE `_fill_questions_by_name_or_placeholder` so that
+            # unlabeled questions can join the single batched answer-engine
+            # call. Without this check that ordering silently outranks a
+            # stronger signal: a bare `<input name="linkedin_url">` with no
+            # label would be claimed here on proximity text, marked examined,
+            # queued for the engine — and if no engine was injected, the
+            # pending list is discarded and the field is left EMPTY, even
+            # though pass 2 would have filled it deterministically from its
+            # own `name`. Leave those untouched entirely (no marking, no
+            # queueing) and let pass 2 have them.
+            try:
+                name_attr = input_locator.get_attribute("name") or ""
+                placeholder_attr = input_locator.get_attribute("placeholder") or ""
+            except PlaywrightError:
+                name_attr = placeholder_attr = ""
+            if FieldMapper.map_field(name=name_attr, placeholder=placeholder_attr) is not None:
+                continue
+
+            match = FieldMapper.map_field(nearby_text=question)
+            if match is None:
+                # Genuinely novel — hand to the answer engine, which is the
+                # only thing that can answer "are you able to work in person
+                # from our Mountain View office?" at all. Deliberately NOT
+                # marked here: `_fill_questions_via_answer_engine` marks it
+                # once it has actually described the field. Marking now would
+                # be marking before a describe that happens in a later step.
+                self._pending_answer_engine_questions.append((question, input_locator))
+                continue
+
+            attribute, confidence = match
+            value = self._resolve_profile_value(attribute)
+            if value in (None, "", []):
+                # Nothing on file for a field we DID recognize — let the answer
+                # engine try rather than leaving a required question blank.
+                self._pending_answer_engine_questions.append((question, input_locator))
+                continue
+
+            field = describe_field(input_locator, label=question, page=self.page, profile_attribute=attribute)
+            outcome = fill_field(field, value, context=self._fill_context())
+            self._mark_examined(input_locator)  # after the fill, never before
+            results.append(FieldFillResult(
+                field_key=question, profile_path=attribute, value_used=value,
+                confidence=confidence if outcome.filled else 0.0, filled=outcome.filled, failure=outcome.failure,
             ))
 
         return results
@@ -569,18 +810,19 @@ class ATSAdapter(ABC):
         `<label>` at all get filled, which pass 1 alone could never do."""
         results: list[FieldFillResult] = []
         selector = _MAPPABLE_FIELD_SELECTOR_TEMPLATE.format(marker=_AUTOMATION_EXAMINED_ATTR)
-
-        try:
-            # `.all()` snapshots the matching elements once, up front. This
-            # loop marks each element it examines with the exclusion
-            # attribute as it goes — using a live `.nth(i)`/`.count()` query
-            # here instead (like the label pass above does, safely, since it
-            # never touches the elements `page.locator("label")` matches)
-            # would re-run the selector on every call and shift every later
-            # index as earlier elements drop out of the `:not([marker])` set.
-            candidates = self.page.locator(selector).all()
-        except PlaywrightError:
-            return results
+        # `Locator.all()` must NOT be used here. It does not snapshot anything:
+        # it returns a list of `Locator`s, each of which re-resolves its own
+        # selector against the live DOM on every call (`repr()` shows them as
+        # `"<selector> >> nth=0"`). Since this selector excludes
+        # `[data-automation-examined]` and this loop writes that attribute,
+        # `.all()` meant (a) the locator for a just-marked element resolved to
+        # zero, stalling the next `describe_field()` for Playwright's full 30s
+        # timeout and reporting a present, fillable field as unfillable, and
+        # (b) every later index shifted as the match set shrank, so with
+        # candidates [e0, e1, e2] marking e0 made `nth=1` resolve to e2 and e1
+        # was silently never examined. `_stamp_candidates()` gives each match
+        # its own stable id instead, so marking can't perturb the iteration.
+        candidates = self._stamp_candidates(selector)
 
         for input_locator in candidates:
             try:
@@ -607,14 +849,19 @@ class ATSAdapter(ABC):
                 logger.debug("Could not check visibility for matched field %r (%s): %s", field_key, attribute, e)
                 is_visible = False
 
-            self._mark_examined(input_locator)  # unconditional — this pass's own snapshot never revisits it either way
-
             if not is_visible:
+                # Nothing to fill, but it HAS been examined — mark it so no
+                # later pass reconsiders it.
+                self._mark_examined(input_locator)
                 results.append(FieldFillResult(field_key=field_key, profile_path=attribute, value_used=value, confidence=0.0, filled=False))
                 continue
 
             field = describe_field(input_locator, label=field_key, page=self.page, profile_attribute=attribute)
             outcome = fill_field(field, value, context=self._fill_context())
+            # AFTER the fill, never before — see `_stamp_candidates`. Still
+            # unconditional on `outcome.filled`: a field this pass attempted
+            # and failed must not be retried (and re-counted) by a later pass.
+            self._mark_examined(input_locator)
             results.append(FieldFillResult(
                 field_key=field_key, profile_path=attribute, value_used=value,
                 confidence=confidence if outcome.filled else 0.0, filled=outcome.filled, failure=outcome.failure,

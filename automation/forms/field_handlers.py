@@ -68,6 +68,7 @@ from typing import Callable
 from playwright.sync_api import Error as PlaywrightError, Locator, Page
 
 from automation.utils.element_actions import safe_click, wait_for_dynamic_element
+from automation.utils.human_input import human_pause_between_fields, human_type
 from automation.utils.scrolling import scroll_container_until_option_found
 
 logger = logging.getLogger(__name__)
@@ -91,6 +92,13 @@ class Field:
     input_type: str | None             # input[type], lowercased; None for non-<input> tags
     role: str | None                   # ARIA role attribute, if any
     profile_attribute: str | None = None
+    #: Why `tag_name`/`input_type`/`role` are empty, when they are. A failed
+    #: introspection used to degrade silently to `tag_name=""`, which no
+    #: handler claims (`TextInputHandler` needs `"input"`, `NativeSelectHandler`
+    #: needs `"select"`), so the field died as `no_handler_matched` with the
+    #: real cause thrown away — the signature of several long-standing suite
+    #: failures. `fill_field()` now copies this into the `FieldFailure`.
+    introspection_error: str | None = None
 
 
 @dataclass
@@ -126,6 +134,28 @@ class FieldFailure:
     #: snapshot of the failed element's own `outerHTML` for debugging.
     last_exception: str | None = None
     element_html: str | None = None
+
+
+class FieldFillRefused(Exception):
+    """A handler DECLINING to fill, as opposed to failing to.
+
+    `FieldHandler.fill()` returns `None` by contract and `FieldFailure` is
+    built by `fill_field()`, so a handler that has positively determined it
+    must not touch the field needs a channel out. Raising this is that
+    channel: `fill_field()` converts it into a `FieldFailure` carrying
+    `reason`/`detail` and — critically — does NOT retry. A refusal is a
+    deterministic conclusion about the live DOM ("two options match this
+    value equally well"), so re-running it two more times produces the same
+    answer and only delays the handoff to a human.
+
+    Distinct from `PlaywrightError`, which means "the interaction itself went
+    wrong" and IS worth retrying."""
+
+    def __init__(self, reason: str, detail: str = "", context: dict | None = None):
+        super().__init__(detail or reason)
+        self.reason = reason
+        self.detail = detail
+        self.context = context or {}
 
 
 #: Cap on `element_html`'s length — a debugging aid, not a full DOM dump;
@@ -245,6 +275,11 @@ def _coerce_date_string(value) -> str:
     return text
 
 
+#: Wait between the two introspection attempts in `describe_field` — long
+#: enough for a just-mounted element to attach, short enough not to matter.
+_INTROSPECTION_RETRY_WAIT_MS = 250
+
+
 def describe_field(
     locator: Locator,
     *,
@@ -262,17 +297,43 @@ def describe_field(
     tag_name = ""
     input_type: str | None = None
     role: str | None = None
-    try:
-        info = locator.evaluate(
-            "el => ({tag: el.tagName ? el.tagName.toLowerCase() : '', "
-            "type: (el.getAttribute && el.getAttribute('type') || '').toLowerCase(), "
-            "role: el.getAttribute ? el.getAttribute('role') : null})"
+    introspection_error: str | None = None
+
+    # Retried once: the overwhelmingly common reason this throws is that the
+    # element isn't attached yet (a React/Vue form still mounting, a step that
+    # just became visible), which a short wait fixes. A second failure is a
+    # real problem worth reporting rather than silently flattening into an
+    # "unknown shape" that no handler can ever claim.
+    for attempt in (1, 2):
+        try:
+            info = locator.evaluate(
+                "el => ({tag: el.tagName ? el.tagName.toLowerCase() : '', "
+                "type: (el.getAttribute && el.getAttribute('type') || '').toLowerCase(), "
+                "role: el.getAttribute ? el.getAttribute('role') : null})"
+            )
+            tag_name = info.get("tag") or ""
+            input_type = info.get("type") or None
+            role = info.get("role")
+            introspection_error = None
+            break
+        except PlaywrightError as e:
+            introspection_error = str(e)
+            if attempt == 1:
+                logger.debug("Introspection of %r failed (%s) — retrying once.", label, e)
+                try:
+                    resolved_page.wait_for_timeout(_INTROSPECTION_RETRY_WAIT_MS)
+                except PlaywrightError:
+                    pass
+
+    if introspection_error is not None:
+        # WARNING, not debug: this is the difference between "unknown widget"
+        # and a diagnosable cause, and it previously vanished at debug level.
+        logger.warning(
+            "Could not introspect field %r after 2 attempts — no handler will claim it. "
+            "Cause: %s. Element: %s",
+            label, introspection_error, _capture_element_html(locator),
         )
-        tag_name = info.get("tag") or ""
-        input_type = info.get("type") or None
-        role = info.get("role")
-    except PlaywrightError as e:
-        logger.debug("Could not introspect field %r (%s) — treating as unknown shape.", label, e)
+
     return Field(
         locator=locator,
         page=resolved_page,
@@ -281,6 +342,7 @@ def describe_field(
         input_type=input_type,
         role=role,
         profile_attribute=profile_attribute,
+        introspection_error=introspection_error,
     )
 
 
@@ -314,7 +376,7 @@ class TextAreaHandler(FieldHandler):
         return field.tag_name == "textarea"
 
     def fill(self, field: Field, value) -> None:
-        field.locator.fill(str(value))
+        human_type(field.locator, str(value), field.page)
 
     def verify(self, field: Field, value) -> tuple[bool, str | None]:
         actual = field.locator.input_value()
@@ -333,7 +395,7 @@ class TextInputHandler(FieldHandler):
         return field.tag_name == "input" and (field.input_type or "") in _TEXT_FILLABLE_INPUT_TYPES
 
     def fill(self, field: Field, value) -> None:
-        field.locator.fill(str(value))
+        human_type(field.locator, str(value), field.page)
 
     def verify(self, field: Field, value) -> tuple[bool, str | None]:
         actual = field.locator.input_value()
@@ -345,6 +407,13 @@ class DateHandler(FieldHandler):
         return field.tag_name == "input" and field.input_type == "date"
 
     def fill(self, field: Field, value) -> None:
+        # Deliberately NOT human-typed. `input[type=date]` renders as segmented
+        # day/month/year spinners whose keystroke handling follows the BROWSER
+        # LOCALE, so typing "1990-05-14" character by character lands the parts
+        # in a different order per locale, and Escape/Tab between segments
+        # varies too. `fill()` sets the ISO value the element actually stores,
+        # which is unambiguous — and a date picker has no as-you-type filtering
+        # behaviour that per-character input would buy us anyway.
         field.locator.fill(_coerce_date_string(value))
 
     def verify(self, field: Field, value) -> tuple[bool, str | None]:
@@ -793,44 +862,202 @@ class FileUploadHandler(FieldHandler):
 # Native <select>
 # ---------------------------------------------------------------------------
 
+#: One round-trip for everything this handler needs to know about a `<select>`:
+#: whether it's multi-select, whether it's rendered, and its live option list.
+_SELECT_STATE_JS = """
+el => ({
+  multiple: !!el.multiple,
+  rendered: el.offsetParent !== null,
+  options: Array.from(el.options || []).map(o => ({
+    text: (o.label || o.textContent || '').trim(),
+    value: o.value,
+    disabled: !!o.disabled,
+  })),
+  selected: Array.from(el.selectedOptions || []).map(o => (o.label || o.textContent || '').trim()),
+})
+"""
+
+#: Does a visible custom-dropdown control sit alongside this hidden `<select>`?
+#: If so the select is that widget's backing store, and the visible control is
+#: what should be driven — mirrors the `is_visible()` reasoning that
+#: `VirtualizedListboxHandler.supports()` got in the Phase 8 audit.
+_SELECT_PROXY_JS = """
+el => {
+  const parent = el.parentElement;
+  if (!parent) return false;
+  const sel = '[role="combobox"],[role="listbox"],[aria-haspopup],'
+            + '[class*="select" i],[class*="dropdown" i],button';
+  return Array.from(parent.querySelectorAll(sel)).some(n => n !== el && n.offsetParent !== null);
+}
+"""
+
+#: Separators an upstream answer may use to express several choices for a
+#: `<select multiple>`.
+_MULTI_VALUE_SEPARATORS = ("\n", ";", ",")
+
+
+def _multi_targets(value) -> list[str]:
+    if isinstance(value, (list, tuple, set)):
+        return [str(v).strip() for v in value if str(v).strip()]
+    text = str(value)
+    for separator in _MULTI_VALUE_SEPARATORS:
+        if separator in text:
+            return [part.strip() for part in text.split(separator) if part.strip()]
+    return [text.strip()] if text.strip() else []
+
+
 class NativeSelectHandler(FieldHandler):
+    """A real `<select>`. Everything is driven off ONE live read of the
+    element's own option list (`_SELECT_STATE_JS`), rather than handing a
+    candidate string to Playwright and hoping it matches something.
+
+    The reason is that the previous implementation's last-resort tier looped
+    the live options, took the FIRST whose text satisfied `_values_match`, and
+    selected it. `_values_match` is substring-tolerant in BOTH directions, so
+    filling "No" against `["Not applicable", "None"]` silently selected
+    "Not applicable" — wrong data, on a real application, verified as success
+    because `verify()` uses the same loose comparison. It also had nothing
+    stopping it landing on a placeholder ("Select...").
+
+    That made this path LOOSER than `answer_engine._match_option`, which
+    refuses when two options match a value equally well. This handler now
+    applies the same discipline: exact text, then exact value, then
+    case/whitespace-normalized text, then loose — taking the first tier that
+    yields exactly ONE non-placeholder option, and REFUSING (via
+    `FieldFillRefused`, no retries) on either zero matches or a tie.
+
+    Note that a tie is only reachable when no earlier, tighter tier matched.
+    "No" against `["Not applicable", "No"]` resolves cleanly at the exact-text
+    tier and is NOT a refusal — treating it as ambiguous would break every
+    Yes/No select that also offers "Not applicable", which is a very common
+    shape."""
+
+    def _state(self, field: Field) -> dict | None:
+        try:
+            return field.locator.evaluate(_SELECT_STATE_JS)
+        except PlaywrightError as e:
+            logger.debug("Could not read <select> state for %r (%s).", field.label, e)
+            return None
+
     def supports(self, field: Field) -> bool:
-        return field.tag_name == "select"
+        if field.tag_name != "select":
+            return False
+        try:
+            if field.locator.is_visible():
+                return True
+        except PlaywrightError:
+            return True  # can't tell — behave exactly as before this guard
+        # Hidden. Decline only if something visible is clearly standing in for
+        # it; otherwise still claim it (see `fill`, which forces the selection
+        # rather than burning every attempt on actionability timeouts).
+        try:
+            has_proxy = bool(field.locator.evaluate(_SELECT_PROXY_JS))
+        except PlaywrightError:
+            has_proxy = False
+        if has_proxy:
+            logger.info(
+                "%r is a hidden <select> with a visible control beside it — leaving it to that widget's handler.",
+                field.label,
+            )
+            return False
+        return True
+
+    @staticmethod
+    def _resolve_one(field_label: str, options: list[dict], target: str) -> dict:
+        """The tiered, ambiguity-checked match. Raises `FieldFillRefused`
+        rather than guessing."""
+        selectable = [
+            option for option in options
+            if not option.get("disabled") and option.get("text")
+            and not _is_placeholder_option(option["text"])
+        ]
+        if not selectable:
+            raise FieldFillRefused(
+                "no_selectable_options",
+                f"<select> for {field_label!r} offers no selectable, non-placeholder options.",
+            )
+
+        normalized_target = _normalize_for_compare(target)
+        tiers = (
+            ("exact_text", [o for o in selectable if o["text"] == target]),
+            ("exact_value", [o for o in selectable if o.get("value") == target]),
+            ("normalized_text", [o for o in selectable if _normalize_for_compare(o["text"]) == normalized_target]),
+            ("loose_text", [o for o in selectable if _values_match(target, o["text"])]),
+        )
+        for tier, matches in tiers:
+            if len(matches) == 1:
+                return matches[0]
+            if len(matches) > 1:
+                texts = [o["text"] for o in matches]
+                raise FieldFillRefused(
+                    "ambiguous_option_match",
+                    f"{target!r} matches {len(matches)} options equally well at the {tier} tier: {texts!r}. "
+                    "Refusing rather than picking one.",
+                    context={"ambiguous_options": texts, "match_tier": tier},
+                )
+        raise FieldFillRefused(
+            "no_matching_option",
+            f"No option matches {target!r}. Available: {[o['text'] for o in selectable]!r}.",
+            context={"available_options": [o["text"] for o in selectable]},
+        )
+
+    def _select(self, field: Field, values: list[str], *, hidden: bool) -> None:
+        try:
+            field.locator.select_option(value=values, force=hidden)
+        except PlaywrightError as e:
+            if hidden:
+                # Don't spend the remaining attempts re-timing-out on an
+                # element that isn't rendered — say so, distinguishably.
+                raise FieldFillRefused(
+                    "hidden_native_select",
+                    f"{field.label!r} is a <select> that isn't rendered and could not be set even with force: {e}",
+                    context={"hidden_native_select": True},
+                ) from e
+            raise
 
     def fill(self, field: Field, value) -> None:
-        text_value = str(value)
-        try:
-            field.locator.select_option(label=text_value)
-            return
-        except PlaywrightError:
-            pass
-        try:
-            field.locator.select_option(value=text_value)
-            return
-        except PlaywrightError:
-            pass
-        # Last resort: case-insensitive/substring match against each
-        # <option>'s visible text (handles "United States" not exactly
-        # matching an option literally titled "United States of America").
-        try:
-            options = field.locator.locator("option").all()
-        except PlaywrightError:
-            options = []
-        for option in options:
+        state = self._state(field)
+        if state is None:
+            # Couldn't read the element at all — fall back to the original
+            # blind attempts rather than refusing outright, so a select we
+            # merely failed to introspect still has a chance of being filled.
+            text_value = str(value)
             try:
-                option_text = (option.text_content() or "").strip()
+                field.locator.select_option(label=text_value)
+                return
             except PlaywrightError:
-                continue
-            if _values_match(text_value, option_text):
-                try:
-                    option_value = option.get_attribute("value")
-                    if option_value is not None:
-                        field.locator.select_option(value=option_value)
-                        return
-                except PlaywrightError:
-                    continue
+                field.locator.select_option(value=text_value)
+                return
+
+        options = state.get("options") or []
+        hidden = not state.get("rendered", True)
+
+        if state.get("multiple"):
+            targets = _multi_targets(value)
+            resolved = [self._resolve_one(field.label, options, target) for target in targets]
+            self._select(field, [o.get("value", "") for o in resolved], hidden=hidden)
+            return
+
+        chosen = self._resolve_one(field.label, options, str(value))
+        self._select(field, [chosen.get("value", "")], hidden=hidden)
 
     def verify(self, field: Field, value) -> tuple[bool, str | None]:
+        state = self._state(field)
+        if state is not None and state.get("multiple"):
+            selected = [text for text in (state.get("selected") or []) if text]
+            targets = _multi_targets(value)
+            actual = ", ".join(selected)
+            if len(selected) != len(targets):
+                return False, actual
+            # Every target must be represented exactly once in the selection.
+            remaining = list(selected)
+            for target in targets:
+                match = next((s for s in remaining if _values_match(target, s)), None)
+                if match is None:
+                    return False, actual
+                remaining.remove(match)
+            return True, actual
+
         try:
             selected_value = field.locator.input_value()
         except PlaywrightError:
@@ -882,6 +1109,42 @@ def _find_search_input(page: Page) -> Locator | None:
     return _first_visible(page.locator(_SEARCH_INPUT_SELECTOR))
 
 
+def _matches_selector(locator: Locator, selector: str) -> bool:
+    try:
+        return bool(locator.evaluate("(el, sel) => el.matches(sel)", selector))
+    except PlaywrightError:
+        return False
+
+
+def _field_search_input(field: Field) -> Locator | None:
+    """This field's OWN text input, if its widget has one — checked before
+    falling back to `_find_search_input(page)`.
+
+    That page-wide fallback picks the first visible match anywhere, which is
+    correct on a form with one dropdown and wrong on a real one. The live
+    Greenhouse application has NINE elements matching `_SEARCH_INPUT_SELECTOR`
+    (every react-select question is `input[role='combobox']
+    [aria-autocomplete='list']`, plus the phone widget), all visible, so the
+    page-wide lookup typed this field's answer into the first question's box
+    every time. The element the label pass resolved IS the right input on that
+    markup — so look at the field itself, and inside it, before looking at the
+    page."""
+    if _matches_selector(field.locator, _SEARCH_INPUT_SELECTOR):
+        return field.locator
+    nested = _first_visible(field.locator.locator(_SEARCH_INPUT_SELECTOR))
+    if nested is not None:
+        return nested
+    # A react-select-style widget keeps its input as a SIBLING of the control
+    # the label points at, under a shared shell — one hop up, then look down.
+    try:
+        parent = field.locator.locator("xpath=ancestor::*[self::div or self::fieldset][1]")
+        if parent.count() > 0:
+            return _first_visible(parent.first.locator(_SEARCH_INPUT_SELECTOR))
+    except PlaywrightError:
+        pass
+    return None
+
+
 def _find_listbox_container(page: Page) -> Locator | None:
     return _first_visible(page.locator(_LISTBOX_SELECTOR))
 
@@ -901,16 +1164,49 @@ def _iter_visible_options(container: Locator) -> list[Locator]:
     return visible
 
 
-def _find_matching_option(page: Page, value, matches: Callable[[str, object], bool]) -> Locator | None:
-    container = _find_listbox_container(page)
-    scope = container if container is not None else page.locator("body")
-    for option in _iter_visible_options(scope):
+def _option_containers(page: Page) -> list[Locator]:
+    """Every visible `_LISTBOX_SELECTOR` match that actually holds visible
+    options right now, in DOM order.
+
+    The distinction from `_find_listbox_container()` (first visible match,
+    full stop) is load-bearing on real forms. On the live Greenhouse
+    application the first visible match is the intl-tel-input phone-country
+    wrapper — `div.iti--inline-dropdown`, caught by `_LISTBOX_SELECTOR`'s
+    `div[class*='dropdown' i]` branch, permanently visible, with its 244
+    country options hidden inside. Anything that stopped at that first match
+    looked into a container with zero visible options and concluded the
+    dropdown had none, while the real `select__menu-list` sat two nodes
+    further down the same query."""
+    try:
+        candidates = page.locator(_LISTBOX_SELECTOR).all()
+    except PlaywrightError:
+        return []
+    containers = []
+    for candidate in candidates:
         try:
-            text = (option.text_content() or "").strip()
+            if not candidate.is_visible():
+                continue
         except PlaywrightError:
             continue
-        if text and matches(text, value):
-            return option
+        if _iter_visible_options(candidate):
+            containers.append(candidate)
+    return containers
+
+
+def _find_matching_option(page: Page, value, matches: Callable[[str, object], bool]) -> Locator | None:
+    """Searches every open option container, not just the first one found —
+    see `_option_containers`. Falls back to scanning `body` when no container
+    resolves at all, which is the original behavior and is safe here because
+    this is looking for ONE known string rather than enumerating choices."""
+    scopes = _option_containers(page) or [page.locator("body")]
+    for scope in scopes:
+        for option in _iter_visible_options(scope):
+            try:
+                text = (option.text_content() or "").strip()
+            except PlaywrightError:
+                continue
+            if text and matches(text, value):
+                return option
     return None
 
 
@@ -972,13 +1268,54 @@ def _wait_for_popup(
     return wait_for_dynamic_element(lambda: _popup_is_open(page), page, timeout_ms=timeout_ms, poll_ms=poll_ms)
 
 
-def _read_dropdown_displayed_value(field: Field) -> str | None:
-    for selector in (
-        "[class*='single-value' i]", "[class*='singlevalue' i]",
-        "[class*='selected-value' i]", "[class*='selected-option' i]",
+#: Where a custom dropdown renders the value it is currently showing.
+_DISPLAY_VALUE_SELECTOR = (
+    "[class*='single-value' i], [class*='singlevalue' i], "
+    "[class*='selected-value' i], [class*='selected-option' i]"
+)
+
+
+def _display_value_scopes(field: Field) -> list[Locator]:
+    """`field.locator` first, then the widget's own control/container
+    ancestor.
+
+    The ancestors matter because the element the label pass resolves is often
+    not the element that displays the value. On react-select — Greenhouse's
+    boards, and the shape that exposed this — `<label for=...>` points at the
+    `<input class="select__input">`, which has NO children, is `opacity: 0`
+    once a value is chosen, and has its `value` attribute cleared by the
+    library on selection. So all three of the original lookups (descendant
+    selectors, `inner_text()`, `value`) came back empty on a dropdown that
+    had in fact been filled correctly, `verify()` failed, and `fill_field()`
+    burned all 3 attempts re-selecting an option that was already selected
+    before reporting a bogus `verification_failed`. The text is one hop up, in
+    a sibling `select__single-value`.
+
+    Scoped to `control`/`container` ancestors ONLY, and used ONLY with the
+    explicit `_DISPLAY_VALUE_SELECTOR` — deliberately never a broad
+    `inner_text()` of an ancestor. On this very form `select__container`
+    includes the question's own `<label>`, and `_values_match` is
+    substring-tolerant in both directions, so reading a whole container's
+    text would let the label "...If not, are you willing to relocate..."
+    satisfy a check for the value "No"."""
+    scopes = [field.locator]
+    for xpath in (
+        "xpath=ancestor::*[contains(@class,'control')][1]",
+        "xpath=ancestor::*[contains(@class,'container')][1]",
     ):
         try:
-            near = field.locator.locator(selector)
+            candidate = field.locator.locator(xpath)
+            if candidate.count() > 0:
+                scopes.append(candidate.first)
+        except PlaywrightError:
+            continue
+    return scopes
+
+
+def _read_dropdown_displayed_value(field: Field) -> str | None:
+    for scope in _display_value_scopes(field):
+        try:
+            near = scope.locator(_DISPLAY_VALUE_SELECTOR)
             if near.count() > 0:
                 text = (near.first.text_content() or "").strip()
                 if text:
@@ -1052,10 +1389,15 @@ class _DropdownHandler(FieldHandler):
 
         logger.info("Dropdown opened for %r." if opened else "Dropdown did not appear to open for %r.", field.label)
 
-        search_input = _find_search_input(field.page)
+        search_input = _field_search_input(field) or _find_search_input(field.page)
         if search_input is not None:
             logger.info("Searching option %r for %r.", value, field.label)
-            search_input.fill(str(value))
+            # `click_first=False`: the search box is focused the moment the
+            # menu opens, and clicking it again toggles the menu shut. This is
+            # also the path where per-character typing matters most — a
+            # searchable dropdown filters on keystroke events, and a bulk
+            # `fill()` can leave the option list unfiltered.
+            human_type(search_input, str(value), field.page, click_first=False)
             field.page.wait_for_timeout(300)  # debounce — most searchable dropdowns filter async
             option = _find_matching_option(field.page, value, self._matches)
         else:
@@ -1246,6 +1588,208 @@ class ComboboxHandler(_DropdownHandler):
 
 
 # ---------------------------------------------------------------------------
+# Option introspection
+# ---------------------------------------------------------------------------
+
+#: A native `<select>`'s first entry is usually a prompt, not a choice
+#: ("Select...", "-- Choose one --", ""). Offering it to the answer engine as
+#: a legitimate answer invites picking it; every real ATS treats it as
+#: "nothing selected."
+_PLACEHOLDER_OPTION_PATTERN = re.compile(
+    r"^(|-+\s*)?(please\s+)?(select|choose|pick)\b.*$|^-+$|^\s*$", re.IGNORECASE
+)
+
+
+def _is_placeholder_option(text: str) -> bool:
+    return bool(_PLACEHOLDER_OPTION_PATTERN.match(text.strip()))
+
+
+def _close_popup(page: Page) -> None:
+    """Best-effort restore after `_probe_dropdown_options` opened a menu.
+    Escape is what closes every dropdown library in practice; the visibility
+    re-check exists so a widget that ignores Escape doesn't silently leave an
+    open menu covering the next field the sweep tries to touch."""
+    try:
+        page.keyboard.press("Escape")
+    except PlaywrightError:
+        return
+    if not _popup_is_open(page):
+        return
+    try:
+        page.locator("body").click(position={"x": 0, "y": 0}, timeout=_FAST_ACTION_TIMEOUT_MS)
+    except PlaywrightError:
+        logger.debug("Could not close a probed dropdown popup — leaving it to the fill pass.")
+
+
+def _visible_options_container(page: Page) -> Locator | None:
+    """A popup container that actually has visible options in it right now.
+
+    Deliberately NOT `_popup_is_open()`. That predicate is satisfied by
+    `_find_search_input()`, which matches `input[role='combobox']` /
+    `input[aria-autocomplete='list']` — and on react-select (which is what
+    Greenhouse's boards render) THAT INPUT IS THE WIDGET ITSELF, present and
+    visible whether the menu is open or closed. Waiting on it returns
+    instantly and always, so a probe built on it reads the DOM a render tick
+    before the menu mounts and concludes there are no options. Waiting for a
+    container that holds visible options is the condition that actually
+    distinguishes open from closed.
+
+    Also deliberately NOT `_find_listbox_container()`, which returns the first
+    VISIBLE match and stops. On the live Greenhouse form that first match is
+    the intl-tel-input phone-country wrapper (`div.iti--inline-dropdown`,
+    which `_LISTBOX_SELECTOR`'s `div[class*='dropdown' i]` branch matches, and
+    which is permanently visible with its 244 country options hidden inside),
+    so the real `select__menu-list` two nodes later was never examined. Every
+    candidate gets checked here, and the first one holding visible options
+    wins — which also means the hidden-until-opened phone list can't be
+    mistaken for this field's choices."""
+    try:
+        candidates = page.locator(_LISTBOX_SELECTOR).all()
+    except PlaywrightError:
+        return None
+    for candidate in candidates:
+        try:
+            if not candidate.is_visible():
+                continue
+        except PlaywrightError:
+            continue
+        if _iter_visible_options(candidate):
+            return candidate
+    return None
+
+
+def _wait_for_options(page: Page) -> Locator | None:
+    """Polls for `_visible_options_container`, returning it as soon as one
+    appears. Uses the same budget as `_wait_for_popup`."""
+    found = wait_for_dynamic_element(
+        lambda: _visible_options_container(page) is not None,
+        page,
+        timeout_ms=_POPUP_APPEAR_TIMEOUT_MS,
+        poll_ms=_POPUP_APPEAR_POLL_MS,
+    )
+    return _visible_options_container(page) if found else None
+
+
+def _probe_dropdown_options(field: Field) -> tuple[str, ...]:
+    """Opens a custom dropdown just far enough to read its options, then
+    closes it again. NEVER clicks an option — the trigger only — so this
+    cannot change the field's value.
+
+    This is a deliberate, narrow exception to "introspection doesn't touch
+    the page." It was originally left out on the principle that a pre-answer
+    read should be side-effect-free, but on a real Greenhouse posting EVERY
+    screening dropdown is this kind of widget, so refusing to open them meant
+    the engine answered every one of them blind — writing prose at a control
+    that only accepts one of two words. A click-open/Escape-closed probe is
+    exactly what a human applicant does before deciding, and `_DropdownHandler`
+    re-opens the widget from scratch at fill time regardless.
+
+    Returns `()` — and leaves the page as it found it — whenever the menu
+    can't be opened or no real option container appears."""
+    page = field.page
+    try:
+        page.keyboard.press("Escape")  # clear a stray popup from an earlier field
+    except PlaywrightError:
+        pass
+
+    safe_click(field.locator, page)
+    container = _wait_for_options(page)
+    if container is None:
+        # Same nested-control retry `_DropdownHandler.fill` needs: the
+        # element resolved from a <label for=...> is often a wrapper, not the
+        # library's actual clickable control.
+        inner = _first_visible(field.locator.locator(_INNER_CLICK_TARGET_SELECTOR))
+        if inner is not None and safe_click(inner, page):
+            container = _wait_for_options(page)
+    if container is None:
+        # Deliberately NOT falling back to scanning `body` the way
+        # `_find_matching_option` does: it's looking for one known string, so
+        # a too-broad scope is harmless, whereas this reads EVERY match and
+        # would happily return the page's nav links as if they were choices.
+        _close_popup(page)
+        logger.debug("Could not open %r to read its options — treating as free-text.", field.label)
+        return ()
+
+    options: list[str] = []
+    for option in _iter_visible_options(container):
+        try:
+            text = (option.text_content() or "").strip()
+        except PlaywrightError:
+            continue
+        if text and not _is_placeholder_option(text) and text not in options:
+            options.append(text)
+
+    _close_popup(page)
+    logger.info("Read %d option(s) from the dropdown for %r.", len(options), field.label)
+    return tuple(options)
+
+
+def read_field_options(field: Field) -> tuple[str, ...]:
+    """Every choice `field` offers, in DOM order, as the exact strings the
+    page displays — or `()` if it isn't a fixed-choice control.
+
+    - **Native `<select>`** — read directly from `el.options`. No interaction.
+    - **Radio-flavored groups** (native radio, `role="radio"`, button
+      choices) — reuses `RadioHandler`'s own group resolution, so the options
+      the engine sees are exactly the ones the handler will later select
+      among. No interaction.
+    - **Custom dropdowns** (react-select, ARIA combobox/listbox) — opened,
+      read, and closed by `_probe_dropdown_options`. The value is never
+      touched; only the trigger is clicked.
+
+    Two honest limits on the probed path. A **searchable** dropdown that
+    loads its options from the server as you type shows only its initial page
+    of results here, and a **virtualized** list only ever materializes its
+    visible window — so for a long list (countries, universities) these
+    options are a sample, not the full set. That's fine for the screening
+    questions this exists for (Yes/No, seniority bands, notice periods) and
+    is why `_match_option` treats "not in the list" as a reason to ask a
+    human rather than proof the answer is wrong. `ComboboxHandler`/
+    `VirtualizedListboxHandler` still do the real, complete option matching
+    at fill time with the menu genuinely open and scrollable.
+    """
+    if field.tag_name == "select":
+        try:
+            texts = field.locator.evaluate(
+                "el => Array.from(el.options || []).map(o => (o.label || o.textContent || '').trim())"
+            )
+        except PlaywrightError as e:
+            logger.debug("Could not read <select> options for %r (%s) — treating as free-text.", field.label, e)
+            return ()
+        if not isinstance(texts, list):
+            return ()
+        return tuple(t for t in (str(x) for x in texts) if t and not _is_placeholder_option(t))
+
+    radio_handler = RadioHandler()
+    try:
+        is_radio = radio_handler.supports(field)
+    except PlaywrightError:
+        return ()
+    if is_radio:
+        group = radio_handler._group(field)  # noqa: SLF001 - same module; deliberately the handler's own grouping
+        try:
+            count = group.count()
+        except PlaywrightError:
+            return ()
+        options = []
+        for i in range(count):
+            text = _option_text(field.page, group.nth(i)).strip()
+            if text and text not in options:
+                options.append(text)
+        return tuple(options)
+
+    # Anything a dropdown handler would claim at fill time gets probed, so
+    # the engine sees the same choices the handler will later select among.
+    try:
+        is_dropdown = ComboboxHandler().supports(field) or ReactSelectHandler().supports(field)
+    except PlaywrightError:
+        return ()
+    if is_dropdown:
+        return _probe_dropdown_options(field)
+    return ()
+
+
+# ---------------------------------------------------------------------------
 # Registry + orchestration
 # ---------------------------------------------------------------------------
 
@@ -1355,10 +1899,24 @@ def fill_field(
 
     handler = active_registry.get_handler(field)
     if handler is None:
-        logger.info("Unknown field type for %r — skipping.", field.label)
+        # Distinguish "we don't support this widget" from "we never managed to
+        # look at it." Both used to surface as a bare `no_handler_matched`
+        # with the real cause discarded, which is why a class of failures here
+        # stayed unexplained for so long.
+        introspection_failed = field.introspection_error is not None
+        reason = "introspection_failed" if introspection_failed else "no_handler_matched"
+        if introspection_failed:
+            logger.info(
+                "No handler for %r because its shape was never readable (%s).",
+                field.label, field.introspection_error,
+            )
+            failure_context = {**failure_context, "introspection_failed": True}
+        else:
+            logger.info("Unknown field type for %r — skipping.", field.label)
         failure = FieldFailure(
-            field.label, field.tag_name or "unknown", str(value), None, "no_handler_matched", 0,
+            field.label, field.tag_name or "unknown", str(value), None, reason, 0,
             widget_type="unknown", context=failure_context,
+            last_exception=field.introspection_error,
             element_html=_capture_element_html(field.locator),
         )
         logger.warning(format_failure_report(failure))
@@ -1373,6 +1931,21 @@ def fill_field(
             logger.info("Retry %d for %r.", attempt - 1, field.label)
         try:
             handler.fill(field, value)
+        except FieldFillRefused as refusal:
+            # A positive decision not to touch this field — see FieldFillRefused.
+            # Deterministic, so the remaining attempts would reach the same
+            # conclusion; report it now and hand the field to a human.
+            logger.warning("Declining to fill %r: %s", field.label, refusal.detail or refusal.reason)
+            failure = FieldFailure(
+                field.label, field.tag_name or "unknown", str(value), None, refusal.reason, 0,
+                widget_type=type(handler).__name__,
+                context={**failure_context, **refusal.context},
+                last_exception=None,
+                element_html=_capture_element_html(field.locator),
+            )
+            logger.warning(format_failure_report(failure))
+            human_pause_between_fields(field.page)
+            return HandlerOutcome(filled=False, actual_value=None, failure=failure)
         except PlaywrightError as e:
             logger.debug("Fill attempt %d for %r raised (%s).", attempt, field.label, e)
             last_exception = str(e)
@@ -1386,11 +1959,15 @@ def fill_field(
 
         if ok:
             logger.info("Verification passed for %r (attempt %d). Filled.", field.label, attempt)
+            # Once per field, after the retry loop settles — never per attempt,
+            # which would make a 3-attempt field pause for 6 seconds.
+            human_pause_between_fields(field.page)
             return HandlerOutcome(filled=True, actual_value=actual_value, failure=None)
 
         logger.info("Verification failed for %r (attempt %d).", field.label, attempt)
 
     logger.warning("Giving up on %r after %d attempt(s).", field.label, max_attempts)
+    human_pause_between_fields(field.page)
     failure = FieldFailure(
         field.label, field.tag_name or "unknown", str(value), actual_value, "verification_failed", max_attempts - 1,
         widget_type=type(handler).__name__, context=failure_context,

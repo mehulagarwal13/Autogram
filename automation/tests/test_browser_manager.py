@@ -10,6 +10,7 @@ in integration testing once Phase 3/4 adapters exist and CI has
 import pytest
 
 from automation.browser.browser_manager import BrowserAutomationError, BrowserManager
+from automation.browser.session import SessionStore
 
 
 class _FakePage:
@@ -45,7 +46,20 @@ class _FakeContext:
 
 def _manager(tmp_path, monkeypatch):
     monkeypatch.setattr("automation.browser.browser_manager.AUTOMATION_LOGS_DIR", str(tmp_path))
-    return BrowserManager(user_id="user-1", ats_platform="greenhouse")
+    # Session store must be tmp_path-backed too, not just the logs dir: left
+    # at its default, BrowserManager builds a SessionStore pointing at the
+    # REAL `AUTOMATION_SESSION_DIR`, so `has_saved_session`/`save_session`
+    # here read and write actual on-disk session files under this fixture's
+    # hardcoded user_id="user-1". Any other test (or any real run) that saved
+    # a session for that same (user-1, greenhouse) pair would then make
+    # `test_has_saved_session_false_before_any_save` below fail depending on
+    # what ran earlier — a leftover file from a previous pytest session is
+    # enough to break it, since nothing ever cleaned it up.
+    return BrowserManager(
+        user_id="user-1",
+        ats_platform="greenhouse",
+        session_store=SessionStore(base_dir=tmp_path / "sessions"),
+    )
 
 
 # ---------- retries ----------

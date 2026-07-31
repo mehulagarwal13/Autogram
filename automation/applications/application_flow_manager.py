@@ -44,7 +44,14 @@ from playwright.sync_api import BrowserContext, Locator, Page
 
 from automation.ats.base import ATSAdapter, FieldFillResult
 from automation.browser.browser_manager import BrowserAutomationError, BrowserManager
-from automation.browser.selectors import find_next_button, page_has_captcha
+from automation.browser.selectors import (
+    find_human_gate,
+    find_next_button,
+    find_unfilled_required_fields,
+    find_validation_errors,
+    page_has_captcha,
+    wait_for_submission_confirmation,
+)
 from automation.forms.answer_engine import ApplicationAnswerEngine
 from automation.interfaces import ApplicationRunResult, CandidateProfile, ProfileDocument
 
@@ -271,6 +278,25 @@ class ApplicationFlowManager:
                 ats_platform=self.ats_platform,
                 confidence=0.0,
                 screenshot_paths=self._safe_screenshot(page),
+                error_log=self._safe_write_error_log("CAPTCHA present — a human must solve it; automation never will."),
+            )
+
+        # Everything else that only a human may transact with: an account
+        # wall, OTP/MFA, email/SMS verification, identity documents, payment.
+        # Same hard stop as CAPTCHA, and for the same reason — these are
+        # never worked around, only handed over.
+        human_gate = find_human_gate(page)
+        if human_gate is not None:
+            reason = f"Human intervention required before this form can be filled: {human_gate}."
+            self.checkpoint("human_gate_detected")
+            logger.info("application %s: %s", self.application_id, reason)
+            return ApplicationRunResult(
+                application_id=self.application_id,
+                status="manual_required",
+                ats_platform=self.ats_platform,
+                confidence=0.0,
+                screenshot_paths=self._safe_screenshot(page),
+                error_log=self._safe_write_error_log(reason),
             )
 
         adapter = self.adapter_cls(
@@ -319,6 +345,45 @@ class ApplicationFlowManager:
             "application %s: reached the final step — %d/%d tracked fields filled (confidence=%.4f)",
             self.application_id, sum(1 for r in all_results if r.filled), len(all_results), confidence,
         )
+
+        # A required field with no value anywhere in the candidate's profile
+        # isn't "low confidence" — it's "automation cannot proceed without a
+        # human," regardless of how well everything else filled. Checked
+        # (and reported by name) before ever considering AUTO_SUBMIT.
+        missing_required = find_unfilled_required_fields(page)
+        if missing_required:
+            reason = f"Required field(s) could not be filled — no value available in the candidate's profile: {', '.join(missing_required)}."
+            logger.info("application %s: %s", self.application_id, reason)
+            self.checkpoint("manual_required_missing_fields")
+            return ApplicationRunResult(
+                application_id=self.application_id,
+                status="manual_required",
+                ats_platform=self.ats_platform,
+                confidence=confidence,
+                screenshot_paths=self._safe_screenshot(page),
+                error_log=self._safe_write_error_log(reason),
+            )
+
+        # Both specs gate auto-submit on "zero visible validation errors".
+        # Unlike a missing required field, these are the ATS telling us
+        # something we DID fill is unacceptable (bad phone format, over a
+        # character limit, rejected file type) — never something to submit
+        # over, and not something automation can resolve on its own, since
+        # the value came from the candidate's own profile.
+        validation_errors = find_validation_errors(page)
+        if validation_errors:
+            reason = f"Validation errors remain on the form: {'; '.join(validation_errors)}."
+            logger.info("application %s: %s", self.application_id, reason)
+            self.checkpoint("needs_review_validation_errors")
+            return ApplicationRunResult(
+                application_id=self.application_id,
+                status="needs_review",
+                ats_platform=self.ats_platform,
+                confidence=confidence,
+                screenshot_paths=self._safe_screenshot(page),
+                error_log=self._safe_write_error_log(reason),
+            )
+
         action = decide_action(confidence, self.ats_platform, self.autopilot_enabled)
         self.checkpoint(f"decision_{action.lower()}")
         logger.info(
@@ -326,10 +391,44 @@ class ApplicationFlowManager:
             self.application_id, action, confidence, self.autopilot_enabled, self.ats_platform,
         )
 
+        error_log: str | None = None
+
         if action == "AUTO_SUBMIT":
             logger.info("application %s: clicking submit (autopilot).", self.application_id)
-            submitted = adapter.submit_application()
-            status = "applied" if submitted else "failed"
+            if not adapter.submit_application():
+                status = "failed"
+            else:
+                # A landed click is NOT an accepted application — see
+                # `find_submission_confirmation`. Only positive confirmation
+                # is allowed to produce "applied".
+                self.checkpoint("submit_clicked")
+                confirmation = wait_for_submission_confirmation(page)
+                if confirmation:
+                    status = "applied"
+                    self.checkpoint("submission_confirmed")
+                    logger.info(
+                        "application %s: submission CONFIRMED via %s.", self.application_id, confirmation,
+                    )
+                else:
+                    # Deliberately not "applied" (we cannot claim the
+                    # candidate applied) and not "failed" (the submission may
+                    # well have gone through — we just can't prove it). A
+                    # human has to confirm on the ATS side, and must do that
+                    # BEFORE any retry, since a retry of a submission that
+                    # actually succeeded would double-apply.
+                    status = "needs_review"
+                    rejection = find_validation_errors(page)
+                    reason = (
+                        "Submit was clicked but no confirmation could be detected "
+                        "(no confirmation page, success message, or application reference). "
+                        "The application may or may not have been received — verify on the ATS "
+                        "before retrying, since retrying a submission that did succeed would double-apply."
+                    )
+                    if rejection:
+                        reason += f" The page reported: {'; '.join(rejection)}."
+                    logger.warning("application %s: %s", self.application_id, reason)
+                    self.checkpoint("submission_unconfirmed")
+                    error_log = self._safe_write_error_log(reason)
         elif action == "NEEDS_REVIEW":
             status = "needs_review"
         else:  # COPILOT_REVIEW — form is filled; a human clicks submit themselves
@@ -349,6 +448,7 @@ class ApplicationFlowManager:
             ats_platform=self.ats_platform,
             confidence=confidence,
             screenshot_paths=screenshot_paths,
+            error_log=error_log,
         )
 
     def _upload_resume(self, adapter: ATSAdapter) -> FieldFillResult:

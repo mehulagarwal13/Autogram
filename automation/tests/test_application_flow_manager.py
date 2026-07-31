@@ -10,14 +10,31 @@ and the final decision -> status mapping) is tested end-to-end against a real
 way test_detector.py does, and a small in-test fake ATSAdapter so the test
 doesn't depend on any specific ATS's real markup.
 
-These end-to-end tests depend on the session-scoped `browser` fixture from
-conftest.py purely to trigger its "skip if Chromium isn't installed" logic —
-ApplicationFlowManager launches its own BrowserManager/browser internally, so
-the fixture's browser object itself is never used directly.
+These end-to-end tests use the `requires_chromium` fixture from conftest.py
+purely to trigger its "skip if Chromium isn't installed" logic —
+ApplicationFlowManager launches its own BrowserManager/browser internally.
+They deliberately do NOT use the session-scoped `browser` fixture: it keeps
+its own `sync_playwright()` context open for the whole test session once
+anything requests it, which collides ("...you are using Playwright Sync API
+inside the asyncio loop...") with the separate `sync_playwright()` instance
+ApplicationFlowManager's own BrowserManager starts — see `requires_chromium`'s
+docstring.
+
+Each test also builds its own `BrowserManager` with a `tmp_path`-backed
+`SessionStore` (via `_isolated_browser_manager`) rather than letting
+ApplicationFlowManager construct one with the real default session
+directory: `_finish_browser_session` saves a session after every real run
+regardless of outcome, and multiple tests below share the same
+(`user_id="user-1"`, `ats_platform="greenhouse"`) pair test_browser_manager.py
+also uses — without this, a real run here would leave a real, encrypted
+session file on disk that makes unrelated BrowserManager tests
+(e.g. "no session exists yet") fail depending on what ran earlier in the
+same pytest session.
 """
 
 from __future__ import annotations
 
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
@@ -25,6 +42,8 @@ import pytest
 from app.core.crypto import encrypt_field
 from app.models.db_models import CandidateProfile, ProfileDocument
 from automation.ats.base import ATSAdapter, FieldFillResult
+from automation.browser.browser_manager import BrowserManager
+from automation.browser.session import SessionStore
 from automation.applications.application_flow_manager import (
     _OPEN_REVIEW_SESSIONS,
     ApplicationFlowManager,
@@ -266,9 +285,29 @@ _HIGH_CONFIDENCE_RESULTS = [
     FieldFillResult("email", "email", "ada@example.com", 0.95, True),
 ]
 
+def _isolated_browser_manager(tmp_path, ats_platform="greenhouse") -> BrowserManager:
+    """A real `BrowserManager` (so these tests still exercise a genuine
+    Playwright launch/navigate/close cycle) backed by a `tmp_path`-local
+    `SessionStore` instead of the real default session directory — see this
+    module's docstring for why that isolation matters here specifically."""
+    return BrowserManager(
+        user_id="user-1",
+        ats_platform=ats_platform,
+        session_store=SessionStore(base_dir=tmp_path / "sessions"),
+    )
+
+
 _NO_CAPTCHA_NO_NEXT_HTML = "data:text/html,<html><body><p>Single-step application form.</p></body></html>"
+# Explicit size: an unstyled, empty <div> renders at zero height (no content,
+# no default height), which `page_has_captcha` now (correctly) treats as a
+# dormant/invisible widget rather than a real challenge — see
+# `automation/browser/selectors.py::page_has_captcha`'s docstring. Sized here
+# to represent one actually being presented (a real reCAPTCHA checkbox widget
+# renders at roughly this size), matching this test's actual intent.
 _CAPTCHA_HTML = (
-    "data:text/html,<html><body><div class='g-recaptcha'></div><p>Verify you're human.</p></body></html>"
+    "data:text/html,<html><body>"
+    "<div class='g-recaptcha' style='width:304px;height:78px'></div>"
+    "<p>Verify you're human.</p></body></html>"
 )
 _ALWAYS_NEXT_HTML = "data:text/html,<html><body><button>Next</button></body></html>"
 
@@ -277,7 +316,7 @@ _ALWAYS_NEXT_HTML = "data:text/html,<html><body><button>Next</button></body></ht
 # End-to-end orchestration tests (real headless browser, data: URLs)
 # ---------------------------------------------------------------------------
 
-def test_run_auto_submits_on_high_confidence_public_ats(browser, tmp_path):
+def test_run_auto_submits_on_high_confidence_public_ats(requires_chromium, tmp_path):
     adapter_cls = _make_fake_adapter_cls(_HIGH_CONFIDENCE_RESULTS)
     manager = ApplicationFlowManager(
         application_id="app-auto-1",
@@ -287,6 +326,7 @@ def test_run_auto_submits_on_high_confidence_public_ats(browser, tmp_path):
         adapter_cls=adapter_cls,
         profile=_profile(),
         resume_document=_resume_document(tmp_path / "resume.pdf"),
+        browser_manager=_isolated_browser_manager(tmp_path),
         autopilot_enabled=True,
     )
 
@@ -304,7 +344,7 @@ def test_run_auto_submits_on_high_confidence_public_ats(browser, tmp_path):
     assert "step_0_advanced" not in manager.steps_completed  # no Next control on this page
 
 
-def test_run_holds_for_copilot_review_when_autopilot_is_off(browser, tmp_path):
+def test_run_holds_for_copilot_review_when_autopilot_is_off(requires_chromium, tmp_path):
     adapter_cls = _make_fake_adapter_cls(_HIGH_CONFIDENCE_RESULTS)
     manager = ApplicationFlowManager(
         application_id="app-copilot-1",
@@ -314,6 +354,7 @@ def test_run_holds_for_copilot_review_when_autopilot_is_off(browser, tmp_path):
         adapter_cls=adapter_cls,
         profile=_profile(),
         resume_document=_resume_document(tmp_path / "resume.pdf"),
+        browser_manager=_isolated_browser_manager(tmp_path),
         autopilot_enabled=False,
     )
 
@@ -324,7 +365,7 @@ def test_run_holds_for_copilot_review_when_autopilot_is_off(browser, tmp_path):
     assert "decision_copilot_review" in manager.steps_completed
 
 
-def test_run_stops_before_filling_anything_when_captcha_is_present(browser, tmp_path):
+def test_run_stops_before_filling_anything_when_captcha_is_present(requires_chromium, tmp_path):
     adapter_cls = _make_fake_adapter_cls(_HIGH_CONFIDENCE_RESULTS)
     manager = ApplicationFlowManager(
         application_id="app-captcha-1",
@@ -334,6 +375,7 @@ def test_run_stops_before_filling_anything_when_captcha_is_present(browser, tmp_
         adapter_cls=adapter_cls,
         profile=_profile(),
         resume_document=_resume_document(tmp_path / "resume.pdf"),
+        browser_manager=_isolated_browser_manager(tmp_path),
         autopilot_enabled=True,
     )
 
@@ -346,7 +388,7 @@ def test_run_stops_before_filling_anything_when_captcha_is_present(browser, tmp_
     assert manager.steps_completed == ["navigated", "captcha_detected"]
 
 
-def test_run_enforces_the_max_steps_safety_cap(browser, tmp_path):
+def test_run_enforces_the_max_steps_safety_cap(requires_chromium, tmp_path):
     # This page's "Next" button never disappears — simulates a broken
     # selector/loop rather than a real multi-step form. The manager must
     # stop after MAX_STEPS iterations instead of clicking forever.
@@ -359,6 +401,7 @@ def test_run_enforces_the_max_steps_safety_cap(browser, tmp_path):
         adapter_cls=adapter_cls,
         profile=_profile(),
         resume_document=_resume_document(tmp_path / "resume.pdf"),
+        browser_manager=_isolated_browser_manager(tmp_path),
         autopilot_enabled=True,
     )
 
@@ -371,12 +414,10 @@ def test_run_enforces_the_max_steps_safety_cap(browser, tmp_path):
     assert result.status in ("applied", "copilot_review", "needs_review")  # loop cap hit; a decision still comes out
 
 
-def test_run_reports_failure_status_when_navigation_fails(browser, monkeypatch, tmp_path):
+def test_run_reports_failure_status_when_navigation_fails(requires_chromium, monkeypatch, tmp_path):
     # Skip BrowserManager's own retry/backoff (already covered by
     # test_browser_manager.py) so this test fails fast instead of waiting
     # through real retry sleeps.
-    from automation.browser.browser_manager import BrowserManager
-
     monkeypatch.setattr(BrowserManager, "run_with_retries", lambda self, action, **kwargs: action())
 
     adapter_cls = _make_fake_adapter_cls(_HIGH_CONFIDENCE_RESULTS)
@@ -388,6 +429,7 @@ def test_run_reports_failure_status_when_navigation_fails(browser, monkeypatch, 
         adapter_cls=adapter_cls,
         profile=_profile(),
         resume_document=_resume_document(tmp_path / "resume.pdf"),
+        browser_manager=_isolated_browser_manager(tmp_path),
         autopilot_enabled=False,
     )
 
@@ -398,7 +440,185 @@ def test_run_reports_failure_status_when_navigation_fails(browser, monkeypatch, 
     assert adapter_cls.calls["fill_personal_information"] == 0
 
 
-def test_run_passes_the_answer_engine_through_to_the_adapter_it_constructs(browser, tmp_path):
+_REQUIRED_FIELD_MISSING_HTML = (
+    "data:text/html,<html><body><input type='text' name='linkedin_url' required></body></html>"
+)
+_REQUIRED_FIELD_PREFILLED_HTML = (
+    "data:text/html,<html><body>"
+    "<input type='text' name='full_name' value='Ada Lovelace' required>"
+    "</body></html>"
+)
+
+
+def test_run_marks_manual_required_when_a_required_field_has_no_available_value(requires_chromium, tmp_path):
+    # The fake adapter never touches this input (it's not one of the profile
+    # fields it fills) — simulating a field the candidate's profile simply
+    # has no value for. `run()` must catch this via the fresh post-fill DOM
+    # scan (`find_unfilled_required_fields`), not just a low confidence score.
+    adapter_cls = _make_fake_adapter_cls(_HIGH_CONFIDENCE_RESULTS)
+    manager = ApplicationFlowManager(
+        application_id="app-required-missing-1",
+        user_id="user-1",
+        job_url=_REQUIRED_FIELD_MISSING_HTML,
+        ats_platform="greenhouse",
+        adapter_cls=adapter_cls,
+        profile=_profile(),
+        resume_document=_resume_document(tmp_path / "resume.pdf"),
+        browser_manager=_isolated_browser_manager(tmp_path),
+        autopilot_enabled=True,
+    )
+
+    result = manager.run()
+
+    assert result.status == "manual_required"
+    # `error_log` is a path (§14 — screenshots/trace/error-log are always
+    # persisted as file paths, never inline text, same as every other status
+    # that writes one); the actual reason lives in the file it points to.
+    assert result.error_log is not None
+    assert "linkedin_url" in Path(result.error_log).read_text(encoding="utf-8")
+    assert adapter_cls.calls["submit_application"] == 0  # never submits with a required field missing
+    assert "manual_required_missing_fields" in manager.steps_completed
+
+
+def test_run_does_not_flag_manual_required_when_the_required_field_already_has_a_value(requires_chromium, tmp_path):
+    adapter_cls = _make_fake_adapter_cls(_HIGH_CONFIDENCE_RESULTS)
+    manager = ApplicationFlowManager(
+        application_id="app-required-filled-1",
+        user_id="user-1",
+        job_url=_REQUIRED_FIELD_PREFILLED_HTML,
+        ats_platform="greenhouse",
+        adapter_cls=adapter_cls,
+        profile=_profile(),
+        resume_document=_resume_document(tmp_path / "resume.pdf"),
+        browser_manager=_isolated_browser_manager(tmp_path),
+        autopilot_enabled=True,
+    )
+
+    result = manager.run()
+
+    assert result.status != "manual_required"
+
+
+_CONFIRMED_SUBMISSION_HTML = (
+    "data:text/html,<html><body><h1>Thank you for applying!</h1></body></html>"
+)
+_UNCONFIRMED_SUBMISSION_HTML = (
+    "data:text/html,<html><body><p>Nothing here confirms anything.</p></body></html>"
+)
+_VERIFICATION_ERROR_HTML = (
+    "data:text/html,<html><body>"
+    "<div class='application-error'>There was an error verifying your application. Please try again.</div>"
+    "</body></html>"
+)
+
+
+def test_run_reports_applied_only_when_submission_is_confirmed(requires_chromium, tmp_path):
+    adapter_cls = _make_fake_adapter_cls(_HIGH_CONFIDENCE_RESULTS)
+    manager = ApplicationFlowManager(
+        application_id="app-confirmed-1",
+        user_id="user-1",
+        job_url=_CONFIRMED_SUBMISSION_HTML,
+        ats_platform="greenhouse",
+        adapter_cls=adapter_cls,
+        profile=_profile(),
+        resume_document=_resume_document(tmp_path / "resume.pdf"),
+        browser_manager=_isolated_browser_manager(tmp_path),
+        autopilot_enabled=True,
+    )
+
+    result = manager.run()
+
+    assert result.status == "applied"
+    assert adapter_cls.calls["submit_application"] == 1
+    assert "submission_confirmed" in manager.steps_completed
+
+
+def test_run_does_not_claim_applied_when_submission_cannot_be_confirmed(requires_chromium, tmp_path):
+    """The regression that matters most: a submit click landing is NOT proof
+    the ATS accepted the application. Claiming `applied` here would put a
+    false record in front of the candidate AND let idempotency block a retry."""
+    adapter_cls = _make_fake_adapter_cls(_HIGH_CONFIDENCE_RESULTS)
+    manager = ApplicationFlowManager(
+        application_id="app-unconfirmed-1",
+        user_id="user-1",
+        job_url=_UNCONFIRMED_SUBMISSION_HTML,
+        ats_platform="greenhouse",
+        adapter_cls=adapter_cls,
+        profile=_profile(),
+        resume_document=_resume_document(tmp_path / "resume.pdf"),
+        browser_manager=_isolated_browser_manager(tmp_path),
+        autopilot_enabled=True,
+    )
+
+    result = manager.run()
+
+    assert result.status != "applied"
+    assert result.status == "needs_review"
+    assert adapter_cls.calls["submit_application"] == 1  # it did try
+    assert "submit_clicked" in manager.steps_completed
+    assert "submission_unconfirmed" in manager.steps_completed
+    assert result.error_log is not None
+    logged = Path(result.error_log).read_text(encoding="utf-8")
+    assert "no confirmation" in logged
+    assert "double-apply" in logged  # warns a human before they retry
+
+
+def test_run_blocks_submission_while_a_validation_error_is_visible(requires_chromium, tmp_path):
+    """The real Lever banner from a live run. Both specs gate submission on
+    zero visible validation errors — this must never be submitted over."""
+    adapter_cls = _make_fake_adapter_cls(_HIGH_CONFIDENCE_RESULTS)
+    manager = ApplicationFlowManager(
+        application_id="app-validation-1",
+        user_id="user-1",
+        job_url=_VERIFICATION_ERROR_HTML,
+        ats_platform="lever",
+        adapter_cls=adapter_cls,
+        profile=_profile(),
+        resume_document=_resume_document(tmp_path / "resume.pdf"),
+        browser_manager=_isolated_browser_manager(tmp_path, ats_platform="lever"),
+        autopilot_enabled=True,
+    )
+
+    result = manager.run()
+
+    assert result.status == "needs_review"
+    assert adapter_cls.calls["submit_application"] == 0  # never submitted over an error
+    assert "needs_review_validation_errors" in manager.steps_completed
+    assert "error verifying your application" in Path(result.error_log).read_text(encoding="utf-8")
+
+
+def test_run_stops_on_a_login_wall_before_filling_anything(requires_chromium, tmp_path):
+    """A visible password field means an account wall — a human-only gate,
+    never transacted with automatically (no account creation, no third-party
+    passwords)."""
+    login_wall = (
+        "data:text/html,<html><body><form>"
+        "<input type='password' name='pw'><button>Sign in</button>"
+        "</form></body></html>"
+    )
+    adapter_cls = _make_fake_adapter_cls(_HIGH_CONFIDENCE_RESULTS)
+    manager = ApplicationFlowManager(
+        application_id="app-loginwall-1",
+        user_id="user-1",
+        job_url=login_wall,
+        ats_platform="greenhouse",
+        adapter_cls=adapter_cls,
+        profile=_profile(),
+        resume_document=_resume_document(tmp_path / "resume.pdf"),
+        browser_manager=_isolated_browser_manager(tmp_path),
+        autopilot_enabled=True,
+    )
+
+    result = manager.run()
+
+    assert result.status == "manual_required"
+    assert adapter_cls.calls["fill_personal_information"] == 0
+    assert adapter_cls.calls["upload_resume"] == 0
+    assert "human_gate_detected" in manager.steps_completed
+    assert "login" in Path(result.error_log).read_text(encoding="utf-8")
+
+
+def test_run_passes_the_answer_engine_through_to_the_adapter_it_constructs(requires_chromium, tmp_path):
     """Phase 6: ApplicationFlowManager never calls `answer_engine` itself —
     it's a pure pass-through into whatever adapter `run()` constructs. Not
     passing one (the default, `None`) is covered by every other end-to-end
@@ -436,6 +656,7 @@ def test_run_passes_the_answer_engine_through_to_the_adapter_it_constructs(brows
         adapter_cls=_RecordingAdapter,
         profile=_profile(),
         resume_document=_resume_document(tmp_path / "resume.pdf"),
+        browser_manager=_isolated_browser_manager(tmp_path),
         autopilot_enabled=True,
         answer_engine=sentinel_engine,
     )

@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(venv/Scripts/python.exe -m pytest automation/tests/test_selectors.py automation/tests/test_application_flow_manager.py automation/tests/test_lever_adapter.py automation/tests/test_greenhouse_adapter.py automation/tests/test_browser_manager.py tests/test_application_repository.py tests/test_applications_api.py -q)"
+    ]
+  }
+}

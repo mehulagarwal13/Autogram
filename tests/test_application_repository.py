@@ -105,6 +105,26 @@ def test_apply_run_result_records_failure_reason_on_failure():
     assert application.failure_reason == "BrowserAutomationError: could not launch browser"
 
 
+def test_apply_run_result_records_the_reason_for_manual_required_too():
+    # manual_required's reason ("this required field is missing from your
+    # profile") matters just as much as failed's — must surface on the
+    # Application row itself, not just the per-run AutomationRun record.
+    application = _blank_application(status="processing")
+    db = MagicMock()
+    result = _FakeRunResult(
+        application_id="app-1",
+        status="manual_required",
+        ats_platform="lever",
+        confidence=0.5,
+        error_log="Required field(s) could not be filled: linkedin_url.",
+    )
+
+    apply_run_result(db, application, result)
+
+    assert application.status == "manual_required"
+    assert application.failure_reason == "Required field(s) could not be filled: linkedin_url."
+
+
 def test_apply_run_result_does_not_set_a_failure_reason_for_non_failed_status():
     application = _blank_application(status="processing")
     db = MagicMock()

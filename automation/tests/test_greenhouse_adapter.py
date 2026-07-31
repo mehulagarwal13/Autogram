@@ -10,6 +10,7 @@ import pytest
 
 from app.core.crypto import encrypt_field
 from app.models.db_models import CandidateProfile, ProfileDocument
+from automation.ats.base import ANSWER_REVIEW_CONFIDENCE_THRESHOLD
 from automation.ats.greenhouse.greenhouse_adapter import GreenhouseAdapter
 from automation.forms.answer_engine import AnswerResult
 
@@ -146,7 +147,12 @@ class _FakeAnswerEngine:
     verify the *handoff* (base.py's collection/fill wiring), not the real
     engine's own deterministic/LLM/cache logic (see test_answer_engine.py)."""
 
-    def __init__(self, answers: dict[str, str], source: str = "llm", confidence: float = 0.6):
+    # Default confidence sits ABOVE base.ANSWER_REVIEW_CONFIDENCE_THRESHOLD on
+    # purpose: these tests exercise the handoff/fill wiring, and a generated
+    # answer below that threshold is now deliberately withheld for a human
+    # (see test_answer_questions_withholds_a_low_confidence_generated_answer),
+    # which would make every wiring assertion below fail for the wrong reason.
+    def __init__(self, answers: dict[str, str], source: str = "llm", confidence: float = 0.9):
         self.answers = answers
         self.source = source
         self.confidence = confidence
@@ -179,7 +185,38 @@ def test_answer_questions_routes_unmatched_labels_to_the_injected_answer_engine(
     matched = [r for r in results if r.filled and r.value_used == "Because I love building things."]
     assert len(matched) == 1
     assert matched[0].profile_path == "answer_engine:llm"
-    assert matched[0].confidence == 0.6
+    assert matched[0].confidence == 0.9
+
+
+def test_answer_questions_withholds_a_low_confidence_generated_answer(page, resume_file):
+    """Both specs gate acting on your own output at 0.80 confidence. A
+    generated answer the engine isn't confident in must be left blank for a
+    human rather than typed into a real application — and reported as
+    unfilled, so it correctly drags the run's aggregate confidence down
+    instead of looking like a handled field."""
+    page.set_content(
+        """<html><body>
+        <label for="why_q">Why do you want to work here?</label>
+        <textarea id="why_q"></textarea>
+        </body></html>"""
+    )
+    engine = _FakeAnswerEngine(
+        {"Why do you want to work here?": "A vague guess."},
+        confidence=ANSWER_REVIEW_CONFIDENCE_THRESHOLD - 0.01,
+    )
+    adapter = GreenhouseAdapter(
+        page=page, profile=_profile(), resume_document=_resume_document(resume_file), answer_engine=engine,
+    )
+
+    results = adapter.answer_questions()
+
+    assert page.locator("#why_q").input_value() == ""  # nothing typed on the candidate's behalf
+    assert engine.batches_seen == [["Why do you want to work here?"]]
+    withheld = [r for r in results if r.field_key == "Why do you want to work here?"]
+    assert len(withheld) == 1
+    assert withheld[0].filled is False
+    assert withheld[0].value_used is None
+    assert withheld[0].confidence == 0.0
 
 
 def test_answer_questions_leaves_field_unfilled_when_answer_engine_returns_nothing(page, resume_file):

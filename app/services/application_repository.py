@@ -84,6 +84,33 @@ def create_application(
     return application
 
 
+def retry_application(
+    db: Session,
+    application: Application,
+    *,
+    company: str | None,
+    position: str | None,
+    autopilot_enabled: bool,
+) -> Application:
+    """Re-arms a `failed`/`manual_required`/`needs_review` Application for
+    another attempt on the SAME row: keeps `application_id`, `created_at`,
+    `job_url`/`job_url_hash` (so the unique constraint stays satisfied and
+    its `AutomationRun` history in `apply_run_result` stays intact), but
+    clears every field the previous attempt left behind and refreshes the
+    per-run fields from this new request — exactly what a brand-new
+    Application would get, just without inserting a second row."""
+    application.status = "pending"
+    application.failure_reason = None
+    application.confidence_score = 0.0
+    application.company = company
+    application.position = position
+    application.autopilot_enabled = autopilot_enabled
+    application.updated_at = datetime.now(timezone.utc)
+    db.commit()
+    db.refresh(application)
+    return application
+
+
 def mark_processing(db: Session, application: Application) -> Application:
     application.status = "processing"
     application.updated_at = datetime.now(timezone.utc)
@@ -117,7 +144,10 @@ def apply_run_result(db: Session, application: Application, result) -> Applicati
     application.confidence_score = result.confidence
     if result.status == "applied":
         application.applied_date = datetime.now(timezone.utc)
-    application.failure_reason = result.error_log if result.status == "failed" else None
+    # manual_required's reason matters just as much as failed's — e.g. "this
+    # field is missing from your profile" is exactly what should surface on
+    # GET /applications/{id}, not just buried in the per-run AutomationRun row.
+    application.failure_reason = result.error_log if result.status in ("failed", "manual_required") else None
     application.updated_at = datetime.now(timezone.utc)
 
     run = AutomationRun(
