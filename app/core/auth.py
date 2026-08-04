@@ -20,7 +20,7 @@ from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy.orm import Session
 
 from app.core.config import JWT_SECRET, JWT_EXPIRE_MINUTES
-from app.core.database import get_db
+from app.core.database import get_db, read_with_reconnect
 from app.models.db_models import User
 
 _PBKDF2_ITERATIONS = 200_000
@@ -71,7 +71,12 @@ def get_current_user(
     except jwt.PyJWTError:
         raise credentials_error
 
-    user = db.query(User).filter(User.user_id == user_id).first()
+    # Every user-scoped request starts here, so a connection Neon killed while
+    # idle in the pool surfaces on this query first. It's a pure read, so it's
+    # safe to replay once on a fresh connection rather than 500-ing the request.
+    user = read_with_reconnect(
+        db, lambda s: s.query(User).filter(User.user_id == user_id).first()
+    )
     if not user:
         raise credentials_error
     return user

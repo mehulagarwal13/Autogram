@@ -872,3 +872,120 @@ which would be flaky.
 ON, at roughly 7s per field including the option probe and the inter-field
 pause. Budget ~2–3s per field: a 30-field form goes from seconds to about two
 minutes.
+
+## Stored-answer coverage — the fields a live Lever form left blank
+
+Source: `jobs.lever.co/leverdemo-8/a41e218e-01c6-4334-9849-dff3e0c027f6/apply`.
+Every text field, dropdown and radio group on that form filled correctly. Five
+things did not: **Pronouns**, **Gender** (EEO select), **Race**, **Veteran
+status**, the **"I identify my ethnicity as"** checkbox group, and the
+**"can contact me about future job opportunities"** opt-in. Three unrelated
+causes, fixed independently.
+
+**1. Stored demographic tokens never matched the form's wording**
+(`automation/forms/demographic_matching.py`). `candidate_demographics` stores
+canonical tokens — `non_binary`, `decline_to_answer`, `not_veteran`,
+`no_disability` — and real ATS dropdowns word the same answers as prose
+("Non-binary", "Decline to self-identify", "I am not a protected veteran", "No,
+I do not have a disability and have not had one in the past"). `match_option`
+correctly refuses every one of those pairings, so `_demographic_answer` found a
+stored value, failed to map it, and surfaced the question for a human anyway —
+the exact outcome storing the answer was supposed to prevent. The fix is a
+token→phrasing layer in front of the matcher (mechanical variants first, then a
+small ordered table of real-world phrasings, longest first so a spelled-out
+option wins over a bare "No" that containment would find ambiguous), NOT a
+looser matcher: every candidate string still has to resolve to exactly one
+option the DOM really has, and an unresolvable value still goes to a human.
+`match_option` itself moved to `automation/forms/option_matching.py` unchanged,
+because a second caller now needs the identical rules.
+
+**2. Checkbox GROUPS were unreachable by every pass**
+(`ats/base.py::_fill_checkbox_groups`). Pass 1 sees each member's own `<label>`
+("He/him"), which is an *option*, not a question, and matches no `FieldMapper`
+synonym; `_collect_for_answer_engine` then drops it (`_NON_FILLABLE_INPUT_TYPES`
+excludes checkboxes); pass 3's selector excludes them; and
+`_fill_consent_checkboxes` only looks at required legal text. The new pass walks
+up from each checkbox to the innermost ancestor that holds 2+ checkboxes and has
+prose of its own — the tightest container, so an EEO section holding both a
+pronoun group and an ethnicity group is never merged into one question — then
+answers it through `ApplicationAnswerEngine.stored_choices()`, which **never
+calls the LLM for any question**. Stricter than `answer_batch` deliberately: a
+wrongly-ticked box is indistinguishable from a deliberately-ticked one on a
+review screen, and the groups this exists for are pronouns and ethnicity.
+Members of a group nothing could answer are left UNMARKED, so two adjacent
+required consent boxes (technically a two-member "group") still reach
+`_fill_consent_checkboxes` instead of silently blocking submission.
+
+**3. Nothing could act on the marketing opt-in**
+(`ats/base.py::_fill_opt_in_checkboxes`). `CandidateProfile.marketing_opt_in` is
+tri-state and only an explicit `True` ticks the box; `None` (never asked) and
+`False` both leave the page exactly as it rendered. It reuses
+`field_mapper.looks_like_opt_in_label` — one definition of "this label is a
+marketing opt-in", shared by the code that refuses to treat it as a profile
+value and the code that acts on a real yes.
+
+**New profile fields.** `CandidateProfile`: `highest_education_level` (free text
+in the form's own vocabulary — "Bachelor's Degree" — because every ATS words its
+education dropdown differently), `willing_to_relocate`, `marketing_opt_in`.
+`CandidateDemographics`: `pronouns` (free text, not an enum: one live form offers
+nine sets plus "Custom") and `ethnicities` (JSONB list, for "select all that
+apply", falling back to `race_ethnicity` when only that is set).
+
+**New question categories.** `demographic_pronouns` — a demographic category,
+checked *before* `demographic_gender` since forms label it "Gender pronouns", and
+the one field where an LLM answer would be worst: the only thing a model could
+infer pronouns from is the candidate's name. Plus `highest_education_level` and
+`willing_to_relocate`, which are ordinary profile-backed factual categories: when
+the column is empty they fall through to the LLM+résumé path exactly as before,
+so the columns make the common case free and deterministic without taking away
+the fallback that already answered them.
+
+**What still goes to the LLM.** Everything else, unchanged — with the résumé
+facts and the two new columns now in the prompt payload. `marketing_opt_in` is
+deliberately kept OUT of the prompt: it is a consent decision, not a fact about
+the candidate, and the only thing allowed to act on it is the opt-in pass above.
+
+### Second tier — seven more profile fields, and one wrong answer
+
+Same exercise as above, applied to what a form asks *after* the EEO block. Six
+gaps and one defect.
+
+**The defect first, because it was a wrong answer rather than a blank.**
+`question_classifier` listed `"current ctc"` among the EXPECTED-salary phrases,
+so "What is your current CTC?" resolved to `expected_salary` and the candidate's
+*target* number was typed into a field asking what they earn today. A blank field
+costs a few seconds of review; a number asserting the candidate already earns
+their target is a negotiating position they never chose. `current_salary` /
+`current_salary_currency` are now their own columns, category, formatter and
+`FieldMapper` entry — the same "two different facts, never inferred from each
+other" split as `work_authorized` vs `requires_sponsorship`.
+
+**The gaps.** `preferred_name` ("What should we call you?" — falls back to
+`first_name`, which is not a guess), `referral_source` ("How did you hear about
+this job?"), `employment_type_preference` (stored as a token, reshaped to
+"Full-Time" because the raw token matches neither "Full-time" nor "Full Time"),
+`languages`, and `willing_background_check` (tri-state, like `marketing_opt_in`).
+
+**Language fluency is the one category that can't be an attribute formatter.**
+The question names *which* language — "Are you fluent in German?" — so the answer
+depends on the question text, not the profile alone, and
+`answer_engine._language_fluency_answer` handles it in the same question-aware
+way the demographic path does. A live Lever posting asked exactly this as a
+required radio group (Yes / No / Limited Working Proficiency) and it came back
+blank. `languages` is therefore a list of `{language, proficiency}` rather than
+bare names: answering a fluency question from a bare mention of English would be
+an assumption about degree. Three deliberate refusals, each of which would
+otherwise be an inference rather than an answer — a language the candidate never
+listed (an absent entry means "they didn't mention it", not "they don't speak
+it"), a question naming two of their languages at once, and an entry with no
+proficiency recorded. A `conversational` speaker gets "Limited Working
+Proficiency" where the form offers that band, and "No" where it only offers
+yes/no; `FLUENT_LANGUAGE_PROFICIENCIES` draws the line where the candidate drew
+it and is never widened for a better fill rate.
+
+**Two ordering constraints worth not breaking.** `preferred_name` sits *before*
+`first_name` in `FIELD_SYNONYMS` because "preferred first name" contains "first
+name" — the other order fills the preferred-name box with the legal first name
+and leaves the real one empty. And `languages` has no bare `"languages"` synonym:
+"Programming languages" is a near-universal field on engineering applications,
+and filling it with spoken languages would be confidently wrong.

@@ -61,9 +61,14 @@ from playwright.sync_api import Error as PlaywrightError, Locator
 
 from app.core.crypto import decrypt_field
 from automation.browser.selectors import find_file_upload_input, find_upload_trigger_button
-from automation.forms.answer_engine import ApplicationAnswerEngine, Question
+from automation.forms.answer_engine import (
+    DETERMINISTIC_CONFIDENCE,
+    ApplicationAnswerEngine,
+    Question,
+)
 from automation.forms.field_handlers import FieldFailure, describe_field, fill_field, read_field_options
-from automation.forms.field_mapper import FieldMapper
+from automation.forms.field_mapper import FieldMapper, looks_like_opt_in_label
+from automation.forms.profile_formatting import format_profile_value
 from automation.interfaces import CandidateProfile, ProfileDocument
 
 logger = logging.getLogger(__name__)
@@ -83,6 +88,22 @@ _AUTOMATION_EXAMINED_ATTR = "data-automation-examined"
 # can never change what an in-flight locator points at, so marking is free to
 # happen at the correct time (after the fill) rather than early.
 _AUTOMATION_CANDIDATE_ATTR = "data-automation-candidate"
+
+# The required-field marker, which is part of the RENDERED text of a question
+# and therefore rides along in any text recovered from the DOM. Lever uses
+# U+2731 HEAVY ASTERISK, not an ASCII "*" — observed live as
+# 'When are you available to start working?✱'. Left in place it travels into
+# the LLM prompt, into the persistent answer cache's key, and into synonym
+# matching, none of which want it. `_normalize_text` in field_mapper.py strips
+# a trailing ASCII asterisk only, so these need handling here too.
+_REQUIRED_MARKER_CHARS = "*✱＊∗﹡·•"
+
+
+def _strip_required_marker(text: str) -> str:
+    """Question text without its trailing required marker or the whitespace
+    around it. Only ever strips from the END: a leading bullet could be
+    meaningful content, and no ATS puts the marker first."""
+    return " ".join(text.split()).rstrip(_REQUIRED_MARKER_CHARS).strip()
 
 # Fields the name/placeholder pass can meaningfully fill by calling
 # `.fill()`/`.select_option()` on. Deliberately excludes checkbox/radio
@@ -201,6 +222,10 @@ class ATSAdapter(ABC):
         # attempt to answer these via `automation/forms/answer_engine.py`.
         self.answer_engine = answer_engine
         self._pending_answer_engine_questions: list[tuple[str, Locator]] = []
+        # Radio group `name`s already queued this sweep. A group asks ONE
+        # question but has N members, each of which reaches
+        # `_collect_for_answer_engine` through its own option label.
+        self._seen_radio_groups: set[str] = set()
 
     # ------------------------------------------------------------------
     # Abstract contract
@@ -345,8 +370,18 @@ class ATSAdapter(ABC):
         `_ENCRYPTED_PROFILE_PROPERTIES`). Every other attribute is read off
         `self.profile` exactly as before."""
         if attribute in _ENCRYPTED_PROFILE_PROPERTIES:
-            return getattr(self, attribute, None)
-        return getattr(self.profile, attribute, None)
+            raw = getattr(self, attribute, None)
+        else:
+            raw = getattr(self.profile, attribute, None)
+        # Raw column values are NOT form text. This used to be a bare getattr,
+        # so `requires_sponsorship` was typed into employers' forms as "True",
+        # `notice_period_days` as "30" rather than "30 days", `expected_salary`
+        # as "120000.0" and `years_of_experience` as "5.0" — all four observed
+        # on live postings. `format_profile_value` is the single shared
+        # formatter that `answer_engine` also routes through, so phrasing is
+        # decided in one place and a newly added typed column can't silently
+        # regress this (see `automation/forms/profile_formatting.py`).
+        return format_profile_value(self.profile, attribute, raw)
 
     def _match_label_to_profile_attribute(self, label_text: str) -> str | None:
         """Matches a question's label text against `FieldMapper` (Phase 5).
@@ -402,7 +437,11 @@ class ATSAdapter(ABC):
         (`_fill_questions_by_nearby_text` — this is the only pass that reaches
         Lever's screening questions), then — if an `ApplicationAnswerEngine`
         was injected (Phase 6) — every unmatched question those two passes
-        collected, batched into one call, then — for anything still not
+        collected, batched into one call, then every CHECKBOX GROUP ("Pronouns",
+        "I identify my ethnicity as — select all that apply") the passes above
+        structurally cannot see, plus the "may we contact you about future
+        roles" opt-in when — and only when — the candidate has opted in, then —
+        for anything still not
         examined — every remaining input/select/textarea's `name`/
         `placeholder` attributes directly, which catches fields an ATS
         renders with no `<label>` at all, then finally any required
@@ -413,6 +452,8 @@ class ATSAdapter(ABC):
         results = self._fill_questions_by_label()
         results.extend(self._fill_questions_by_nearby_text())
         results.extend(self._fill_questions_via_answer_engine())
+        results.extend(self._fill_checkbox_groups())
+        results.extend(self._fill_opt_in_checkboxes())
         results.extend(self._fill_questions_by_name_or_placeholder())
         results.extend(self._fill_consent_checkboxes())
         return results
@@ -424,6 +465,7 @@ class ATSAdapter(ABC):
         pass 2 never reconsiders the same field."""
         results: list[FieldFillResult] = []
         self._pending_answer_engine_questions = []
+        self._seen_radio_groups = set()
         labels = self.page.locator("label")
 
         try:
@@ -501,7 +543,94 @@ class ATSAdapter(ABC):
 
     #: `<input type=...>` values the answer engine must never try to `.fill()`
     #: — same exclusion list as `_MAPPABLE_FIELD_SELECTOR_TEMPLATE`'s pass 2.
-    _NON_FILLABLE_INPUT_TYPES = frozenset({"checkbox", "radio", "hidden", "submit", "button", "file"})
+    # `radio` is deliberately NOT here. It was, and that alone left a required
+    # question blank on a live Lever posting ("Are you fluent in English?" with
+    # Yes / No / Limited Working Proficiency): every member of the group hit
+    # this guard and the group was never asked at all. The exclusion made sense
+    # when the engine could only produce prose — typing a sentence at a radio
+    # is meaningless — but it is option-aware now, so a fixed-choice group is
+    # among the SAFEST things to send it: `read_field_options` supplies the real
+    # choices and `_match_option` discards anything that isn't one of them.
+    # Checkboxes stay excluded: they have their own narrow, consent-gated path
+    # (`_fill_consent_checkboxes`) and a checkbox is never a multi-choice
+    # question the engine should be picking an answer for.
+    _NON_FILLABLE_INPUT_TYPES = frozenset({"checkbox", "hidden", "submit", "button", "file"})
+
+    #: The question a RADIO GROUP asks, which is never any one member's own
+    #: label. On the live Lever form each radio is `<label><input>Yes</label>`,
+    #: so pass 1 sees the OPTION text ("Yes") and the real question sits four
+    #: ancestors up, in a container holding all three radios:
+    #:
+    #:     <li class="application-question">
+    #:       <div>Are you fluent in English?✱
+    #:         <div class="application-field">
+    #:           <ul><li><label><input type=radio value=Yes>Yes</label></li> ...
+    #:
+    #: `_NEARBY_QUESTION_TEXT_JS` cannot reach it: that helper stops as soon as
+    #: an ancestor holds more than one control, which is correct for a lone text
+    #: input (shared text must not be attributed to one of several fields) and
+    #: exactly wrong here, where several controls sharing one question IS the
+    #: shape. So this walks up while every control in the container belongs to
+    #: THIS radio group, and strips the option labels — a `<label>` that wraps a
+    #: member or points at one via `for` — leaving only the group's own prose.
+    _RADIO_GROUP_QUESTION_JS = """
+    el => {
+      const groupName = el.name;
+      const isMember = n => n.tagName === 'INPUT' && n.type === 'radio' && n.name === groupName;
+      let cur = el;
+      for (let i = 0; i < 6 && cur.parentElement; i++) {
+        cur = cur.parentElement;
+        const controls = Array.from(cur.querySelectorAll('input, textarea, select'));
+        if (!controls.length || !controls.every(isMember)) break;
+        const clone = cur.cloneNode(true);
+        clone.querySelectorAll('label').forEach(l => {
+          const wraps = !!l.querySelector('input[type="radio"]');
+          let pointsAt = null;
+          const forAttr = l.getAttribute('for');
+          if (forAttr) {
+            try { pointsAt = clone.querySelector('#' + CSS.escape(forAttr)); } catch (e) { pointsAt = null; }
+          }
+          if (wraps || (pointsAt && isMember(pointsAt))) l.remove();
+        });
+        clone.querySelectorAll('input, textarea, select, button').forEach(n => n.remove());
+        const text = (clone.textContent || '').replace(/\\s+/g, ' ').trim();
+        if (text.length >= 10 && text.length <= 400) return text;
+      }
+      return '';
+    }
+    """
+
+    def _radio_group_question(self, radio: Locator) -> str:
+        """The question a radio group asks, or "" if it can't be recovered."""
+        try:
+            return _strip_required_marker(radio.evaluate(self._RADIO_GROUP_QUESTION_JS) or "")
+        except PlaywrightError:
+            return ""
+
+    def _radio_group_name(self, radio: Locator) -> str:
+        try:
+            return radio.get_attribute("name") or ""
+        except PlaywrightError:
+            return ""
+
+    def _mark_radio_group_examined(self, radio: Locator) -> None:
+        """Marks every OTHER member of the group. The member being queued is
+        left unmarked for `_fill_questions_via_answer_engine` to mark after it
+        describes — the siblings are never described, and leaving them unmarked
+        would let pass 2 pick them up as separate fields."""
+        group_name = self._radio_group_name(radio)
+        if not group_name:
+            return
+        try:
+            radio.evaluate(
+                """(el, attr) => {
+                    document.querySelectorAll(`input[type="radio"][name="${CSS.escape(el.name)}"]`)
+                        .forEach(n => { if (n !== el) n.setAttribute(attr, '1'); });
+                }""",
+                _AUTOMATION_EXAMINED_ATTR,
+            )
+        except PlaywrightError as e:
+            logger.debug("Could not mark the rest of radio group %r (%s).", group_name, e)
 
     def _collect_for_answer_engine(self, text: str, label: Locator) -> None:
         """Records a labeled-but-FieldMapper-unmatched question as a
@@ -533,12 +662,36 @@ class ATSAdapter(ABC):
             tag_name = input_locator.evaluate("el => el.tagName.toLowerCase()")
             if tag_name not in ("input", "textarea", "select"):
                 return
+            input_type = ""
             if tag_name == "input":
                 input_type = (input_locator.get_attribute("type") or "text").lower()
                 if input_type in self._NON_FILLABLE_INPUT_TYPES:
                     return
         except PlaywrightError as e:
             logger.debug("Could not inspect the control for question %r (%s) — skipping.", text, e)
+            return
+
+        if input_type == "radio":
+            # `text` here is this member's OWN label — "Yes" — which is an
+            # option, not a question. Asking the engine "Yes" would be asking
+            # it nothing; three members would ask it three times.
+            group_name = self._radio_group_name(input_locator)
+            if group_name and group_name in self._seen_radio_groups:
+                return  # already queued once, via an earlier member's label
+            group_question = self._radio_group_question(input_locator)
+            if not group_question:
+                logger.debug(
+                    "Could not recover the question for radio group %r — leaving it for a human "
+                    "rather than asking the engine about the option label %r.",
+                    group_name, text,
+                )
+                return
+            if group_name:
+                self._seen_radio_groups.add(group_name)
+            self._mark_radio_group_examined(input_locator)
+            # The group's own question, and the member locator `RadioHandler`
+            # resolves the whole group from. Not marked here — see below.
+            self._pending_answer_engine_questions.append((group_question, input_locator))
             return
 
         # Marked immediately, not just once actually filled below — this is
@@ -651,9 +804,14 @@ class ATSAdapter(ABC):
     """
 
     def _nearby_question_text(self, input_locator) -> str:
-        """The question text sitting next to an unlabeled control, or ""."""
+        """The question text sitting next to an unlabeled control, or "".
+
+        The trailing required marker is stripped — it is rendered text, so it
+        arrives as part of the question ('When are you available to start
+        working?✱' on the live Lever form) and would otherwise end up in the
+        LLM prompt and in the answer cache's key. See `_strip_required_marker`."""
         try:
-            return (input_locator.evaluate(self._NEARBY_QUESTION_TEXT_JS) or "").strip()
+            return _strip_required_marker(input_locator.evaluate(self._NEARBY_QUESTION_TEXT_JS) or "")
         except PlaywrightError:
             return ""
 
@@ -865,6 +1023,226 @@ class ATSAdapter(ABC):
             results.append(FieldFillResult(
                 field_key=field_key, profile_path=attribute, value_used=value,
                 confidence=confidence if outcome.filled else 0.0, filled=outcome.filled, failure=outcome.failure,
+            ))
+
+        return results
+
+    # ------------------------------------------------------------------
+    # Checkbox groups ("select all that apply") and the marketing opt-in
+    # ------------------------------------------------------------------
+
+    #: Recovers, for ONE checkbox: its own option label, the question its GROUP
+    #: asks, and how many members that group has.
+    #:
+    #: A checkbox group is invisible to every other pass by construction, which
+    #: is why "Pronouns" and "I identify my ethnicity as" came back untouched on
+    #: a live Lever form where everything else filled: pass 1 sees each member's
+    #: own `<label>` ("He/him"), which is an OPTION rather than a question and
+    #: matches no `FieldMapper` synonym; `_collect_for_answer_engine` then drops
+    #: it because `_NON_FILLABLE_INPUT_TYPES` excludes checkboxes; pass 3's
+    #: selector excludes them too; and `_fill_consent_checkboxes` only ever
+    #: looks at required legal-consent text.
+    #:
+    #: Same ancestor-walk shape as `_RADIO_GROUP_QUESTION_JS`, with two
+    #: deliberate differences:
+    #:
+    #: - Membership is "any checkbox", not "same `name`". Real forms build these
+    #:   groups both ways — one shared `name="...[]"` (Rails/PHP multi-value
+    #:   convention) or a distinct `name` per box — and the container is the
+    #:   thing that actually delimits the question either way.
+    #: - It returns the FIRST (innermost) ancestor that both holds 2+ checkboxes
+    #:   and has prose of its own, then stops. Climbing to the outermost
+    #:   all-checkbox ancestor would happily merge two adjacent groups (an EEO
+    #:   section holding both a pronoun group and an ethnicity group) into one
+    #:   question belonging to neither.
+    _CHECKBOX_GROUP_JS = """
+    el => {
+      const clean = t => (t || '').replace(/\\s+/g, ' ').trim();
+      const ownLabel = (() => {
+        const wrapping = el.closest('label');
+        if (wrapping) return wrapping.textContent;
+        const forAttr = el.id;
+        if (forAttr) {
+          try {
+            const l = document.querySelector(`label[for="${CSS.escape(forAttr)}"]`);
+            if (l) return l.textContent;
+          } catch (e) {}
+        }
+        return el.getAttribute('aria-label') || el.value || '';
+      })();
+      const isMember = n => n.tagName === 'INPUT' && n.type === 'checkbox';
+      let cur = el;
+      for (let i = 0; i < 6 && cur.parentElement; i++) {
+        cur = cur.parentElement;
+        const controls = Array.from(cur.querySelectorAll('input, textarea, select'));
+        if (!controls.length || !controls.every(isMember)) break;
+        if (controls.length < 2) continue;
+        const clone = cur.cloneNode(true);
+        clone.querySelectorAll('label').forEach(l => {
+          const wraps = !!l.querySelector('input[type="checkbox"]');
+          let pointsAt = null;
+          const forAttr = l.getAttribute('for');
+          if (forAttr) {
+            try { pointsAt = clone.querySelector('#' + CSS.escape(forAttr)); } catch (e) { pointsAt = null; }
+          }
+          if (wraps || (pointsAt && isMember(pointsAt))) l.remove();
+        });
+        clone.querySelectorAll('input, textarea, select, button').forEach(n => n.remove());
+        const text = clean(clone.textContent);
+        if (text.length >= 3 && text.length <= 400) {
+          return {ownLabel: clean(ownLabel), question: text, size: controls.length};
+        }
+      }
+      return {ownLabel: clean(ownLabel), question: '', size: 0};
+    }
+    """
+
+    def _fill_checkbox_groups(self) -> list[FieldFillResult]:
+        """Ticks the members of a "select all that apply" checkbox group that
+        the candidate's own STORED answers name — pronouns, ethnicity.
+
+        Answered exclusively through `ApplicationAnswerEngine.stored_choices()`,
+        which never calls the LLM for any question. That is stricter than the
+        answer-engine pass above, on purpose: a wrongly-ticked box is the least
+        visible mistake this system can make (on a review screen it looks
+        identical to a deliberately-ticked one), and the two groups this exists
+        for are pronouns and ethnicity, where a guess is worse than a blank in
+        every direction.
+
+        No engine injected means no pass at all — the engine is what holds the
+        DB session the demographics row is read through. That matches how every
+        other Phase 6+ pass degrades.
+
+        Members of a group nothing could answer are deliberately left UNMARKED
+        rather than stamped as examined: two adjacent required consent
+        checkboxes are technically a two-member "group" with a section heading
+        for a question, and marking them here would make
+        `_fill_consent_checkboxes` skip them and silently block submission."""
+        if self.answer_engine is None:
+            return []
+
+        checkboxes = self._stamp_candidates(
+            f"input[type='checkbox']:not([{_AUTOMATION_EXAMINED_ATTR}])"
+        )
+        if not checkboxes:
+            return []
+
+        # question -> [(member_label, locator)], in DOM order. Grouping on the
+        # recovered question text is what stitches N members back into the one
+        # question they collectively ask.
+        groups: dict[str, list[tuple[str, Locator]]] = {}
+        for checkbox in checkboxes:
+            try:
+                if not checkbox.is_visible():
+                    continue
+                info = checkbox.evaluate(self._CHECKBOX_GROUP_JS)
+            except PlaywrightError as e:
+                logger.debug("Could not inspect a checkbox for group detection (%s) — skipping it.", e)
+                continue
+            if not isinstance(info, dict):
+                continue
+            question = _strip_required_marker(str(info.get("question") or ""))
+            member_label = _strip_required_marker(str(info.get("ownLabel") or ""))
+            if not question or not member_label or int(info.get("size") or 0) < 2:
+                continue
+            groups.setdefault(question, []).append((member_label, checkbox))
+
+        results: list[FieldFillResult] = []
+        for question, members in groups.items():
+            if len(members) < 2:
+                continue  # only one member actually resolved — not a group we can read
+            options = list(dict.fromkeys(label for label, _ in members))
+            try:
+                chosen = self.answer_engine.stored_choices(Question(text=question, options=options))
+            except Exception as e:  # noqa: BLE001 - a broken engine call must never abort the sweep
+                logger.debug("stored_choices failed for checkbox group %r (%s) — leaving it blank.", question, e)
+                continue
+            if not chosen:
+                logger.debug(
+                    "Nothing stored answers the checkbox group %r (%d options) — leaving it for a human.",
+                    question, len(options),
+                )
+                continue
+
+            for member_label, locator in members:
+                if member_label not in chosen:
+                    continue
+                self._mark_examined(locator)
+                field = describe_field(
+                    locator, label=f"{question} — {member_label}",
+                    page=self.page, profile_attribute="checkbox_group",
+                )
+                outcome = fill_field(field, True, context=self._fill_context())
+                results.append(FieldFillResult(
+                    field_key=f"{question} — {member_label}", profile_path="checkbox_group",
+                    value_used=member_label,
+                    confidence=DETERMINISTIC_CONFIDENCE if outcome.filled else 0.0,
+                    filled=outcome.filled, failure=outcome.failure,
+                ))
+
+        return results
+
+    def _fill_opt_in_checkboxes(self) -> list[FieldFillResult]:
+        """Ticks a "Yes, <company> can contact me about future roles" marketing
+        opt-in — and ONLY when `profile.marketing_opt_in` is exactly `True`.
+
+        `None` (never asked) and `False` are both left as the page rendered
+        them, unticked, and this pass then does nothing at all. Consent is the
+        one thing in this codebase that is never inferred from silence, so the
+        tri-state is the point rather than an accident: the alternative reading
+        of `None` — "probably fine" — is how an automation subscribes someone to
+        a talent-pool mailing list they never agreed to.
+
+        Reuses `field_mapper.looks_like_opt_in_label`, the same predicate that
+        stops opt-in prose from resolving to a profile VALUE (see
+        `automation/tests/test_checkbox_intent.py`) — one definition of "this
+        label is a marketing opt-in", used by both the code that refuses to
+        touch it and the code that acts on an explicit yes."""
+        if getattr(self.profile, "marketing_opt_in", None) is not True:
+            return []
+
+        results: list[FieldFillResult] = []
+        labels = self.page.locator("label")
+        try:
+            label_count = labels.count()
+        except PlaywrightError:
+            return results
+
+        for i in range(label_count):
+            label = labels.nth(i)
+            try:
+                text = (label.text_content() or "").strip()
+            except PlaywrightError:
+                continue
+            if not text or not looks_like_opt_in_label(text):
+                continue
+
+            try:
+                input_locator = self._input_for_label(label)
+            except Exception as e:  # noqa: BLE001 - one broken selector must never abort the sweep
+                logger.debug("Could not resolve the control for opt-in label %r (%s) — skipping.", text, e)
+                continue
+            if input_locator is None:
+                continue
+
+            try:
+                already_examined = input_locator.get_attribute(_AUTOMATION_EXAMINED_ATTR)
+                tag_name = input_locator.evaluate("el => el.tagName.toLowerCase()")
+                input_type = (input_locator.get_attribute("type") or "").lower() if tag_name == "input" else ""
+                is_visible = input_locator.is_visible()
+            except PlaywrightError as e:
+                logger.debug("Could not inspect opt-in checkbox candidate %r (%s) — skipping.", text, e)
+                continue
+            if already_examined or input_type != "checkbox" or not is_visible:
+                continue
+
+            self._mark_examined(input_locator)
+            field = describe_field(input_locator, label=text, page=self.page, profile_attribute="marketing_opt_in")
+            outcome = fill_field(field, True, context=self._fill_context())
+            results.append(FieldFillResult(
+                field_key=text, profile_path="marketing_opt_in", value_used=True,
+                confidence=DETERMINISTIC_CONFIDENCE if outcome.filled else 0.0,
+                filled=outcome.filled, failure=outcome.failure,
             ))
 
         return results

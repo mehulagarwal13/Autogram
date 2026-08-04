@@ -15,6 +15,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from app.core.config import RATE_LIMIT_PER_MINUTE
+from app.core.database import is_disconnect_error
 
 logger = logging.getLogger("app.request")
 
@@ -62,8 +63,20 @@ def register_middleware(app: FastAPI) -> None:
         start = time.perf_counter()
         try:
             response = await call_next(request)
-        except Exception:
+        except Exception as e:
             # Nothing unhandled ever leaks a stack trace to the client.
+            # A dropped Neon connection isn't a bug in the request — it's a
+            # transient upstream outage, so it gets 503 (retryable) rather than
+            # 500, which would tell the caller their request was malformed.
+            if is_disconnect_error(e):
+                logger.warning(
+                    "Database connection lost on %s %s", request.method, request.url.path,
+                )
+                return JSONResponse(
+                    status_code=503,
+                    content={"detail": "Database temporarily unavailable. Please retry."},
+                    headers={"Retry-After": "2"},
+                )
             logger.exception("Unhandled error on %s %s", request.method, request.url.path)
             return JSONResponse(
                 status_code=500,

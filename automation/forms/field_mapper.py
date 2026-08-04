@@ -44,6 +44,14 @@ from functools import lru_cache
 # plaintext-facing key `app/services/profile_repository.py` uses — "phone",
 # "address" — never the `_encrypted` column name itself).
 FIELD_SYNONYMS: dict[str, list[str]] = {
+    # BEFORE "first_name", and the order is load-bearing:
+    # `_first_matching_attribute` returns the first entry that matches while
+    # iterating this table, and "preferred first name" contains "first name". Put
+    # this after `first_name` and a form's preferred-name field gets the
+    # candidate's LEGAL first name typed into it while the real first-name field
+    # goes unfilled. `format_preferred_name` already falls back to `first_name`
+    # when nothing is stored, so nothing is lost by claiming it here.
+    "preferred_name": ["preferred name", "preferred first name", "nickname", "name you go by"],
     "first_name": ["first name", "given name", "legal first name"],
     "last_name": ["last name", "surname", "family name", "legal last name"],
     "full_name": ["full name", "candidate name", "your name"],
@@ -62,6 +70,11 @@ FIELD_SYNONYMS: dict[str, list[str]] = {
     "current_role": ["current title", "current role", "current position"],
     "years_of_experience": ["years of experience", "total experience"],
     "notice_period_days": ["notice period"],
+    # Current before expected: these are different facts (see
+    # `CandidateProfile.current_salary`), and neither synonym list contains the
+    # other's phrasing, so the ordering here is documentation rather than a
+    # dependency.
+    "current_salary": ["current salary", "current ctc", "current compensation", "current package"],
     "expected_salary": ["expected salary", "expected ctc", "salary expectation"],
     "expected_salary_currency": ["salary currency", "currency"],
     "work_authorization": ["work authorization", "authorized to work"],
@@ -79,6 +92,26 @@ FIELD_SYNONYMS: dict[str, list[str]] = {
     # `requires_sponsorship`'s own synonyms don't overlap with either.
     "requires_sponsorship": ["require sponsorship", "visa sponsorship", "need sponsorship"],
     "visa_type": ["visa type", "type of visa"],
+    # Two more profile-backed facts forms ask for directly. Both also have a
+    # `question_classifier` category for when they arrive as a full sentence
+    # rather than a short label — this table is the short-label half (a
+    # `<select name="education_level">`, a "Willing to relocate?" checkbox), and
+    # the two layers overlapping in vocabulary is by design (see that module's
+    # docstring). No "relocation"/"relocate" on its own here either: "relocation
+    # assistance" is a question about money, not willingness.
+    "highest_education_level": [
+        "highest level of education", "highest education level", "highest education",
+        "level of education", "education level", "highest degree",
+    ],
+    "willing_to_relocate": ["willing to relocate", "open to relocation", "able to relocate"],
+    "referral_source": ["how did you hear", "how did you find", "referral source"],
+    "employment_type_preference": ["employment type", "type of employment", "employment preference"],
+    "willing_background_check": ["background check", "background screening"],
+    # "languages spoken", never a bare "languages": a "Programming languages"
+    # field is extremely common on engineering applications, and filling it with
+    # the candidate's SPOKEN languages would be confidently wrong. Their
+    # programming languages live in `skills`, which this table doesn't map.
+    "languages": ["languages spoken", "spoken languages", "languages you speak"],
 }
 
 # Confidence per signal tier, decreasing certainty top to bottom — mirrors
@@ -153,6 +186,49 @@ def _matches_synonym(normalized: str, synonyms: list[str]) -> bool:
     return any(_synonym_pattern(synonym).search(normalized) for synonym in synonyms)
 
 
+#: Prose that marks a label as a marketing/consent OPT-IN — a boolean choice
+#: the candidate makes — rather than a request for a profile value.
+#:
+#: The bug this fixes: "Send me job alerts by email" matched the `email`
+#: synonym (correctly, on a word boundary — "by email"), resolved to
+#: `('email', 0.9)`, and the candidate's email address was then handed to
+#: `CheckboxHandler`, which ticked the marketing opt-in. Confidence 0.9 is
+#: above the auto-submit bar, so a candidate could be silently subscribed to
+#: marketing email on a real application.
+#:
+#: These labels belong to the checkbox-intent path, never the text-value path,
+#: so a match here suppresses the mapping regardless of which synonym hit.
+#: Written as patterns, not one label: any future "Notify me about...",
+#: "Subscribe to...", "Sign up for..." phrasing is covered too.
+#:
+#: Deliberately applied ONLY to prose signals (label, nearby text) and NOT to
+#: `name`/`id`. A machine identifier like `name="email"` is never marketing
+#: prose, and suppressing on it would break ordinary email fields.
+_OPT_IN_LABEL_PATTERNS = tuple(re.compile(pattern, re.IGNORECASE) for pattern in (
+    r"\bsend me\b",
+    r"\bnotify me\b",
+    r"\bemail me\b",
+    r"\btext me\b",
+    r"\bcontact me (about|with|regarding)\b",
+    r"\bsubscribe\b",
+    r"\bopt[\s-]?in\b",
+    r"\bsign me up\b",
+    r"\bsign up for\b",
+    r"\bkeep me (posted|informed|updated|in the loop)\b",
+    r"\b(job|email|marketing) alerts\b",
+    r"\bnewsletter\b",
+    r"\bi (would like|want) to receive\b",
+    r"\breceive (updates|news|emails|marketing|communications|notifications)\b",
+))
+
+
+def looks_like_opt_in_label(text: str) -> bool:
+    """True when `text` reads as a marketing/consent opt-in rather than a
+    request for a value. Public because `automation/ats/base.py` and its tests
+    reason about the same distinction."""
+    return any(pattern.search(text) for pattern in _OPT_IN_LABEL_PATTERNS)
+
+
 def _first_matching_attribute(normalized: str) -> str | None:
     if not normalized:
         return None
@@ -192,7 +268,10 @@ class FieldMapper:
             if attribute:
                 return attribute, NAME_MATCH_CONFIDENCE
 
-        if label:
+        # Prose signals only: an opt-in label is a boolean choice, not a value
+        # request, so it must not resolve to a profile attribute even when a
+        # synonym legitimately matches inside it. See `_OPT_IN_LABEL_PATTERNS`.
+        if label and not looks_like_opt_in_label(label):
             attribute = _first_matching_attribute(_normalize_text(label))
             if attribute:
                 return attribute, LABEL_MATCH_CONFIDENCE
@@ -202,7 +281,7 @@ class FieldMapper:
             if attribute:
                 return attribute, PLACEHOLDER_MATCH_CONFIDENCE
 
-        if nearby_text:
+        if nearby_text and not looks_like_opt_in_label(nearby_text):
             attribute = _first_matching_attribute(_normalize_text(nearby_text))
             if attribute:
                 return attribute, NEARBY_TEXT_MATCH_CONFIDENCE

@@ -434,14 +434,54 @@ _CHECKBOX_NEGATIVE_TEXT = {"no", "n", "false", "0", "off", "unchecked", "disagre
 _FAST_ACTION_TIMEOUT_MS = 1000
 
 
-def _coerce_checkbox_intent(value) -> bool:
-    """What a checkbox should end up as for a given `value`. Booleans pass
-    through directly; recognized negative words uncheck; anything else
-    non-empty (FieldMapper/AnswerEngine never call in with None/""/[] —
-    see `fill_field`) is treated as an affirmative — checked."""
+_CHECKBOX_AFFIRMATIVE_TEXT = {
+    "yes", "y", "true", "1", "on", "checked", "agree", "agreed", "accept",
+    "accepted", "consent", "confirm", "confirmed", "acknowledge", "acknowledged",
+    "i agree", "i accept", "i consent", "i acknowledge", "i confirm",
+}
+
+#: Splits an answer into its leading token so "Yes, I agree" and "No, thanks"
+#: still resolve, while "Noida, India" does not (its first token is "noida").
+_LEADING_TOKEN = re.compile(r"[\s,.;:!/()\-]+")
+
+
+def _coerce_checkbox_intent(value) -> bool | None:
+    """What a checkbox should end up as for `value` — or `None` for "this is
+    not a boolean answer, don't touch the box."
+
+    This used to return `True` for anything not on `_CHECKBOX_NEGATIVE_TEXT`,
+    which meant a checkbox mis-mapped to ANY text profile field was always
+    ticked. Observed live: a "Send me job alerts by email" opt-in matched the
+    `email` synonym, received the candidate's email address as its "value",
+    and got checked — the candidate silently subscribed to marketing, at a
+    confidence above the auto-submit bar.
+
+    A blocklist is the wrong shape for this decision. The set of strings that
+    legitimately mean "check this box" is small and enumerable; the set of
+    arbitrary profile text is not. So this is now an ALLOWLIST in both
+    directions, and anything unrecognized refuses.
+
+    Refusing is deliberately independent of the `FieldMapper` opt-in-label fix
+    (`field_mapper.looks_like_opt_in_label`). That one stops this particular
+    mis-mapping at its source; this one makes every OTHER mis-mapping — present
+    or future, whatever synonym causes it — fail safe rather than tick a box on
+    the candidate's behalf.
+    """
     if isinstance(value, bool):
         return value
-    return _normalize_for_compare(str(value)) not in _CHECKBOX_NEGATIVE_TEXT
+    normalized = _normalize_for_compare(str(value))
+    if not normalized:
+        return None
+    if normalized in _CHECKBOX_NEGATIVE_TEXT:
+        return False
+    if normalized in _CHECKBOX_AFFIRMATIVE_TEXT:
+        return True
+    leading = _LEADING_TOKEN.split(normalized, maxsplit=1)[0]
+    if leading in _CHECKBOX_NEGATIVE_TEXT:
+        return False
+    if leading in _CHECKBOX_AFFIRMATIVE_TEXT:
+        return True
+    return None
 
 
 def _find_label_for(page: Page, input_locator: Locator) -> Locator | None:
@@ -485,6 +525,45 @@ def _element_tag_and_type(locator: Locator) -> tuple[str, str]:
     return tag, input_type
 
 
+#: `CheckboxHandler`'s last-resort JavaScript state flip, branching on what the
+#: widget actually IS.
+#:
+#: The gap this closes: a `role="checkbox"` `<div>` has no `.checked` property.
+#: Assigning one just creates an expando nobody reads, and `input`/`change`
+#: aren't the events a custom widget listens for — so the original
+#: single-branch script was a guaranteed no-op on precisely the widget class
+#: the fallback existed to rescue. The box stayed unchecked and `verify()`
+#: correctly reported `verification_failed`; the fallback contributed nothing.
+#:
+#: For an ARIA widget the state lives in `aria-checked` and the event it
+#: listens for is `click`. Dispatching the click FIRST is deliberate: a widget
+#: with a real handler updates its own internal (React/Vue/...) state alongside
+#: the attribute, and a bare `setAttribute` would leave those two disagreeing —
+#: the attribute would say checked while the component's state said otherwise,
+#: which is exactly the kind of inconsistency that gets dropped on submit. The
+#: attribute is only forced when the dispatched click did NOT achieve the
+#: intent, i.e. a widget with no working handler at all.
+#:
+#: Native `<input type=checkbox>` keeps the original `.checked` + input/change
+#: behavior unchanged — for that element it is correct.
+_CHECKBOX_STATE_FLIP_JS = """
+(el, checked) => {
+  const role = (el.getAttribute('role') || '').toLowerCase();
+  if (el.tagName !== 'INPUT' && role === 'checkbox') {
+    const isOn = () => (el.getAttribute('aria-checked') || '').toLowerCase() === 'true';
+    el.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true}));
+    if (isOn() !== checked) {
+      el.setAttribute('aria-checked', checked ? 'true' : 'false');
+    }
+    return;
+  }
+  el.checked = checked;
+  el.dispatchEvent(new Event('input', {bubbles: true}));
+  el.dispatchEvent(new Event('change', {bubbles: true}));
+}
+"""
+
+
 class CheckboxHandler(FieldHandler):
     """Handles both a native `<input type=checkbox>` and a custom
     `role="checkbox"` element (PART 9). The common, previously-unhandled
@@ -520,6 +599,13 @@ class CheckboxHandler(FieldHandler):
 
     def fill(self, field: Field, value) -> None:
         intent = _coerce_checkbox_intent(value)
+        if intent is None:
+            raise FieldFillRefused(
+                "non_boolean_checkbox_value",
+                f"{value!r} is not a yes/no answer, so {field.label!r} is left as the candidate "
+                "set it. A checkbox is only ever ticked from a genuinely boolean-shaped value.",
+                context={"rejected_checkbox_value": str(value)},
+            )
         if self._safe_is_checked(field) == intent:
             return  # already in the desired state
 
@@ -562,18 +648,18 @@ class CheckboxHandler(FieldHandler):
         # would trigger, so this is deliberately the LEAST preferred
         # strategy, never the default.
         try:
-            field.locator.evaluate(
-                "(el, checked) => { el.checked = checked; "
-                "el.dispatchEvent(new Event('input', {bubbles: true})); "
-                "el.dispatchEvent(new Event('change', {bubbles: true})); }",
-                intent,
-            )
+            field.locator.evaluate(_CHECKBOX_STATE_FLIP_JS, intent)
         except PlaywrightError as e:
             logger.debug("JavaScript fallback checkbox flip for %r also failed (%s).", field.label, e)
 
     def verify(self, field: Field, value) -> tuple[bool, str | None]:
         actual_checked = self._safe_is_checked(field)
-        return actual_checked == _coerce_checkbox_intent(value), str(actual_checked)
+        intent = _coerce_checkbox_intent(value)
+        if intent is None:
+            # Unreachable via `fill_field` (fill refuses first), but a direct
+            # caller must not get a bogus pass out of it either.
+            return False, str(actual_checked)
+        return actual_checked == intent, str(actual_checked)
 
 
 class ToggleHandler(FieldHandler):
@@ -608,13 +694,25 @@ class ToggleHandler(FieldHandler):
 
     def fill(self, field: Field, value) -> None:
         intent = _coerce_checkbox_intent(value)
+        if intent is None:
+            # Same reasoning as CheckboxHandler: a toggle is a boolean control,
+            # and clicking it on the strength of arbitrary text would flip a
+            # real preference on the candidate's behalf.
+            raise FieldFillRefused(
+                "non_boolean_toggle_value",
+                f"{value!r} is not a yes/no answer, so the toggle {field.label!r} is left alone.",
+                context={"rejected_toggle_value": str(value)},
+            )
         if self._is_on(field) == intent:
             return  # already in the desired state — clicking would flip it the wrong way
         safe_click(field.locator, field.page)
 
     def verify(self, field: Field, value) -> tuple[bool, str | None]:
         actual = self._is_on(field)
-        return actual == _coerce_checkbox_intent(value), str(actual)
+        intent = _coerce_checkbox_intent(value)
+        if intent is None:
+            return False, str(actual)
+        return actual == intent, str(actual)
 
 
 def _radio_option_text(page: Page, radio: Locator) -> str:

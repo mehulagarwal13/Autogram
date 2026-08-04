@@ -18,6 +18,10 @@ email-validator
 pytest
 cryptography      # field-level encryption for candidate profile PII (phone, address)
 
+# --- Object storage (STORAGE_BACKEND=s3 — see app/services/storage/) ---
+boto3             # only actually connects to S3 when STORAGE_BACKEND=s3; harmless to install otherwise
+moto[s3]          # test-only: mocks S3 for tests/test_storage_backends.py, no real AWS calls made
+
 # --- Optional: OCR fallback for scanned/image PDFs ---
 # Uncomment the two lines below AND install the Tesseract engine binary
 # (https://github.com/tesseract-ocr/tesseract) to enable OCR.

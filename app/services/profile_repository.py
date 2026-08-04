@@ -31,6 +31,14 @@ _PLAIN_PROFILE_FIELDS = [
     # Phase 8 — compliance screening questions (see db_models.py's CandidateProfile docstring).
     "work_authorized", "requires_sponsorship", "visa_type", "sponsorship_countries",
     "preferred_locations", "remote_preference",
+    # Form-answer fields (see db_models.py::CandidateProfile) — ordinary profile
+    # data, settable through the normal POST/PATCH /profile path. Note
+    # `marketing_opt_in` lives here rather than with the demographics below
+    # because it is a preference the user states about themselves, not
+    # protected-class data; it shares only the tri-state/never-inferred rule.
+    "highest_education_level", "willing_to_relocate", "marketing_opt_in",
+    "preferred_name", "current_salary", "current_salary_currency", "referral_source",
+    "employment_type_preference", "languages", "willing_background_check",
 ]
 
 
@@ -248,7 +256,10 @@ def delete_document(db: Session, document: ProfileDocument) -> None:
 # table — see `app/models/db_models.py::CandidateDemographics` and
 # `automation/forms/answer_engine.py` for the enforcement side of that rule.
 
-_DEMOGRAPHICS_FIELDS = ["gender", "veteran_status", "disability_status", "race_ethnicity"]
+_DEMOGRAPHICS_FIELDS = [
+    "gender", "veteran_status", "disability_status", "race_ethnicity",
+    "pronouns", "ethnicities",
+]
 
 
 def get_demographics(db: Session, profile_id: str) -> CandidateDemographics | None:

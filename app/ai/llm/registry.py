@@ -47,6 +47,29 @@ TASK_ROUTES: dict[str, TaskRoute] = {
         max_tokens=800,            # a form-sized batch of short answers, not an essay each
         json_mode=True,            # {"answers": [...]} — see automation/forms/answer_engine.py
     ),
+    # --- Phase 2 prep (see PHASE2_ARCHITECTURE.md Initiative 1) ---
+    # automation/agents/*.py will call these once the LangGraph agent layer
+    # is built. Registered here now so the route (and its cost/latency
+    # profile) is decided up front rather than hardcoded inside an agent.
+    # Left on gpt-4.1-mini for both, same as every other route above:
+    # whether either of these should move to a premium model (gpt-4.1 /
+    # gpt-4o) is a pending product decision, not a default made here — see
+    # PHASE2_ARCHITECTURE.md §0 (the README's "premium tier" claim currently
+    # describes removed functionality, not a route that exists in this file).
+    "field_reasoning": TaskRoute(
+        provider="openai",
+        model="gpt-4.1-mini",
+        temperature=0.0,
+        max_tokens=600,
+        json_mode=True,   # {"field_key": ..., "value": ..., "confidence": ...}
+    ),
+    "resume_selection": TaskRoute(
+        provider="openai",
+        model="gpt-4.1-mini",
+        temperature=0.0,
+        max_tokens=400,
+        json_mode=True,   # {"document_id": ..., "confidence": ..., "reason": ...}
+    ),
 }
 
 

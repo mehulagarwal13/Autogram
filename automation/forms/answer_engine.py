@@ -25,10 +25,14 @@ Two paths, cheapest first:
    question ever reaches this class.
 
    **Demographic questions (Phase 8) are a hard exception to "fall through
-   to the LLM":** gender, veteran status, disability status, and
-   race/ethnicity are NEVER answered by the LLM and NEVER inferred — only
+   to the LLM":** gender, veteran status, disability status, race/ethnicity,
+   and pronouns are NEVER answered by the LLM and NEVER inferred — only
    from a value the candidate explicitly stored via `PUT
    /profile/demographics` (`app/models/db_models.py::CandidateDemographics`).
+   What IS stored is a canonical token, and forms word the same answers as
+   prose, so the two are bridged by
+   `automation/forms/demographic_matching.py` rather than by loosening the
+   option matcher for everything else.
    If nothing is stored yet, the question is surfaced as
    `SOURCE_NEEDS_USER_INPUT` (zero confidence, empty answer) instead of ever
    reaching `_call_llm` — see `_demographic_answer` below.
@@ -82,17 +86,50 @@ from typing import Callable, Iterable, Sequence
 from sqlalchemy.orm import Session
 
 from app.services import answer_cache_repository
+from automation.forms.demographic_matching import (
+    match_demographic_value,
+    match_demographic_values,
+)
+from automation.forms.option_matching import match_option as _match_option
 from automation.forms.question_classifier import (
+    CATEGORY_BACKGROUND_CHECK,
+    CATEGORY_CURRENT_SALARY,
+    CATEGORY_EMPLOYMENT_TYPE,
     CATEGORY_EXPECTED_SALARY,
+    CATEGORY_HIGHEST_EDUCATION,
+    CATEGORY_LANGUAGE_FLUENCY,
     CATEGORY_NOTICE_PERIOD,
+    CATEGORY_PREFERRED_NAME,
+    CATEGORY_REFERRAL_SOURCE,
     CATEGORY_REQUIRES_SPONSORSHIP,
     CATEGORY_VISA_TYPE,
+    CATEGORY_WILLING_TO_RELOCATE,
     CATEGORY_WORK_AUTHORIZED,
     CATEGORY_YEARS_OF_EXPERIENCE,
+    MULTI_VALUE_DEMOGRAPHIC_CATEGORIES,
     classify_question,
     is_demographic,
 )
+from automation.forms.profile_formatting import (
+    format_current_salary,
+    format_employment_type,
+    format_expected_salary,
+    format_highest_education_level,
+    format_languages,
+    format_notice_period,
+    format_preferred_name,
+    format_referral_source,
+    format_requires_sponsorship,
+    format_visa_type,
+    format_willing_background_check,
+    format_willing_to_relocate,
+    format_work_authorized,
+    format_years_of_experience,
+    normalized_languages,
+)
+from automation.forms.resume_context import ResumeContext, load_resume_context
 from automation.interfaces import (
+    FLUENT_LANGUAGE_PROFICIENCIES,
     CandidateDemographics,
     CandidateProfile,
     generate_answer,
@@ -165,60 +202,31 @@ SOURCE_NEEDS_USER_INPUT = "needs_user_input"
 # module's job is purely "given a category, what's the answer" — reading the
 # right `CandidateProfile`/`CandidateDemographics` field and formatting it.
 
-def _format_requires_sponsorship(profile: CandidateProfile) -> str | None:
-    """Prefers the new boolean `requires_sponsorship` (a real yes/no fact) —
-    only falls back to echoing the old free-text `work_authorization`/
-    `visa_status` fields (pre-Phase-8 behavior, kept for any profile that
-    hasn't set the new field yet) when the boolean itself was never set."""
-    if profile.requires_sponsorship is not None:
-        answer = "Yes" if profile.requires_sponsorship else "No"
-        if profile.requires_sponsorship and profile.visa_type:
-            answer += f" ({profile.visa_type})"
-        return answer
-    return profile.work_authorization or profile.visa_status or None
-
-
-def _format_work_authorized(profile: CandidateProfile) -> str | None:
-    """Same pattern as `_format_requires_sponsorship`: prefer the real
-    boolean; fall back to the old free-text echo if it was never set."""
-    if profile.work_authorized is not None:
-        return "Yes" if profile.work_authorized else "No"
-    return profile.work_authorization or profile.visa_status or None
-
-
-def _format_visa_type(profile: CandidateProfile) -> str | None:
-    return profile.visa_type or None
-
-
-def _format_notice_period(profile: CandidateProfile) -> str | None:
-    if profile.notice_period_days is None:
-        return None
-    return f"{profile.notice_period_days} days"
-
-
-def _format_expected_salary(profile: CandidateProfile) -> str | None:
-    if profile.expected_salary is None:
-        return None
-    salary = profile.expected_salary
-    formatted = f"{int(salary):,}" if float(salary).is_integer() else f"{salary:,}"
-    currency = profile.expected_salary_currency or ""
-    return f"{currency} {formatted}".strip()
-
-
-def _format_years_of_experience(profile: CandidateProfile) -> str | None:
-    if profile.years_of_experience is None:
-        return None
-    years = profile.years_of_experience
-    return f"{int(years)} years" if float(years).is_integer() else f"{years} years"
-
-
+#: Question category -> formatter. The formatters themselves live in
+#: `automation/forms/profile_formatting.py`, keyed by profile ATTRIBUTE, and are
+#: shared with `ats/base.py::_resolve_profile_value()` — the `FieldMapper` path,
+#: which previously did no formatting at all and typed raw column values
+#: ("True", "30", "120000.0") into real forms. This table is now just the
+#: category->attribute mapping; the phrasing lives in one place.
 _DETERMINISTIC_FORMATTERS: dict[str, Callable[[CandidateProfile], str | None]] = {
-    CATEGORY_REQUIRES_SPONSORSHIP: _format_requires_sponsorship,
-    CATEGORY_WORK_AUTHORIZED: _format_work_authorized,
-    CATEGORY_VISA_TYPE: _format_visa_type,
-    CATEGORY_NOTICE_PERIOD: _format_notice_period,
-    CATEGORY_EXPECTED_SALARY: _format_expected_salary,
-    CATEGORY_YEARS_OF_EXPERIENCE: _format_years_of_experience,
+    CATEGORY_REQUIRES_SPONSORSHIP: format_requires_sponsorship,
+    CATEGORY_WORK_AUTHORIZED: format_work_authorized,
+    CATEGORY_VISA_TYPE: format_visa_type,
+    CATEGORY_NOTICE_PERIOD: format_notice_period,
+    CATEGORY_EXPECTED_SALARY: format_expected_salary,
+    CATEGORY_YEARS_OF_EXPERIENCE: format_years_of_experience,
+    CATEGORY_HIGHEST_EDUCATION: format_highest_education_level,
+    CATEGORY_WILLING_TO_RELOCATE: format_willing_to_relocate,
+    CATEGORY_CURRENT_SALARY: format_current_salary,
+    CATEGORY_PREFERRED_NAME: format_preferred_name,
+    CATEGORY_REFERRAL_SOURCE: format_referral_source,
+    CATEGORY_EMPLOYMENT_TYPE: format_employment_type,
+    CATEGORY_BACKGROUND_CHECK: format_willing_background_check,
+    # The free-text "which languages do you speak?" form of the question. The
+    # yes/no "are you fluent in <language>?" form can't be answered from the
+    # profile alone — see `_language_fluency_answer`, which intercepts this
+    # category before the table is consulted.
+    CATEGORY_LANGUAGE_FLUENCY: format_languages,
 }
 
 #: CandidateDemographics attribute name for each demographic category —
@@ -228,6 +236,15 @@ _DEMOGRAPHIC_PROFILE_FIELDS: dict[str, str] = {
     "demographic_veteran_status": "veteran_status",
     "demographic_disability_status": "disability_status",
     "demographic_race_ethnicity": "race_ethnicity",
+    "demographic_pronouns": "pronouns",
+}
+
+#: Where a MULTI_VALUE_DEMOGRAPHIC_CATEGORIES answer comes from: the list
+#: column first, falling back to the single-value column above. A candidate who
+#: only ever answered a pick-one race question still has something to say to a
+#: "select all that apply" one — their single answer — and that beats a blank.
+_DEMOGRAPHIC_LIST_FIELDS: dict[str, str] = {
+    "demographic_race_ethnicity": "ethnicities",
 }
 
 DETERMINISTIC_CONFIDENCE = 0.9
@@ -236,6 +253,64 @@ DETERMINISTIC_CONFIDENCE = 0.9
 # AUTO_SUBMIT bar (0.85) on purpose, so a form that leans on the LLM path
 # lands in copilot/needs-review rather than auto-submitting on a guess.
 LLM_CONFIDENCE = 0.6
+
+#: `CandidateProfile` attributes sent to the model in addition to the original
+#: four (`current_role`, `current_company`, `years_of_experience`, `skills`).
+#:
+#: Chosen by one rule: would a screening question ever ask for it? Logistics
+#: (notice period, salary, location, remote preference), authorization, and the
+#: candidate's own public links all get asked about constantly, and every one of
+#: them was invisible to the model until now.
+#:
+#: Deliberately EXCLUDED, and not an oversight:
+#:
+#: - `phone`/`address` — the two Fernet-encrypted columns. There is no question
+#:   worth answering that needs them, the deterministic path already fills the
+#:   real phone/address fields from `FieldMapper`, and an encrypted-at-rest
+#:   value has no business in an outbound prompt.
+#: - Names and `email` — same reasoning minus the encryption: `FieldMapper`
+#:   owns those fields at 0.97 confidence, so sending them buys nothing.
+#: - The EEO/demographic row — `_demographic_answer` answers those ONLY from
+#:   what the candidate explicitly stored, and they are never sent to an LLM.
+#:   See this module's docstring.
+#: - `marketing_opt_in` — a consent decision, not a fact about the candidate.
+#:   The only thing that may act on it is the explicit opt-in checkbox pass in
+#:   `automation/ats/base.py`, gated on `True`; letting a model see it invites
+#:   it to answer some adjacent consent question in prose on the candidate's
+#:   behalf, which is not a thing an LLM gets to do.
+#: - `willing_background_check` — same reasoning as `marketing_opt_in`: agreeing
+#:   to be background-checked is a consent, and the deterministic category
+#:   covers the standard phrasings, so there is no reason for a model to be
+#:   composing prose around it.
+#: - `preferred_name` — a name, so it falls under the exclusion above.
+_PROMPT_PROFILE_ATTRIBUTES: tuple[str, ...] = (
+    "highest_education_level",
+    "willing_to_relocate",
+    "current_salary",
+    "current_salary_currency",
+    "referral_source",
+    "employment_type_preference",
+    "languages",
+    "location",
+    "city",
+    "state",
+    "country",
+    "notice_period_days",
+    "expected_salary",
+    "expected_salary_currency",
+    "work_authorization",
+    "work_authorized",
+    "requires_sponsorship",
+    "visa_status",
+    "visa_type",
+    "sponsorship_countries",
+    "remote_preference",
+    "preferred_locations",
+    "linkedin_url",
+    "github_url",
+    "portfolio_url",
+    "website_url",
+)
 
 _SYSTEM_PROMPT = (
     "You are helping a job candidate answer screening questions on a job "
@@ -275,6 +350,53 @@ _SYSTEM_PROMPT = (
     "answer generically, or when the question is subjective. A low score "
     "costs the candidate a few seconds of review; an overconfident wrong "
     "answer can cost them the role."
+)
+
+#: Appended to `_SYSTEM_PROMPT` only when the candidate actually has résumé
+#: facts to reason over (see `automation/forms/resume_context.py`). Kept out of
+#: the base prompt so a candidate with no stored education/experience doesn't get
+#: instructions about sections that aren't in their payload — and so the prompt
+#: is unchanged for every caller that predates this.
+#:
+#: The two rules here are the ones that decide whether a real form gets filled
+#: correctly rather than just non-blank:
+#:
+#: - Résumé questions usually want ONE value from a list of entries ("in which
+#:   year did you complete your Bachelor's degree?" against three degrees), so
+#:   the model has to be told which entry to read rather than guessing or
+#:   concatenating.
+#: - A form's own vocabulary rarely matches a résumé's ("B.Tech" vs
+#:   "Bachelor's Degree"), and `_match_option` will DISCARD an answer that
+#:   isn't one of the real options — so translating to the form's wording is
+#:   the difference between a filled dropdown and a dropped answer.
+_RESUME_PROMPT = (
+    " The profile also includes the candidate's own résumé facts: `education` "
+    "(degree, field of study, university, start/end dates) and `experience` "
+    "(job title, employer, start/end dates), each ordered most-recent-first, "
+    "plus `certifications`. These are parsed from the résumé the candidate is "
+    "submitting with this application, so treat them as authoritative — a "
+    "question you can answer from them is NOT an unanswerable question, and "
+    "leaving it blank costs the candidate the field for no reason. "
+    "Two rules for using them:\n"
+    "(a) When a question asks for ONE value but several entries could supply "
+    "it, pick the single entry the question means and answer with that value "
+    "alone — never a list, never a range spanning entries. A question naming a "
+    "specific qualification ('your Bachelor's degree') means the entry whose "
+    "`degree` matches it; an unqualified question ('year of graduation', "
+    "'highest degree') means the most recent/highest entry, which is the first "
+    "in the list. Answer a year question with just the year: '2018', not "
+    "'2018-06' and not 'Graduated in 2018 from ...'.\n"
+    "(b) Résumé wording and form wording differ. When the question offers "
+    "options, answer in the FORM's vocabulary, not the résumé's — a résumé "
+    "saying 'B.Tech in Computer Science' against options like [\"Bachelor's "
+    "Degree\", \"Master's Degree\"] is \"Bachelor's Degree\". Only do this when "
+    "the mapping is unambiguous; if the résumé's qualification doesn't clearly "
+    "correspond to any offered option, answer null and let a human choose.\n"
+    "(c) Confidence for these: a value copied straight out of the résumé facts "
+    "is a well-grounded answer, not a guess — score it 0.9 or higher. The "
+    "instruction to err toward under-confidence is about answers you had to "
+    "compose or infer, not about facts you were handed. Under-scoring a "
+    "copied fact leaves the field blank for no reason."
 )
 
 #: Appended to `_SYSTEM_PROMPT` only when at least one question in the batch
@@ -331,48 +453,10 @@ def _looks_like_meta_commentary(text: str) -> bool:
     return any(pattern.search(text) for pattern in _META_COMMENTARY_PATTERNS)
 
 
-def _normalize_option(text: str) -> str:
-    """Case- and whitespace-insensitive form used only for MATCHING an
-    answer back to a real option — never for what gets typed into the page.
-    The verbatim option string is always what's filled."""
-    return " ".join(text.split()).casefold()
-
-
-def _match_option(answer: str, options: Sequence[str]) -> str | None:
-    """Resolves the model's answer to one of `options`, returning that
-    option VERBATIM (so `field_handlers` selects a string the DOM really
-    has), or `None` if it can't be resolved to exactly one.
-
-    Three tiers, tightest first:
-
-    1. Exact string equality.
-    2. Case/whitespace-normalized equality — covers "yes" vs "Yes" and the
-       stray trailing space an ATS puts in its own `<option>` text.
-    3. Containment, but ONLY when exactly one option matches: a model
-       answering "Yes" against `["Yes, now or in the future", "No"]` is
-       clearly right, and rejecting it would send a perfectly answerable
-       question to a human. Ambiguity is not resolved by picking the first
-       or longest match — two candidates means `None`, which routes the
-       question to review. That's the deliberate trade: this module never
-       guesses between plausible options (same rule as `FieldMapper`).
-    """
-    if not options:
-        return None
-    for option in options:
-        if answer == option:
-            return option
-    normalized_answer = _normalize_option(answer)
-    if not normalized_answer:
-        return None
-    for option in options:
-        if _normalize_option(option) == normalized_answer:
-            return option
-    contained = [
-        option for option in options
-        if normalized_answer in _normalize_option(option)
-        or _normalize_option(option) in normalized_answer
-    ]
-    return contained[0] if len(contained) == 1 else None
+#: `_match_option` now lives in `automation/forms/option_matching.py` (imported
+#: above under its original name, unchanged) — `automation/ats/base.py`'s
+#: checkbox-group pass needs the identical matcher, and the one rule that must
+#: never diverge between two copies of this logic is "refuse on ambiguity".
 
 
 def _as_question(item: str | Question) -> Question:
@@ -396,11 +480,17 @@ class ApplicationAnswerEngine:
         db: Session | None = None,
         user_id: str | None = None,
         llm_fn: Callable[..., str] | None = None,
+        resume_context: ResumeContext | None = None,
     ):
         self.profile = profile
         self.job_description = job_description
         self.db = db
         self.user_id = user_id
+        # Injectable so a test (or any caller already holding the rows) can
+        # supply résumé facts without a DB; otherwise loaded lazily from the
+        # candidate's stored education/experience — see `_get_resume_context`.
+        self._resume_context = resume_context
+        self._resume_context_loaded = resume_context is not None
         # Injectable for tests; defaults to the real router
         # (`automation.interfaces.generate_answer` -> `app.ai.llm.router`).
         self._llm_fn = llm_fn or generate_answer
@@ -476,6 +566,82 @@ class ApplicationAnswerEngine:
                         logger.debug("Could not load candidate_demographics for %r — treating as unanswered.", profile_id)
         return self._demographics
 
+    def _get_resume_context(self) -> ResumeContext:
+        """Loads (once) the candidate's résumé facts. Lazy for the same reason
+        `_get_demographics` is: a form whose every question resolves
+        deterministically never reaches the LLM, and shouldn't pay for two
+        queries to build a prompt nobody sends."""
+        if not self._resume_context_loaded:
+            self._resume_context_loaded = True
+            self._resume_context = load_resume_context(self.db, self.profile)
+        return self._resume_context or ResumeContext()
+
+    def _stored_demographic_value(self, category: str) -> str | None:
+        """The single stored value for one demographic category, or `None` if
+        the candidate never answered it. For a multi-value category the first
+        stored entry stands in as the single answer (a pick-one form has to be
+        given one thing) — `_stored_demographic_values` is the list form."""
+        values = self._stored_demographic_values(category)
+        return values[0] if values else None
+
+    def _stored_demographic_values(self, category: str) -> list[str]:
+        """Every stored value for one demographic category, in stored order.
+        Single-value categories return at most one entry; a multi-value one
+        (ethnicity — see `MULTI_VALUE_DEMOGRAPHIC_CATEGORIES`) returns its list
+        column, falling back to its single-value column so a candidate who only
+        answered the pick-one version of the question still has an answer for
+        the "select all that apply" version."""
+        demographics = self._get_demographics()
+        if demographics is None:
+            return []
+        if category in MULTI_VALUE_DEMOGRAPHIC_CATEGORIES:
+            list_field = _DEMOGRAPHIC_LIST_FIELDS.get(category)
+            stored = getattr(demographics, list_field, None) if list_field else None
+            if isinstance(stored, (list, tuple)):
+                values = [str(item).strip() for item in stored if str(item).strip()]
+                if values:
+                    return values
+        field_name = _DEMOGRAPHIC_PROFILE_FIELDS.get(category)
+        value = getattr(demographics, field_name, None) if field_name else None
+        value = str(value).strip() if value else ""
+        return [value] if value else []
+
+    def stored_choices(self, question: str | Question) -> list[str]:
+        """Every option of `question` the candidate's OWN STORED DATA says to
+        select, verbatim as the page words them — `[]` when there's nothing
+        stored to answer it with, or nothing that resolves to a real option.
+
+        Exists for `automation/ats/base.py`'s checkbox-group pass, which is the
+        one widget shape where more than one answer can be correct at once
+        ("Select all that apply") and where `answer_batch`'s single-string
+        `AnswerResult` therefore doesn't fit.
+
+        Deterministic BY CONSTRUCTION: this never reaches `_call_llm` for any
+        question, demographic or not. That's stricter than `answer_batch`, and
+        deliberately so — a checkbox is the least visible widget on a form (a
+        wrongly-ticked box looks exactly like a deliberately-ticked one to a
+        human skimming the review screen), and the groups this exists to fill
+        are pronouns and ethnicity, where a guess is worse than a blank."""
+        question = _as_question(question)
+        if not question.options:
+            return []
+        category = classify_question(question.text)
+        if category is None:
+            return []
+        if is_demographic(category):
+            values = self._stored_demographic_values(category)
+            if not values:
+                return []
+            if category in MULTI_VALUE_DEMOGRAPHIC_CATEGORIES:
+                return match_demographic_values(values, question.options)
+            matched = match_demographic_value(values[0], question.options)
+            return [matched] if matched else []
+        answer = _DETERMINISTIC_FORMATTERS[category](self.profile)
+        if not answer:
+            return []
+        matched = _match_option(answer, question.options)
+        return [matched] if matched else []
+
     def _demographic_answer(self, question: Question, category: str) -> AnswerResult:
         """HARD RULE (see module docstring / PART 2 of the request that
         created this): a demographic question is answered ONLY from a value
@@ -483,9 +649,7 @@ class ApplicationAnswerEngine:
         /profile/demographics` — NEVER inferred, NEVER sent to the LLM.
         `answer_batch()` guarantees this method's result is never routed
         into `llm_questions` regardless of what it returns here."""
-        demographics = self._get_demographics()
-        field_name = _DEMOGRAPHIC_PROFILE_FIELDS.get(category)
-        value = getattr(demographics, field_name, None) if demographics is not None and field_name else None
+        value = self._stored_demographic_value(category)
         if value:
             # Snap to the form's own wording when it offers a fixed list
             # ("Prefer not to say" vs "I don't wish to answer"). An
@@ -494,7 +658,14 @@ class ApplicationAnswerEngine:
             # surfaces for a human, because inferring a demographic answer is
             # exactly what this path exists to prevent.
             if question.options:
-                matched = _match_option(value, question.options)
+                # `match_demographic_value`, not the bare `_match_option`: what
+                # is stored is a canonical token ("non_binary",
+                # "decline_to_answer") and what the form offers is prose
+                # ("Non-binary", "Decline to self-identify"). Matching those
+                # directly fails, which is why Gender/Race/Veteran came back
+                # blank on a live posting even for a candidate who HAD answered
+                # them — see `automation/forms/demographic_matching.py`.
+                matched = match_demographic_value(value, question.options)
                 if matched is None:
                     logger.info(
                         "Stored demographic value %r isn't among this form's options for %r — leaving it for a human.",
@@ -518,6 +689,63 @@ class ApplicationAnswerEngine:
             confidence=0.0, available_options=question.options,
         )
 
+    def _language_fluency_answer(self, question: Question) -> AnswerResult | None:
+        """"Are you fluent in German?" — the answer depends on WHICH language the
+        question names, so this reads the question text rather than the profile
+        alone (the one factual category that can't be a plain attribute
+        formatter). `None` means "not answerable this way", and the caller falls
+        back to listing the candidate's languages / to the LLM.
+
+        Three deliberate refusals, each of which would otherwise be an inference
+        rather than an answer:
+
+        - The question names a language the candidate never listed. The honest
+          reading of an absent entry is "they didn't mention it", not "they don't
+          speak it" — a stored list is rarely exhaustive. Falls through to the
+          LLM, which has the list in its prompt.
+        - The question names two of their languages at once ("...in English or
+          French?"), where a single yes/no can't be attributed.
+        - The entry has no proficiency recorded. "Speaks English" does not
+          establish fluency, and overstating language ability is a claim the
+          candidate has to defend in an interview."""
+        entries = normalized_languages(self.profile)
+        if not entries:
+            return None
+        asked = question.text.casefold()
+        named = [(name, proficiency) for name, proficiency in entries if name.casefold() in asked]
+        if len(named) != 1:
+            return None
+        _name, proficiency = named[0]
+        if not proficiency:
+            return None
+
+        is_fluent = proficiency in FLUENT_LANGUAGE_PROFICIENCIES
+        if not question.options:
+            return self._as_deterministic(question, "Yes" if is_fluent else "No")
+
+        # Ordered candidates, best fit first — a form offering proficiency BANDS
+        # ("Limited Working Proficiency", observed live on Lever alongside
+        # Yes/No) deserves the band, and a plain Yes/No form has no band for the
+        # earlier candidates to match, so it lands on the yes/no.
+        if is_fluent:
+            candidates = ("Yes", proficiency.title(), "Fluent", "Full professional proficiency",
+                          "Native or bilingual proficiency")
+        elif proficiency == "conversational":
+            candidates = ("Limited working proficiency", "Conversational", "No")
+        else:
+            candidates = ("Elementary proficiency", "Basic", "Limited working proficiency", "No")
+        for candidate in candidates:
+            matched = _match_option(candidate, question.options)
+            if matched is not None:
+                return self._as_deterministic(question, matched)
+        return None
+
+    def _as_deterministic(self, question: Question, answer: str) -> AnswerResult:
+        return AnswerResult(
+            question=question.text, answer=answer, source="deterministic",
+            confidence=DETERMINISTIC_CONFIDENCE, available_options=question.options,
+        )
+
     def _deterministic_answer(self, question: Question) -> AnswerResult | None:
         """Returns `None` only for "not a recognized factual shape at all" —
         genuinely demographic questions are always handled (see
@@ -528,6 +756,13 @@ class ApplicationAnswerEngine:
             return None
         if is_demographic(category):
             return self._demographic_answer(question, category)
+        if category == CATEGORY_LANGUAGE_FLUENCY:
+            # A yes/no about ONE named language. Falls through to the formatter
+            # below (which lists every language and its level) when the question
+            # is the other shape — "which languages do you speak?".
+            fluency = self._language_fluency_answer(question)
+            if fluency is not None:
+                return fluency
         answer = _DETERMINISTIC_FORMATTERS[category](self.profile)
         if not answer:
             return None  # profile has nothing to say here — fall through to the LLM rather than guess
@@ -685,6 +920,8 @@ class ApplicationAnswerEngine:
         raising and losing every other answer in the batch."""
         prompt = self._build_prompt(questions)
         system = _SYSTEM_PROMPT
+        if self._get_resume_context():
+            system += _RESUME_PROMPT
         if any(question.options for question in questions):
             system += _OPTION_PROMPT
         try:
@@ -718,6 +955,28 @@ class ApplicationAnswerEngine:
             "years_of_experience": self.profile.years_of_experience,
             "skills": self.profile.skills,
         }
+        # Everything else the profile knows that a screening question can ask
+        # about. These four facts used to be the model's ENTIRE view of the
+        # candidate, so any question outside them was unanswerable from the
+        # given context — and `_SYSTEM_PROMPT` rightly forbids inventing an
+        # answer, so the field was left blank. Observed live on a Lever posting:
+        # "When are you available to start working?" came back null with
+        # `notice_period_days` sitting in the profile, unsent.
+        #
+        # Empty values are omitted rather than sent as null: a model shown
+        # `"portfolio_url": null` can read it as "the candidate has no
+        # portfolio", which is a claim, not a gap.
+        for attribute in _PROMPT_PROFILE_ATTRIBUTES:
+            value = getattr(self.profile, attribute, None)
+            if value not in (None, "", [], {}):
+                profile_summary[attribute] = value
+        # The candidate's own résumé facts — education, experience,
+        # certifications — merged in only when they exist, so a candidate
+        # without them produces exactly the payload this prompt had before.
+        # Without this, every "which year did you graduate?" / "highest degree?"
+        # question was unanswerable from the given context and correctly came
+        # back null. See `automation/forms/resume_context.py`.
+        profile_summary.update(self._get_resume_context().as_prompt_payload())
         payload = {
             "candidate_profile": profile_summary,
             "job_description": self.job_description,

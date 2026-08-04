@@ -74,9 +74,12 @@ from app.models.db_models import (  # noqa: F401
     ExperienceEntry,
     ProfileDocument,
     User,
+    FLUENT_LANGUAGE_PROFICIENCIES,
     VALID_DISABILITY_STATUS_VALUES,
     VALID_DOCUMENT_TYPES,
+    VALID_EMPLOYMENT_TYPES,
     VALID_GENDER_VALUES,
+    VALID_LANGUAGE_PROFICIENCIES,
     VALID_VETERAN_STATUS_VALUES,
 )
 

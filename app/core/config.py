@@ -50,3 +50,22 @@ AUTOMATION_HEADLESS = os.getenv("AUTOMATION_HEADLESS", "true").strip().lower() !
 AUTOMATION_SESSION_DIR = os.getenv("AUTOMATION_SESSION_DIR", "storage/automation_sessions")
 # Screenshots / traces / error logs per application run (see ARCHITECTURE.md §14).
 AUTOMATION_LOGS_DIR = os.getenv("AUTOMATION_LOGS_DIR", "logs")
+
+# --- Object storage (Phase 2 hardening — see PHASE2_ARCHITECTURE.md Initiative 4) ---
+# "local" (default) keeps today's on-disk behavior under storage/. "s3" routes
+# app/services/file_storage.py and document_storage.py through an S3-compatible
+# bucket (AWS S3, Cloudflare R2, MinIO) instead — see app/services/storage/.
+# Read app/services/storage/s3_backend.py's module docstring before flipping
+# this to "s3": text extraction and the Playwright resume-upload path aren't
+# rewired to the new local_path() accessor yet, so that specific gap is
+# tracked, not silently broken.
+STORAGE_BACKEND = os.getenv("STORAGE_BACKEND", "local").strip().lower()
+if STORAGE_BACKEND not in ("local", "s3"):
+    raise RuntimeError(f"STORAGE_BACKEND must be 'local' or 's3', got: {STORAGE_BACKEND!r}")
+
+S3_BUCKET = os.getenv("S3_BUCKET")
+S3_REGION = os.getenv("S3_REGION")
+S3_ENDPOINT_URL = os.getenv("S3_ENDPOINT_URL")  # set for Cloudflare R2 / MinIO; unset for AWS S3
+
+if STORAGE_BACKEND == "s3" and not S3_BUCKET:
+    raise RuntimeError("STORAGE_BACKEND=s3 requires S3_BUCKET to be set in .env.")

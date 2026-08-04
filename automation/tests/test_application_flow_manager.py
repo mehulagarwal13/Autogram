@@ -245,12 +245,39 @@ def _resume_document(path) -> ProfileDocument:
     )
 
 
-def _make_fake_adapter_cls(fill_results, *, upload_ok=True, submit_ok=True):
-    """A minimal ATSAdapter that never touches `self.page` itself — used to
+# What a real ATS does that a `return True` doesn't: it CHANGES THE PAGE.
+# Greenhouse and Lever both replace the form with a success banner (and usually
+# navigate) once a submit is accepted, and `wait_for_submission_confirmation`
+# exists precisely to look for that. A fake `submit_application` that returned
+# `True` while leaving the DOM and URL byte-identical was therefore simulating
+# something no ATS does — a submit with zero observable effect — and the run
+# correctly came out `needs_review` ("clicked, but cannot prove it landed").
+# The heading below matches `SUBMISSION_CONFIRMATION_TEXT_PATTERNS`' "thank you
+# for applying", so the submit path here exercises the real detection code
+# rather than a page that never changes.
+_FAKE_SUBMIT_CONFIRMATION_HTML = (
+    "<html><body><h1>Thank you for applying!</h1>"
+    "<p>We have received your application and will be in touch.</p></body></html>"
+)
+
+
+def _make_fake_adapter_cls(
+    fill_results,
+    *,
+    upload_ok=True,
+    submit_ok=True,
+    submit_confirmation_html=_FAKE_SUBMIT_CONFIRMATION_HTML,
+):
+    """A minimal ATSAdapter that touches `self.page` only to simulate a
+    submit's page change (see `_FAKE_SUBMIT_CONFIRMATION_HTML`) — used to
     isolate ApplicationFlowManager's own orchestration logic (loop, decision,
     checkpoints) from any real ATS's markup, which is already covered by
     test_greenhouse_adapter.py / test_lever_adapter.py. `calls` records what
-    the flow manager invoked, for assertions."""
+    the flow manager invoked, for assertions.
+
+    Pass `submit_confirmation_html=None` to model an ATS that accepts the click
+    but shows nothing recognizable afterwards — the unconfirmed-submission case,
+    which is a deliberate scenario rather than the default."""
 
     calls = {"upload_resume": 0, "fill_personal_information": 0, "answer_questions": 0, "submit_application": 0}
 
@@ -274,7 +301,13 @@ def _make_fake_adapter_cls(fill_results, *, upload_ok=True, submit_ok=True):
 
         def submit_application(self) -> bool:
             calls["submit_application"] += 1
-            return submit_ok
+            if not submit_ok:
+                # A submit that didn't go through leaves the form on screen —
+                # so, correctly, no page change here either.
+                return False
+            if submit_confirmation_html is not None:
+                self.page.set_content(submit_confirmation_html)
+            return True
 
     _FakeAdapter.calls = calls
     return _FakeAdapter
@@ -536,8 +569,12 @@ def test_run_reports_applied_only_when_submission_is_confirmed(requires_chromium
 def test_run_does_not_claim_applied_when_submission_cannot_be_confirmed(requires_chromium, tmp_path):
     """The regression that matters most: a submit click landing is NOT proof
     the ATS accepted the application. Claiming `applied` here would put a
-    false record in front of the candidate AND let idempotency block a retry."""
-    adapter_cls = _make_fake_adapter_cls(_HIGH_CONFIDENCE_RESULTS)
+    false record in front of the candidate AND let idempotency block a retry.
+
+    `submit_confirmation_html=None` is the whole point of this test: the click
+    lands and the adapter reports success, but the page shows nothing that
+    proves the ATS accepted it."""
+    adapter_cls = _make_fake_adapter_cls(_HIGH_CONFIDENCE_RESULTS, submit_confirmation_html=None)
     manager = ApplicationFlowManager(
         application_id="app-unconfirmed-1",
         user_id="user-1",

@@ -2,8 +2,10 @@ import uuid
 from pathlib import Path
 import hashlib
 
+from app.services.storage import get_storage_backend
+
 STORAGE_DIR = Path("storage/resumes")
-STORAGE_DIR.mkdir(parents=True, exist_ok=True)
+STORAGE_DIR.mkdir(parents=True, exist_ok=True)  # local-mode default; ignored under STORAGE_BACKEND=s3
 
 ALLOWED_EXTENSIONS = {".pdf", ".docx"}
 
@@ -34,20 +36,22 @@ def validate_content(ext: str, content: bytes) -> None:
 
 def save_resume_file(filename: str, content: bytes) -> tuple[str, str]:
     """
-    Validates extension AND content signature, then saves to disk under a unique ID.
-    Returns (resume_id, stored_path).
+    Validates extension AND content signature, then saves via the active
+    StorageBackend (local disk by default; S3-compatible when
+    STORAGE_BACKEND=s3 — see app/services/storage/). Returns
+    (resume_id, stored_path); stored_path is whatever the backend returns as
+    the persisted locator (a local path today, an s3:// URI under S3).
     """
     ext = validate_extension(filename)
     validate_content(ext, content)
 
     resume_id = str(uuid.uuid4())
     stored_filename = f"{resume_id}{ext}"
-    stored_path = STORAGE_DIR / stored_filename
+    key = str(STORAGE_DIR / stored_filename)
 
-    with open(stored_path, "wb") as f:
-        f.write(content)
+    stored_path = get_storage_backend().save(key, content)
 
-    return resume_id, str(stored_path)
+    return resume_id, stored_path
 
 
 def compute_file_hash(content: bytes) -> str:

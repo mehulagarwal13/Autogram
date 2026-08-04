@@ -23,7 +23,10 @@ from sqlalchemy.dialects import postgresql
 
 # revision identifiers, used by Alembic.
 revision: str = '9b1c2f7a3e4d'
-down_revision: Union[str, Sequence[str], None] = '4475eb486d90'
+# Was '4475eb486d90'. Re-pointed at the revision that creates `users`: every
+# table below declares a foreign key to `users.user_id`, and nothing in the
+# history had ever created it — see a1b2c3d4e5f6's docstring.
+down_revision: Union[str, Sequence[str], None] = 'a1b2c3d4e5f6'
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

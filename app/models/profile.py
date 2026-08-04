@@ -5,6 +5,18 @@ from pydantic import BaseModel, ConfigDict, Field
 
 # ---------- personal + professional profile ----------
 
+class LanguageEntry(BaseModel):
+    """One language and how well the candidate speaks it. The proficiency is the
+    whole point: forms ask "are you fluent in X?", and answering that from a bare
+    mention of X in a list would be an assumption about degree rather than an
+    answer. `proficiency` stays optional so a caller can list a language without
+    committing to a level — such an entry just doesn't answer fluency questions.
+    """
+
+    language: str
+    proficiency: str | None = None  # see VALID_LANGUAGE_PROFICIENCIES
+
+
 class ProfileUpsertRequest(BaseModel):
     """All fields optional — both create (`POST /profile`) and update
     (`PATCH /profile`) apply only the fields the caller sends."""
@@ -43,6 +55,23 @@ class ProfileUpsertRequest(BaseModel):
     sponsorship_countries: list[str] | None = None
     preferred_locations: list[str] | None = None
     remote_preference: str | None = None  # remote / hybrid / onsite / no_preference
+    # Questions real ATS forms ask that had no profile field to answer from —
+    # see app/models/db_models.py::CandidateProfile. `highest_education_level`
+    # is free text in the form's own words ("Bachelor's Degree");
+    # `marketing_opt_in` is tri-state, and only an explicit `true` ever ticks a
+    # "may we contact you about future roles" box.
+    highest_education_level: str | None = None
+    willing_to_relocate: bool | None = None
+    marketing_opt_in: bool | None = None
+    preferred_name: str | None = None
+    # A DIFFERENT fact from expected_salary — forms ask both, and the classifier
+    # used to answer "current CTC" with the expected number.
+    current_salary: float | None = None
+    current_salary_currency: str | None = None
+    referral_source: str | None = None            # "How did you hear about this job?"
+    employment_type_preference: str | None = None  # see VALID_EMPLOYMENT_TYPES
+    languages: list[LanguageEntry] | None = None
+    willing_background_check: bool | None = None   # tri-state, like marketing_opt_in
 
 
 class ProfileResponse(BaseModel):
@@ -76,6 +105,18 @@ class ProfileResponse(BaseModel):
     sponsorship_countries: list[str] | None = None
     preferred_locations: list[str] | None = None
     remote_preference: str | None = None
+    highest_education_level: str | None = None
+    willing_to_relocate: bool | None = None
+    marketing_opt_in: bool | None = None
+    preferred_name: str | None = None
+    current_salary: float | None = None
+    current_salary_currency: str | None = None
+    referral_source: str | None = None
+    employment_type_preference: str | None = None
+    # Echoed back as stored (plain dicts) rather than re-parsed into
+    # `LanguageEntry`, matching how `skills` and `sponsorship_countries` behave.
+    languages: list[dict] | None = None
+    willing_background_check: bool | None = None
     skills: dict | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
@@ -158,6 +199,13 @@ class DemographicsRequest(BaseModel):
     veteran_status: str | None = None      # see VALID_VETERAN_STATUS_VALUES
     disability_status: str | None = None   # see VALID_DISABILITY_STATUS_VALUES
     race_ethnicity: str | None = None      # free text — categories vary by country/form
+    # Free text, unvalidated, both of them — deliberately. Pronoun sets are
+    # open-ended (one live form offers nine plus "Custom") and ethnicity
+    # categories differ by country, so a closed enum here would reject
+    # legitimate answers. Store them worded the way forms word them
+    # ("they/them", "Asian") and they match the page's own options directly.
+    pronouns: str | None = None
+    ethnicities: list[str] | None = None   # "select all that apply" ethnicity groups
 
 
 class DemographicsResponse(BaseModel):
@@ -168,5 +216,7 @@ class DemographicsResponse(BaseModel):
     veteran_status: str | None = None
     disability_status: str | None = None
     race_ethnicity: str | None = None
+    pronouns: str | None = None
+    ethnicities: list[str] | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None

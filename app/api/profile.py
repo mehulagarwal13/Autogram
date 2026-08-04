@@ -23,7 +23,9 @@ from app.models.db_models import (
     User,
     VALID_DISABILITY_STATUS_VALUES,
     VALID_DOCUMENT_TYPES,
+    VALID_EMPLOYMENT_TYPES,
     VALID_GENDER_VALUES,
+    VALID_LANGUAGE_PROFICIENCIES,
     VALID_REMOTE_PREFERENCES,
     VALID_VETERAN_STATUS_VALUES,
 )
@@ -93,6 +95,21 @@ def _validate_choice(value: str | None, valid: set[str], field_name: str) -> Non
         raise HTTPException(status_code=400, detail=f"Invalid {field_name} '{value}'. Must be one of {sorted(valid)}.")
 
 
+def _validate_profile_choices(data: dict) -> None:
+    """Every closed-vocabulary field on a profile create/update, in one place so
+    `POST` and `PATCH` can't drift apart on what they accept."""
+    _validate_remote_preference(data.get("remote_preference"))
+    _validate_choice(data.get("employment_type_preference"), VALID_EMPLOYMENT_TYPES, "employment_type_preference")
+    for entry in data.get("languages") or []:
+        # A language with no proficiency is allowed (it simply can't answer a
+        # fluency question — see `answer_engine._language_fluency_answer`); a
+        # proficiency outside the vocabulary is a typo worth rejecting, because
+        # it would silently make every fluency question fall through to the LLM.
+        _validate_choice(entry.get("proficiency"), VALID_LANGUAGE_PROFICIENCIES, "language proficiency")
+        if not (entry.get("language") or "").strip():
+            raise HTTPException(status_code=400, detail="Each language entry needs a non-empty 'language'.")
+
+
 # ---------- profile ----------
 
 @router.post("", response_model=ProfileResponse, status_code=201)
@@ -105,7 +122,7 @@ def create_profile(
         raise HTTPException(status_code=409, detail="Profile already exists. Use PATCH /profile to update it.")
 
     data = body.model_dump(exclude_unset=True)
-    _validate_remote_preference(data.get("remote_preference"))
+    _validate_profile_choices(data)
     profile = repo.create_profile(db, user.user_id, data)
     return ProfileResponse(**repo.profile_to_dict(profile))
 
@@ -124,7 +141,7 @@ def update_profile(
 ):
     profile = _get_owned_profile(db, user)
     data = body.model_dump(exclude_unset=True)
-    _validate_remote_preference(data.get("remote_preference"))
+    _validate_profile_choices(data)
     profile = repo.update_profile(db, profile, data)
     return ProfileResponse(**repo.profile_to_dict(profile))
 
@@ -345,4 +362,10 @@ def put_demographics(
     _validate_choice(data.get("gender"), VALID_GENDER_VALUES, "gender")
     _validate_choice(data.get("veteran_status"), VALID_VETERAN_STATUS_VALUES, "veteran_status")
     _validate_choice(data.get("disability_status"), VALID_DISABILITY_STATUS_VALUES, "disability_status")
+    # `pronouns`, `race_ethnicity` and `ethnicities` are deliberately NOT
+    # validated against a closed set — see `DemographicsRequest`. Whatever the
+    # user stores is matched against the options a given form actually offers
+    # (`automation/forms/demographic_matching.py`), and a value no form has an
+    # option for simply leaves that question for a human. Rejecting a legitimate
+    # pronoun set or a non-US ethnicity category would be the worse failure.
     return repo.upsert_demographics(db, profile.profile_id, data)

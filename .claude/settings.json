@@ -1,7 +1,17 @@
 {
   "permissions": {
     "allow": [
-      "Bash(venv/Scripts/python.exe -m pytest automation/tests/test_selectors.py automation/tests/test_application_flow_manager.py automation/tests/test_lever_adapter.py automation/tests/test_greenhouse_adapter.py automation/tests/test_browser_manager.py tests/test_application_repository.py tests/test_applications_api.py -q)"
+      "Bash(venv/Scripts/python.exe -m pytest automation/tests/test_selectors.py automation/tests/test_application_flow_manager.py automation/tests/test_lever_adapter.py automation/tests/test_greenhouse_adapter.py automation/tests/test_browser_manager.py tests/test_application_repository.py tests/test_applications_api.py -q)",
+      "PowerShell($env:PYTHONPATH=\"d:\\\\PROJECT\\\\autogram\\\\Autogram\"; python -c \"from automation.forms.field_mapper import FieldMapper; print\\('label ->', FieldMapper.map_field\\(label='Send me job alerts by email'\\)\\); print\\('name/ph ->', FieldMapper.map_field\\(name='newsletter_q'\\)\\)\")",
+      "PowerShell($env:PYTHONPATH=\"d:\\\\PROJECT\\\\autogram\\\\Autogram\"; $env:AUTOMATION_HUMAN_PACING=\"0\"; python \"C:\\\\Users\\\\MEHULA~1\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\d--PROJECT-autogram-Autogram\\\\a07f4bfd-a88a-4bda-b96d-ce06e7e4cbc0\\\\scratchpad\\\\diagnose_checkbox.py\" 2>&1 | Select-Object -First 30)",
+      "PowerShell($env:PYTHONPATH=\"d:\\\\PROJECT\\\\autogram\\\\Autogram\"; $env:AUTOMATION_HUMAN_PACING=\"0\"; python \"C:\\\\Users\\\\MEHULA~1\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\d--PROJECT-autogram-Autogram\\\\a07f4bfd-a88a-4bda-b96d-ce06e7e4cbc0\\\\scratchpad\\\\diagnose_checkbox.py\" 2>&1 | Select-Object -First 40)",
+      "PowerShell(python -m pytest \"automation/tests/test_application_flow_manager.py::test_run_auto_submits_on_high_confidence_public_ats\" -q --no-header -p no:cacheprovider --tb=short 2>&1)",
+      "PowerShell(python -m pytest automation/tests/test_checkbox_intent.py automation/tests/test_field_mapper.py -q --no-header -p no:cacheprovider 2>&1)",
+      "Bash(python -)",
+      "Bash(python -m pytest automation/tests/test_application_flow_manager.py -q)",
+      "Bash(python -m pytest -q)",
+      "Bash(python -m pytest automation/tests/test_field_handlers_phase8.py -q -k \"checkbox\")",
+      "Bash(python -m pytest automation/tests/test_field_handlers_phase8.py -q)"
     ]
   }
 }

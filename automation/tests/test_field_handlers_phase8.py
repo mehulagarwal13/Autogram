@@ -164,24 +164,115 @@ def test_checkbox_handler_clicks_the_label_when_the_input_itself_is_hidden(page)
     assert page.locator("#consent").is_checked() is True
 
 
+# A real custom checkbox is a styled, clickable box. The original fixture gave
+# the <div> no dimensions, and an empty unstyled <div> renders at zero height —
+# so every click strategy failed on an element with no clickable surface, and
+# the test was measuring an impossible fixture rather than the handler.
+#
+# `isTrusted` separates a genuine browser click (Playwright's, `true`) from a
+# `dispatchEvent` one (the JS fallback's, `false`), which is what lets the tests
+# below assert WHICH strategy actually did the work instead of just checking the
+# end state — the distinction that matters, since the JS fallback is the least
+# preferred path and must not quietly become the one that always runs.
+_CUSTOM_CHECKBOX_HTML = """
+<div id="custom" role="checkbox" aria-checked="false" tabindex="0"
+     style="width:20px;height:20px;border:1px solid #666"></div>
+<script>
+  window.__trustedClicks = 0;
+  window.__syntheticClicks = 0;
+  document.getElementById('custom').addEventListener('click', function(e) {
+    if (e.isTrusted) { window.__trustedClicks++; } else { window.__syntheticClicks++; }
+    this.setAttribute('aria-checked', this.getAttribute('aria-checked') === 'true' ? 'false' : 'true');
+  });
+</script>
+"""
+
+# Same widget, but nothing listens for the click — a "dead" custom checkbox
+# (handler failed to bind, or the framework hydrated only part of the page).
+_INERT_CUSTOM_CHECKBOX_HTML = """
+<div id="custom" role="checkbox" aria-checked="false" tabindex="0"
+     style="width:20px;height:20px;border:1px solid #666"></div>
+"""
+
+# Covers the viewport, so Playwright's click hit-target check fails on every
+# attempt (`safe_click` never uses force=True) and the handler is driven all the
+# way down to attempt 5 — the only reliable way to exercise the JS fallback
+# through the real `fill_field` path rather than by calling it directly.
+_BLOCKING_OVERLAY_HTML = (
+    "<div id='overlay' style='position:fixed;inset:0;z-index:9999;background:rgba(0,0,0,0.01)'></div>"
+)
+
+
 def test_checkbox_handler_verifies_via_aria_checked_for_a_custom_widget(page):
-    _render(
-        page,
-        """
-        <div id="custom" role="checkbox" aria-checked="false" tabindex="0"></div>
-        <script>
-          document.getElementById('custom').addEventListener('click', function() {
-            this.setAttribute('aria-checked', this.getAttribute('aria-checked') === 'true' ? 'false' : 'true');
-          });
-        </script>
-        """,
-    )
+    _render(page, _CUSTOM_CHECKBOX_HTML)
     field = describe_field(page.locator("#custom"), label="I agree", page=page)
 
     outcome = fill_field(field, True)
 
     assert outcome.filled is True
     assert page.locator("#custom").get_attribute("aria-checked") == "true"
+
+
+def test_a_real_click_is_what_checks_a_properly_sized_custom_checkbox(page):
+    """The preferred path, pinned explicitly: a clickable custom checkbox is
+    ticked by a genuine browser click (attempt 3), never by the JS fallback."""
+    _render(page, _CUSTOM_CHECKBOX_HTML)
+    field = describe_field(page.locator("#custom"), label="I agree", page=page)
+
+    outcome = fill_field(field, True)
+
+    assert outcome.filled is True
+    assert page.locator("#custom").get_attribute("aria-checked") == "true"
+    assert page.evaluate("() => window.__trustedClicks") == 1
+    assert page.evaluate("() => window.__syntheticClicks") == 0
+
+
+def test_the_js_fallback_flips_aria_checked_when_every_click_is_blocked(page):
+    """The real gap. With clicks intercepted, the fallback used to assign
+    `el.checked` on a `<div>` — an expando property with no effect on a
+    `role="checkbox"` widget — and dispatch input/change, which such widgets
+    don't listen for. It now dispatches a click the widget's own handler
+    receives, so the component's internal state stays consistent with the
+    attribute."""
+    _render(page, _CUSTOM_CHECKBOX_HTML + _BLOCKING_OVERLAY_HTML)
+    field = describe_field(page.locator("#custom"), label="I agree", page=page)
+
+    outcome = fill_field(field, True)
+
+    assert outcome.filled is True
+    assert page.locator("#custom").get_attribute("aria-checked") == "true"
+    # It really was the fallback, not a click that squeezed past the overlay.
+    assert page.evaluate("() => window.__trustedClicks") == 0
+    assert page.evaluate("() => window.__syntheticClicks") >= 1
+    # And the meaningless write is gone: `.checked` was never assigned, so it
+    # is still `undefined` on this <div>.
+    assert page.locator("#custom").evaluate("el => el.checked") is None
+
+
+def test_the_js_fallback_forces_aria_checked_on_a_widget_with_no_click_handler(page):
+    """The other half of the fallback: dispatching a click achieves nothing on
+    a widget with no listener, so the attribute is written directly — the
+    genuine last resort, and still correct state rather than a no-op."""
+    _render(page, _INERT_CUSTOM_CHECKBOX_HTML + _BLOCKING_OVERLAY_HTML)
+    field = describe_field(page.locator("#custom"), label="I agree", page=page)
+
+    outcome = fill_field(field, True)
+
+    assert outcome.filled is True
+    assert page.locator("#custom").get_attribute("aria-checked") == "true"
+    assert page.locator("#custom").evaluate("el => el.checked") is None
+
+
+def test_the_js_fallback_still_uses_checked_for_a_native_input(page):
+    """The native branch must be untouched: a real `<input type=checkbox>` does
+    have `.checked`, and input/change are the right events for it."""
+    _render(page, "<input id='native' type='checkbox'>" + _BLOCKING_OVERLAY_HTML)
+    field = describe_field(page.locator("#native"), label="I agree", page=page)
+
+    outcome = fill_field(field, True)
+
+    assert outcome.filled is True
+    assert page.locator("#native").is_checked() is True
 
 
 # ---------------------------------------------------------------------------

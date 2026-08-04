@@ -15,9 +15,10 @@ import uuid
 from pathlib import Path
 
 from app.services.file_storage import compute_file_hash  # re-exported for callers
+from app.services.storage import get_storage_backend
 
 STORAGE_DIR = Path("storage/documents")
-STORAGE_DIR.mkdir(parents=True, exist_ok=True)
+STORAGE_DIR.mkdir(parents=True, exist_ok=True)  # local-mode default; ignored under STORAGE_BACKEND=s3
 
 ALLOWED_EXTENSIONS_BY_TYPE: dict[str, set[str]] = {
     "resume": {".pdf", ".docx"},
@@ -64,26 +65,24 @@ def validate_content(ext: str, content: bytes) -> None:
 
 def save_document_file(document_type: str, filename: str, content: bytes) -> tuple[str, str]:
     """
-    Validates extension AND content signature, then saves to disk under a
-    unique ID, namespaced by document type. Returns (document_id, stored_path).
+    Validates extension AND content signature, then saves via the active
+    StorageBackend (local disk by default; S3-compatible when
+    STORAGE_BACKEND=s3 — see app/services/storage/), namespaced by document
+    type. Returns (document_id, stored_path).
     """
     ext = validate_extension(document_type, filename)
     validate_content(ext, content)
 
     type_dir = STORAGE_DIR / document_type
-    type_dir.mkdir(parents=True, exist_ok=True)
-
     document_id = str(uuid.uuid4())
-    stored_path = type_dir / f"{document_id}{ext}"
+    key = str(type_dir / f"{document_id}{ext}")
 
-    with open(stored_path, "wb") as f:
-        f.write(content)
+    stored_path = get_storage_backend().save(key, content)
 
-    return document_id, str(stored_path)
+    return document_id, stored_path
 
 
 def delete_document_file(stored_path: str) -> None:
-    """Best-effort delete — a missing file is not an error (already cleaned up)."""
-    path = Path(stored_path)
-    if path.exists():
-        path.unlink()
+    """Best-effort delete via the active StorageBackend — a missing file is
+    not an error (already cleaned up)."""
+    get_storage_backend().delete(stored_path)

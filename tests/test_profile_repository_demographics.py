@@ -98,3 +98,85 @@ def test_upsert_demographics_only_touches_fields_present_in_the_request():
     assert existing.gender == "female"
     assert existing.veteran_status == "veteran"
     assert existing.disability_status == "no_disability"
+
+
+# ---------- the fields real ATS forms left blank ----------
+# Five columns for five questions a live Lever posting couldn't answer because
+# the profile had nowhere to store the answer. See
+# automation/tests/test_demographic_option_matching.py for the matching side and
+# automation/tests/test_checkbox_group_fill.py for the fill side.
+
+def test_form_answer_fields_round_trip_through_profile_to_dict():
+    profile = CandidateProfile(profile_id="p1", user_id="u1")
+    _apply_profile_fields(profile, {
+        "highest_education_level": "Bachelor's Degree",
+        "willing_to_relocate": True,
+        "marketing_opt_in": False,
+    })
+
+    result = profile_to_dict(profile)
+
+    assert result["highest_education_level"] == "Bachelor's Degree"
+    assert result["willing_to_relocate"] is True
+    assert result["marketing_opt_in"] is False
+
+
+def test_marketing_opt_in_defaults_to_none_not_false():
+    """The tri-state is the point: `None` means never asked, and only an
+    explicit `True` ever ticks an opt-in box (see
+    `automation/ats/base.py::_fill_opt_in_checkboxes`). Defaulting it to `False`
+    would lose the distinction; defaulting it to `True` would invent consent."""
+    result = profile_to_dict(CandidateProfile(profile_id="p1", user_id="u1"))
+
+    assert result["marketing_opt_in"] is None
+    assert result["willing_to_relocate"] is None
+    assert result["highest_education_level"] is None
+
+
+def test_the_second_tier_of_form_answer_fields_round_trips():
+    profile = CandidateProfile(profile_id="p1", user_id="u1")
+    _apply_profile_fields(profile, {
+        "preferred_name": "Mo",
+        "current_salary": 1_800_000.0,
+        "current_salary_currency": "INR",
+        "referral_source": "LinkedIn",
+        "employment_type_preference": "full_time",
+        "languages": [{"language": "English", "proficiency": "fluent"}],
+        "willing_background_check": True,
+    })
+
+    result = profile_to_dict(profile)
+
+    assert result["preferred_name"] == "Mo"
+    assert result["current_salary"] == 1_800_000.0
+    assert result["current_salary_currency"] == "INR"
+    assert result["referral_source"] == "LinkedIn"
+    assert result["employment_type_preference"] == "full_time"
+    assert result["languages"] == [{"language": "English", "proficiency": "fluent"}]
+    assert result["willing_background_check"] is True
+
+
+def test_current_and_expected_salary_are_stored_independently():
+    """The whole point of the new column: a form asking both gets both, and
+    neither question is ever answered with the other's number."""
+    profile = CandidateProfile(profile_id="p1", user_id="u1")
+    _apply_profile_fields(profile, {"current_salary": 1_800_000.0, "expected_salary": 2_500_000.0})
+
+    result = profile_to_dict(profile)
+
+    assert result["current_salary"] == 1_800_000.0
+    assert result["expected_salary"] == 2_500_000.0
+
+
+def test_upsert_demographics_stores_pronouns_and_the_ethnicity_list():
+    db = MagicMock()
+    db.query.return_value.filter.return_value.first.return_value = None
+
+    upsert_demographics(db, "profile-1", {
+        "pronouns": "they/them",
+        "ethnicities": ["Asian", "White / Caucasian"],
+    })
+
+    added = db.add.call_args[0][0]
+    assert added.pronouns == "they/them"
+    assert added.ethnicities == ["Asian", "White / Caucasian"]

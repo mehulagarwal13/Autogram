@@ -289,6 +289,36 @@ def find_unfilled_required_fields(page: Page) -> list[str]:
 # So a submission is only ever reported as applied on POSITIVE evidence: the URL
 # moved to a confirmation route, a recognizable success phrase appeared, or the
 # ATS handed back an application/reference identifier.
+#
+# ---------------------------------------------------------------------------
+# UNVALIDATED AGAINST A REAL POST-SUBMIT PAGE — resolve before enabling
+# autopilot against live Greenhouse/Lever postings.
+# ---------------------------------------------------------------------------
+# The 12 text patterns and 5 URL hints below have NEVER been checked against a
+# real Greenhouse or Lever confirmation page. They were derived from the specs
+# and from ATS documentation/wording conventions, not from a captured live run:
+# development deliberately never submitted a live application, so no genuine
+# post-submit DOM was ever recorded. Every test that exercises this code
+# supplies fixture HTML written to match these patterns, which means the tests
+# prove the MATCHING works — not that the patterns are the wording real ATSs
+# actually use.
+#
+# The specific risk: Greenhouse's `job-boards.*` board is a SPA and may render
+# its confirmation WITHOUT changing the URL, in which case the URL hints never
+# fire and the text patterns are the only signal left. If the real wording
+# isn't one of the 12 (or is an image/aria-only banner), a genuinely successful
+# autopilot submit lands in `needs_review` with the "cannot prove it landed"
+# warning — a false negative. That direction is the safe one by design (it
+# never claims `applied` without evidence), but at scale it would make
+# autopilot look broken and push every real success through manual review.
+#
+# How to resolve this properly: capture a small number of REAL confirmation
+# pages — with the user's consent, on the user's own genuine applications —
+# and check the actual wording, URL, and DOM against this list. Do NOT resolve
+# it by guessing extra patterns now: unvalidated additions widen the surface
+# for a FALSE POSITIVE (reporting `applied` when the ATS rejected the
+# submission server-side), which is the far worse failure per this section's
+# header comment, and adds no real coverage.
 SUBMISSION_CONFIRMATION_URL_HINTS = ["thank", "confirmation", "confirmed", "/success", "submitted"]
 SUBMISSION_CONFIRMATION_TEXT_PATTERNS = [
     "thank you for applying",

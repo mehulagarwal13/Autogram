@@ -18,6 +18,16 @@ VALID_DOCUMENT_TYPES = {"resume", "cover_letter", "certificate", "other"}
 VALID_GENDER_VALUES = {"male", "female", "non_binary", "decline_to_answer", "self_described"}
 VALID_VETERAN_STATUS_VALUES = {"veteran", "not_veteran", "decline_to_answer"}
 VALID_DISABILITY_STATUS_VALUES = {"has_disability", "no_disability", "decline_to_answer"}
+VALID_EMPLOYMENT_TYPES = {"full_time", "part_time", "contract", "internship", "temporary", "no_preference"}
+# Language proficiency, coarsest distinction that matters to a form: an ATS asks
+# "are you fluent in X?" as a yes/no, and the honest answer depends on which
+# band the candidate put themselves in.
+VALID_LANGUAGE_PROFICIENCIES = {"native", "fluent", "professional", "conversational", "basic"}
+# The bands that answer "yes" to a fluency question. "conversational"/"basic"
+# deliberately answer "no": overstating language ability on an application is a
+# claim the candidate has to live with in an interview, so the boundary is drawn
+# where the candidate themselves drew it, never widened for a better fill rate.
+FLUENT_LANGUAGE_PROFICIENCIES = {"native", "fluent", "professional"}
 # Mirrors automation.interfaces.ApplicationRunResult.status (Phase 4) plus the
 # two states that exist only before/between automation runs ("pending" before
 # the first run starts, "processing" while one is in flight).
@@ -167,6 +177,60 @@ class CandidateProfile(Base):
     preferred_locations = Column(JSONB, nullable=True)  # list[str]
     remote_preference = Column(String, nullable=True)   # see VALID_REMOTE_PREFERENCES
 
+    # Three facts real ATS forms ask for constantly that had nowhere to live in
+    # this table, so each one was left blank (or, for education level,
+    # re-derived by the LLM from the résumé on every single application).
+    # All observed unanswered on one live Lever posting.
+    #
+    # `highest_education_level` is deliberately FREE TEXT in the form's own
+    # vocabulary ("Bachelor's Degree", "Master's Degree") rather than a closed
+    # enum: every ATS words its own education dropdown differently, and the
+    # value's only job is to be matchable against the options a given form
+    # actually offers. When it's empty the LLM+résumé path still answers the
+    # question exactly as it does today — this column only makes the common
+    # case deterministic and free.
+    highest_education_level = Column(String, nullable=True)
+    willing_to_relocate = Column(Boolean, nullable=True)
+
+    # "Preferred name" / "What should we call you?" — a distinct field on most
+    # Greenhouse and Lever forms, sitting right next to legal first/last name.
+    # `format_preferred_name` falls back to `first_name` when this is empty,
+    # which is not a guess: a form asking what to call someone is correctly
+    # answered with their first name when they haven't said otherwise.
+    preferred_name = Column(String, nullable=True)
+    # Current compensation. A SEPARATE fact from `expected_salary`, for the same
+    # reason `work_authorized` is separate from `requires_sponsorship`: forms ask
+    # both, they are different numbers, and the classifier used to route "current
+    # CTC" to the expected-salary formatter — so the candidate's expected number
+    # was typed into a field asking what they earn today. A wrong answer, not a
+    # blank one, which is the worse of the two failures.
+    current_salary = Column(Float, nullable=True)
+    current_salary_currency = Column(String, nullable=True)
+    # "How did you hear about this job?" — asked on nearly every form, and
+    # unanswerable from anything else in this table, so it was either left blank
+    # or composed by the LLM out of nothing.
+    referral_source = Column(String, nullable=True)
+    employment_type_preference = Column(String, nullable=True)  # see VALID_EMPLOYMENT_TYPES
+    # list[{"language": str, "proficiency": str}] — see VALID_LANGUAGE_PROFICIENCIES.
+    # Structured rather than a flat list of names because the question forms
+    # actually ask is "are you fluent in English?", and answering that from a
+    # bare mention of English in a list would be an inference about degree. A
+    # live Lever posting asked exactly this as a required radio group (Yes / No /
+    # Limited Working Proficiency) and it was left blank.
+    languages = Column(JSONB, nullable=True)
+    # "Are you willing to complete a background check?" Tri-state for the same
+    # reason `marketing_opt_in` is: `None` means never asked, and agreeing to a
+    # background check on someone's behalf because they were silent is not a
+    # thing this system does.
+    willing_background_check = Column(Boolean, nullable=True)
+    # "Yes, <company> may contact me about future roles" — the marketing/
+    # talent-pool opt-in nearly every form ends with. Tri-state on purpose and
+    # for the same reason the demographic columns are: `None` means the user
+    # was never asked, and an un-asked consent is NEVER inferred as consent.
+    # `automation/ats/base.py` ticks one of these boxes only for an explicit
+    # `True`; `False` and `None` both leave it exactly as the page rendered it.
+    marketing_opt_in = Column(Boolean, nullable=True)
+
     # Skills — structured JSONB rather than a separate table: read/written as
     # one unit (`PUT /profile/skills`), never filtered/joined on independently.
     # Shape: {programming_languages, frameworks, tools, certifications,
@@ -256,6 +320,24 @@ class CandidateDemographics(Base):
     veteran_status = Column(String, nullable=True)       # see VALID_VETERAN_STATUS_VALUES
     disability_status = Column(String, nullable=True)    # see VALID_DISABILITY_STATUS_VALUES
     race_ethnicity = Column(String, nullable=True)       # free text — EEO race/ethnicity categories vary by country/form
+
+    # Pronouns. Identity data, so it belongs here under the never-inferred rule
+    # above rather than on CandidateProfile — and it is the single field where
+    # letting an LLM answer would be worst: the only thing a model could infer
+    # pronouns FROM is the candidate's name, which is exactly how you misgender
+    # someone on a job application.
+    #
+    # Free text, NOT a closed enum: one live Lever form offers nine pronoun sets
+    # plus "Use name only" and "Custom", and a fixed set would force anyone
+    # outside it into "self_described". Store it the way the form words it
+    # ("he/him", "she/her", "they/them") and it matches directly.
+    pronouns = Column(String, nullable=True)
+    # list[str] — for the "select all that apply" ethnicity checkbox groups
+    # (Lever renders eight of them). `race_ethnicity` above stays the answer to
+    # a single-choice race/ethnicity question; this is the multi-choice form of
+    # the same fact, and `automation/forms/answer_engine.py` falls back to
+    # `[race_ethnicity]` when only that one is set.
+    ethnicities = Column(JSONB, nullable=True)
 
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))

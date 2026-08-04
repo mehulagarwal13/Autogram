@@ -8,6 +8,8 @@ open/search/scroll/verify algorithm is exercised for real, not mocked.
 
 from __future__ import annotations
 
+import pytest
+
 from automation.forms.field_handlers import (
     DEFAULT_HANDLER_REGISTRY,
     ComboboxHandler,
@@ -155,9 +157,38 @@ def test_native_select_handler_matches_a_slightly_longer_option_label(page):
 def test_checkbox_handler_checks_for_an_affirmative_value(page):
     _render(page, '<input id="f" type="checkbox">')
     field = describe_field(page.locator("#f"), label="I am authorized to work", page=page)
-    outcome = fill_field(field, "Authorized")
+    outcome = fill_field(field, "Yes")
     assert outcome.filled is True
     assert page.locator("#f").is_checked() is True
+
+
+@pytest.mark.parametrize("profile_text", [
+    "Authorized",
+    "Not authorized",
+    "I am not authorized to work",
+    "Requires H1B sponsorship",
+    "US Citizen",
+])
+def test_checkbox_handler_refuses_free_text_instead_of_ticking_a_declaration(page, profile_text):
+    """This test previously asserted the OPPOSITE for "Authorized": any string
+    not on a small negative-words blocklist ticked the box.
+
+    That was not a harmless default. The identical code path ticked "I am
+    authorized to work" when the profile's free-text `work_authorization`
+    column said "Not authorized" or "Requires H1B sponsorship" — a false legal
+    declaration on a real job application, because "not"/"requires" simply
+    weren't on the blocklist. A checkbox is now only ever set from a genuinely
+    boolean-shaped value; anything else refuses and goes to a human.
+    """
+    _render(page, '<input id="f" type="checkbox">')
+    field = describe_field(page.locator("#f"), label="I am authorized to work", page=page)
+
+    outcome = fill_field(field, profile_text)
+
+    assert outcome.filled is False
+    assert outcome.failure is not None
+    assert outcome.failure.failure_reason == "non_boolean_checkbox_value"
+    assert page.locator("#f").is_checked() is False
 
 
 def test_checkbox_handler_unchecks_for_a_negative_value(page):
