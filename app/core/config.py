@@ -50,6 +50,16 @@ AUTOMATION_HEADLESS = os.getenv("AUTOMATION_HEADLESS", "true").strip().lower() !
 AUTOMATION_SESSION_DIR = os.getenv("AUTOMATION_SESSION_DIR", "storage/automation_sessions")
 # Screenshots / traces / error logs per application run (see ARCHITECTURE.md §14).
 AUTOMATION_LOGS_DIR = os.getenv("AUTOMATION_LOGS_DIR", "logs")
+# Vision fallback (automation/forms/vision_fallback.py): after every cheaper
+# pass has run, screenshot the required fields that are STILL empty and ask a
+# vision model to read them. On by default — the fields it exists for (a
+# conditional follow-up whose meaning is in the question above it, a control
+# whose visible value isn't in its own value) are otherwise left blank and send
+# the whole run to a human. Set AUTOMATION_VISION_FALLBACK=false to turn it off;
+# it is the most expensive path in the system (one high-detail image per field,
+# capped at vision_fallback.MAX_FIELDS_PER_CALL), so a deployment watching cost
+# may reasonably want it off.
+AUTOMATION_VISION_FALLBACK = os.getenv("AUTOMATION_VISION_FALLBACK", "true").strip().lower() != "false"
 
 # --- Object storage (Phase 2 hardening — see PHASE2_ARCHITECTURE.md Initiative 4) ---
 # "local" (default) keeps today's on-disk behavior under storage/. "s3" routes

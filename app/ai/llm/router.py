@@ -13,6 +13,7 @@ Responsibilities:
 
 import logging
 import time
+from typing import Sequence
 
 from app.ai.llm.base import LLMProvider, LLMError
 from app.ai.llm.registry import TASK_ROUTES, PROVIDER_FACTORIES
@@ -44,11 +45,17 @@ class LLMRouter:
         task: str,
         prompt: str,
         system: str | None = None,
+        images: Sequence[bytes] | None = None,
         **overrides,
     ) -> str:
         """
         Executes `task` with its configured route. Keyword overrides
         (temperature, max_tokens, json_mode, model) apply per call.
+
+        `images` (raw PNG bytes, in order) rides along to providers that
+        accept it — see `LLMProvider.complete`. It is only forwarded when
+        non-empty, so a provider (or test double) written against the
+        text-only signature is never handed an argument it doesn't declare.
         """
         route = TASK_ROUTES.get(task)
         if route is None:
@@ -63,6 +70,8 @@ class LLMRouter:
             "max_tokens": overrides.get("max_tokens", route.max_tokens),
             "json_mode": overrides.get("json_mode", route.json_mode),
         }
+        if images:
+            params["images"] = images
 
         last_error: Exception | None = None
         for attempt in range(1, self._max_attempts + 1):

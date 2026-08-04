@@ -701,3 +701,172 @@ def test_run_passes_the_answer_engine_through_to_the_adapter_it_constructs(requi
     manager.run()
 
     assert seen_engines == [sentinel_engine]
+
+
+# ---------------------------------------------------------------------------
+# Vision fallback + résumé re-check (see automation/forms/vision_fallback.py and
+# ATSAdapter.ensure_resume_attached). These exercise the flow manager's own
+# bookkeeping directly rather than through a real run: what's worth pinning down
+# here is how the two passes' outcomes are folded into the confidence score and
+# the missing-required decision, which is pure logic.
+# ---------------------------------------------------------------------------
+
+def _bare_manager(tmp_path, **kwargs) -> ApplicationFlowManager:
+    """A manager with a mocked BrowserManager — never launches a browser. For
+    the helper methods below, which take the page/adapter they act on as
+    arguments."""
+    return ApplicationFlowManager(
+        application_id="app-helpers-1",
+        user_id="user-1",
+        job_url="about:blank",
+        ats_platform="greenhouse",
+        adapter_cls=_make_fake_adapter_cls([]),
+        profile=_profile(),
+        resume_document=_resume_document(tmp_path / "resume.pdf"),
+        browser_manager=MagicMock(),
+        **kwargs,
+    )
+
+
+class _VisionAdapterStub:
+    """Just enough adapter for the flow manager's two post-fill helpers."""
+
+    def __init__(self, *, vision_outcome=None, attached=None):
+        from automation.ats.base import VisionPassOutcome
+
+        self.vision_outcome = vision_outcome or VisionPassOutcome()
+        self.attached = attached
+        self.vision_calls = 0
+
+    def fill_unfilled_fields_with_vision(self, answerer, *, debug_dir=None):
+        self.vision_calls += 1
+        return self.vision_outcome
+
+    def ensure_resume_attached(self):
+        return self.attached
+
+
+def test_vision_pass_is_skipped_entirely_when_no_answerer_was_injected(tmp_path):
+    adapter = _VisionAdapterStub()
+    manager = _bare_manager(tmp_path)
+
+    assert manager._run_vision_pass(adapter, []) == set()
+    assert adapter.vision_calls == 0
+
+
+def test_vision_results_replace_an_earlier_passs_failure_instead_of_double_counting(tmp_path):
+    """A field the answer engine reported unfilled and the vision pass then
+    filled must count ONCE, as filled — otherwise a fully filled form scores
+    50% on that field and never reaches auto-submit."""
+    from automation.ats.base import VisionPassOutcome
+
+    question = "If yes to the above question, what role?"
+    all_results = [
+        FieldFillResult("first_name", "first_name", "Ada", 0.95, True),
+        FieldFillResult(question, "answer_engine:llm", None, 0.0, False),
+    ]
+    adapter = _VisionAdapterStub(vision_outcome=VisionPassOutcome(
+        results=[FieldFillResult(question, "vision", "N/A", 0.95, True)],
+    ))
+    manager = _bare_manager(tmp_path, vision_answerer=MagicMock())
+
+    manager._run_vision_pass(adapter, all_results)
+
+    assert len(all_results) == 2
+    assert all_results[1].filled is True
+    assert all_results[1].value_used == "N/A"
+    assert all_results[1].profile_path == "vision"
+    assert ApplicationFlowManager._aggregate_confidence(all_results) == 1.0
+
+
+def test_a_vision_field_no_earlier_pass_saw_is_appended(tmp_path):
+    from automation.ats.base import VisionPassOutcome
+
+    all_results = [FieldFillResult("first_name", "first_name", "Ada", 0.95, True)]
+    adapter = _VisionAdapterStub(vision_outcome=VisionPassOutcome(
+        results=[FieldFillResult("An unlabeled box", "vision", "N/A", 0.9, True)],
+    ))
+    manager = _bare_manager(tmp_path, vision_answerer=MagicMock())
+
+    manager._run_vision_pass(adapter, all_results)
+
+    assert [r.field_key for r in all_results] == ["first_name", "An unlabeled box"]
+
+
+def test_vision_pass_returns_the_fields_it_confirmed_already_answered(tmp_path):
+    from automation.ats.base import VisionPassOutcome
+
+    adapter = _VisionAdapterStub(vision_outcome=VisionPassOutcome(
+        confirmed_already_filled=["candidate-location", "country"],
+    ))
+    manager = _bare_manager(tmp_path, vision_answerer=MagicMock())
+
+    assert manager._run_vision_pass(adapter, []) == {"candidate-location", "country"}
+
+
+def test_a_vision_pass_that_raises_leaves_the_run_alone(tmp_path):
+    class _Exploding(_VisionAdapterStub):
+        def fill_unfilled_fields_with_vision(self, answerer, *, debug_dir=None):
+            raise RuntimeError("boom")
+
+    all_results = [FieldFillResult("first_name", "first_name", "Ada", 0.95, True)]
+    manager = _bare_manager(tmp_path, vision_answerer=MagicMock())
+
+    assert manager._run_vision_pass(_Exploding(), all_results) == set()
+    assert len(all_results) == 1
+
+
+def test_required_fields_the_vision_pass_read_as_answered_are_not_reported_missing(tmp_path, monkeypatch):
+    manager = _bare_manager(tmp_path)
+    monkeypatch.setattr(
+        "automation.applications.application_flow_manager.find_unfilled_required_fields",
+        lambda page: ["candidate-location", "question_37527990002"],
+    )
+
+    still_missing = manager._still_missing_required(MagicMock(), {"candidate-location"})
+
+    assert still_missing == ["question_37527990002"]
+
+
+def test_nothing_is_waived_when_the_vision_pass_confirmed_nothing(tmp_path, monkeypatch):
+    manager = _bare_manager(tmp_path)
+    monkeypatch.setattr(
+        "automation.applications.application_flow_manager.find_unfilled_required_fields",
+        lambda page: ["country"],
+    )
+
+    assert manager._still_missing_required(MagicMock(), set()) == ["country"]
+
+
+def test_recheck_marks_the_resume_unfilled_when_the_form_dropped_it(tmp_path):
+    """The bug this exists for: the upload verified at the time and the résumé
+    was gone by the end. The run must NOT report it as uploaded."""
+    resume_result = FieldFillResult("resume_upload", "resume_document", "resume.pdf", 1.0, True)
+    manager = _bare_manager(tmp_path)
+
+    manager._recheck_resume(_VisionAdapterStub(attached=False), resume_result)
+
+    assert resume_result.filled is False
+    assert resume_result.confidence == 0.0
+    assert "resume_lost_after_upload" in manager.steps_completed
+
+
+def test_recheck_upgrades_a_resume_that_was_re_attached(tmp_path):
+    resume_result = FieldFillResult("resume_upload", "resume_document", "resume.pdf", 0.0, False)
+    manager = _bare_manager(tmp_path)
+
+    manager._recheck_resume(_VisionAdapterStub(attached=True), resume_result)
+
+    assert resume_result.filled is True
+    assert resume_result.confidence == 1.0
+    assert "resume_reattached" in manager.steps_completed
+
+
+def test_recheck_leaves_the_original_result_alone_when_there_is_no_upload_field(tmp_path):
+    resume_result = FieldFillResult("resume_upload", "resume_document", "resume.pdf", 1.0, True)
+    manager = _bare_manager(tmp_path)
+
+    manager._recheck_resume(_VisionAdapterStub(attached=None), resume_result)
+
+    assert resume_result.filled is True
+    assert manager.steps_completed == []

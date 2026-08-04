@@ -31,6 +31,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Response
 from sqlalchemy.orm import Session
 
 from app.core.auth import get_current_user
+from app.core.config import AUTOMATION_VISION_FALLBACK
 from app.core.database import SessionLocal, get_db
 from app.models.application import ApplicationResponse, ApplicationStartRequest, AutomationRunResponse
 from app.models.db_models import Application, User
@@ -39,6 +40,7 @@ from automation.applications.application_flow_manager import ApplicationFlowMana
 from automation.ats.detector import detect_ats_for_url
 from automation.ats.registry import get_adapter_class
 from automation.forms.answer_engine import ApplicationAnswerEngine
+from automation.forms.vision_fallback import VisionFormAnswerer
 
 logger = logging.getLogger(__name__)
 
@@ -291,6 +293,20 @@ def _run_application(application_id: str, resume_document_id: str, job_descripti
             logger.exception("Application %s: could not build ApplicationAnswerEngine — continuing without it.", application_id)
             answer_engine = None
 
+        # The vision fallback reads the fields nothing else could fill off
+        # cropped screenshots (see automation/forms/vision_fallback.py). It
+        # reuses the answer engine's view of the candidate, so there's nothing
+        # to build without one — and, like the engine itself, a failure here
+        # only costs the run its last-resort pass, never the run.
+        vision_answerer = None
+        if answer_engine is not None and AUTOMATION_VISION_FALLBACK:
+            try:
+                vision_answerer = VisionFormAnswerer(answer_engine)
+            except Exception:
+                logger.exception(
+                    "Application %s: could not build the vision fallback — continuing without it.", application_id,
+                )
+
         manager = ApplicationFlowManager(
             application_id=application.application_id,
             user_id=application.user_id,
@@ -308,6 +324,7 @@ def _run_application(application_id: str, resume_document_id: str, job_descripti
             # watch them.
             headless=False if not application.autopilot_enabled else None,
             answer_engine=answer_engine,
+            vision_answerer=vision_answerer,
         )
         # See _run_on_dedicated_thread's docstring: Playwright's sync API
         # must run on a thread that was never touched by asyncio AND won't

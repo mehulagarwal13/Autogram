@@ -219,6 +219,16 @@ class BrowserManager:
         directory.mkdir(parents=True, exist_ok=True)
         return directory
 
+    def run_directory(self, application_id: str) -> Path:
+        """This run's artifact directory (`logs/<application_id>/`), created if
+        needed — the same one screenshots, the trace, and the error log go to.
+        Public so a caller with its own artifact to write can put it alongside
+        them instead of inventing a second location: the vision fallback pass
+        saves the cropped screenshots it sent to the model here, which is the
+        first thing anyone reviewing a questionable vision answer wants to
+        see."""
+        return self._run_dir(application_id)
+
     def screenshot_on_failure(self, page: Page, application_id: str) -> str:
         """Saves a full-page screenshot to `logs/<application_id>/screenshotN.png`
         (N auto-incremented) and returns its path — feeds

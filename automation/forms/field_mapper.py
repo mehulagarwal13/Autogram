@@ -53,6 +53,9 @@ FIELD_SYNONYMS: dict[str, list[str]] = {
     # when nothing is stored, so nothing is lost by claiming it here.
     "preferred_name": ["preferred name", "preferred first name", "nickname", "name you go by"],
     "first_name": ["first name", "given name", "legal first name"],
+    # No "middle initial": that field wants one letter, and typing a whole
+    # middle name into it is a wrong answer where a blank is a harmless one.
+    "middle_name": ["middle name", "legal middle name"],
     "last_name": ["last name", "surname", "family name", "legal last name"],
     "full_name": ["full name", "candidate name", "your name"],
     "email": ["email", "email address", "e-mail"],
@@ -60,8 +63,10 @@ FIELD_SYNONYMS: dict[str, list[str]] = {
     "location": ["location", "current location", "city, state"],
     "city": ["city"],
     "state": ["state", "province"],
+    "postal_code": ["zip", "zip code", "zipcode", "postal code", "postcode", "pin code"],
     "country": ["country"],
     "address": ["address", "street address", "mailing address"],
+    "time_zone": ["time zone", "timezone"],
     "linkedin_url": ["linkedin", "linkedin url", "linkedin profile"],
     "github_url": ["github", "github url"],
     "portfolio_url": ["portfolio", "portfolio url", "personal website"],
@@ -104,9 +109,44 @@ FIELD_SYNONYMS: dict[str, list[str]] = {
         "level of education", "education level", "highest degree",
     ],
     "willing_to_relocate": ["willing to relocate", "open to relocation", "able to relocate"],
+    # AFTER willing_to_relocate, same load-bearing order as the matching
+    # `question_classifier` categories: a "Willing to relocate?" checkbox whose
+    # label mentions the package stays a willingness question, and only a field
+    # that asks about assistance alone reaches this entry.
+    "requires_relocation_assistance": ["relocation assistance", "relocation support", "relocation package"],
+    "willing_to_travel": ["willing to travel", "able to travel", "open to travel"],
     "referral_source": ["how did you hear", "how did you find", "referral source"],
+    # AFTER referral_source, for the reason spelled out on the matching
+    # `question_classifier` category: a combined "how did you hear (if referred,
+    # by whom)" field is the source question, and only a dedicated referrer field
+    # gets a person's name.
+    "referrer_name": ["referred by", "referrer", "referrer name", "who referred you"],
     "employment_type_preference": ["employment type", "type of employment", "employment preference"],
     "willing_background_check": ["background check", "background screening"],
+    "willing_drug_test": ["drug test", "drug screen", "drug screening"],
+    # No bare "license"/"licence" — a professional license (nursing, PE, legal)
+    # is a different question this column would answer wrongly.
+    "has_drivers_license": [
+        "driver's license", "driver’s license", "drivers license", "driver license",
+        "driving license", "driving licence",
+    ],
+    "age_over_18": ["at least 18", "18 years or older", "18 or older", "over the age of 18"],
+    "security_clearance": ["security clearance", "clearance level", "active clearance"],
+    # "Earliest start date", never a bare "start date": Greenhouse's Education
+    # block renders "Start date year" fields, and a notice-period-shaped answer
+    # in a degree's start-year box is confidently wrong (the same note appears on
+    # `question_classifier`'s NOTICE_PERIOD phrases).
+    "earliest_start_date": [
+        "earliest start date", "earliest available start", "available start date",
+        "availability date", "date available to start",
+    ],
+    "professional_summary": [
+        "professional summary", "profile summary", "candidate summary",
+        # No "about you"/"tell us about yourself": those are prose questions
+        # tailored per posting, and `answer_engine`'s LLM path (which can now see
+        # this column — see `_PROMPT_PROFILE_ATTRIBUTES`) writes a better answer
+        # for them than a verbatim paste of the stored summary.
+    ],
     # "languages spoken", never a bare "languages": a "Programming languages"
     # field is extremely common on engineering applications, and filling it with
     # the candidate's SPOKEN languages would be confidently wrong. Their

@@ -47,6 +47,26 @@ TASK_ROUTES: dict[str, TaskRoute] = {
         max_tokens=800,            # a form-sized batch of short answers, not an essay each
         json_mode=True,            # {"answers": [...]} — see automation/forms/answer_engine.py
     ),
+    # --- vision fallback (last resort, one batched call per form) ---
+    # Answers the fields NO other pass could fill, from cropped SCREENSHOTS of
+    # those fields plus the candidate profile — see
+    # `automation/forms/vision_fallback.py`. Must stay on a vision-capable
+    # model (gpt-4.1-mini is; a text-only model would fail the call outright
+    # rather than answer blind — see `LLMProvider.complete`'s `images`).
+    #
+    # temperature 0.0, unlike `application_answer`'s 0.4: by the time a field
+    # reaches this route the answer being asked for is almost always a literal
+    # ("N/A" for an inapplicable conditional follow-up, one of a dropdown's own
+    # options, a value already visible on screen), where latitude for natural
+    # phrasing buys nothing and costs determinism. max_tokens is larger only
+    # because each answer carries a short `reason` for the run log.
+    "form_vision_answer": TaskRoute(
+        provider="openai",
+        model="gpt-4.1-mini",
+        temperature=0.0,
+        max_tokens=1200,
+        json_mode=True,   # {"answers": [{"field": 1, "answer": ..., "confidence": ...}]}
+    ),
     # --- Phase 2 prep (see PHASE2_ARCHITECTURE.md Initiative 1) ---
     # automation/agents/*.py will call these once the LangGraph agent layer
     # is built. Registered here now so the route (and its cost/latency

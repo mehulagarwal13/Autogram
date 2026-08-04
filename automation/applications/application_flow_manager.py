@@ -50,9 +50,11 @@ from automation.browser.selectors import (
     find_unfilled_required_fields,
     find_validation_errors,
     page_has_captcha,
+    wait_for_form_ready,
     wait_for_submission_confirmation,
 )
 from automation.forms.answer_engine import ApplicationAnswerEngine
+from automation.forms.vision_fallback import VisionFormAnswerer
 from automation.interfaces import ApplicationRunResult, CandidateProfile, ProfileDocument
 
 logger = logging.getLogger(__name__)
@@ -155,6 +157,7 @@ class ApplicationFlowManager:
         browser_manager: BrowserManager | None = None,
         headless: bool | None = None,
         answer_engine: ApplicationAnswerEngine | None = None,
+        vision_answerer: VisionFormAnswerer | None = None,
     ) -> None:
         self.application_id = application_id
         self.user_id = user_id
@@ -169,6 +172,14 @@ class ApplicationFlowManager:
         # Phase 5 behavior. Passed straight through to the adapter; this
         # class never calls it directly.
         self.answer_engine = answer_engine
+        # The vision fallback (`automation/forms/vision_fallback.py`), run once
+        # at the very end over whatever required fields are STILL empty. Also
+        # optional, and for the same reason: `None` keeps the run's behavior
+        # exactly as it was before this existed — the leftovers stay empty and
+        # the run goes to a human. Unlike `answer_engine` this one IS called
+        # from here rather than passed to the adapter, because it can only run
+        # after every fill pass on every step has finished.
+        self.vision_answerer = vision_answerer
         # `headless` only applies when this instance builds its own
         # BrowserManager — an injected one (tests; a caller managing its own
         # lifecycle) is used exactly as given. Left `None` (the default),
@@ -264,6 +275,12 @@ class ApplicationFlowManager:
     def _run_on_page(self, page: Page) -> ApplicationRunResult:
         self.browser_manager.run_with_retries(lambda: page.goto(self.job_url, wait_until="domcontentloaded"))
         self.checkpoint("navigated")
+        # `domcontentloaded` above is "the HTML parsed", which on a React/Remix
+        # ATS is before the form is hydrated — and filling a form mid-hydration
+        # can be silently undone by the framework as it takes over the DOM. See
+        # `wait_for_form_ready`'s comment block for the live Greenhouse run
+        # where exactly that dropped an already-verified résumé.
+        wait_for_form_ready(page)
         logger.info(
             "application %s: reached the job application page (%s, headless=%s)",
             self.application_id, self.job_url, self.browser_manager.headless,
@@ -304,7 +321,8 @@ class ApplicationFlowManager:
         )
 
         all_results: list[FieldFillResult] = []
-        all_results.append(self._upload_resume(adapter))
+        resume_result = self._upload_resume(adapter)
+        all_results.append(resume_result)
 
         for step_index in range(self.MAX_STEPS):
             personal_info_results = adapter.fill_personal_information()
@@ -340,6 +358,19 @@ class ApplicationFlowManager:
                 self.application_id, self.MAX_STEPS,
             )
 
+        # Last chance for the fields nothing above could fill: read them off
+        # screenshots. Runs BEFORE the confidence/missing-required checks so
+        # anything it fills counts, and after every step's fill passes because
+        # a field is only genuinely "left over" once they've all had a turn.
+        vision_confirmed_filled = self._run_vision_pass(adapter, all_results)
+
+        # Re-verify the résumé LAST, for the reason spelled out in
+        # `ATSAdapter.ensure_resume_attached`: a client-rendered form can drop
+        # an already-verified upload while it hydrates, so the only
+        # verification worth acting on is one taken after the form has settled
+        # and everything else has been filled.
+        self._recheck_resume(adapter, resume_result)
+
         confidence = self._aggregate_confidence(all_results)
         logger.info(
             "application %s: reached the final step — %d/%d tracked fields filled (confidence=%.4f)",
@@ -350,7 +381,7 @@ class ApplicationFlowManager:
         # isn't "low confidence" — it's "automation cannot proceed without a
         # human," regardless of how well everything else filled. Checked
         # (and reported by name) before ever considering AUTO_SUBMIT.
-        missing_required = find_unfilled_required_fields(page)
+        missing_required = self._still_missing_required(page, vision_confirmed_filled)
         if missing_required:
             reason = f"Required field(s) could not be filled — no value available in the candidate's profile: {', '.join(missing_required)}."
             logger.info("application %s: %s", self.application_id, reason)
@@ -450,6 +481,106 @@ class ApplicationFlowManager:
             screenshot_paths=screenshot_paths,
             error_log=error_log,
         )
+
+    def _run_vision_pass(self, adapter: ATSAdapter, all_results: list[FieldFillResult]) -> set[str]:
+        """Runs the vision fallback over whatever required fields are still
+        empty, merging its outcomes into `all_results` IN PLACE. Returns the
+        names of fields it confirmed were already answered on the form (see
+        `VisionPassOutcome`), for `_still_missing_required`.
+
+        Merging rather than appending matters for the confidence score: a field
+        an earlier pass already reported as unfilled must not be counted twice
+        — once as a failure and once as a success — which would leave a
+        perfectly filled form scoring 50% on that field. Results are matched by
+        `field_key`, which is the question text on both sides.
+
+        A no-op (empty set, `all_results` untouched) when no answerer was
+        injected.
+
+        Runs once, on the FINAL step. On a multi-step form the earlier steps
+        are behind a Next click by the time this runs, which is the same
+        constraint the missing-required check has always had: whatever a step
+        left empty went with it when the form advanced."""
+        if self.vision_answerer is None:
+            return set()
+
+        try:
+            outcome = adapter.fill_unfilled_fields_with_vision(
+                self.vision_answerer, debug_dir=self.browser_manager.run_directory(self.application_id),
+            )
+        except Exception:  # noqa: BLE001 - a best-effort last pass must never fail the run
+            logger.exception("application %s: the vision fallback pass failed — continuing without it.", self.application_id)
+            return set()
+
+        for result in outcome.results:
+            existing = next((r for r in all_results if r.field_key == result.field_key), None)
+            if existing is None:
+                all_results.append(result)
+                continue
+            existing.profile_path = result.profile_path
+            existing.value_used = result.value_used
+            existing.confidence = result.confidence
+            existing.filled = result.filled
+            existing.failure = result.failure
+
+        filled_count = sum(1 for r in outcome.results if r.filled)
+        if outcome.results or outcome.confirmed_already_filled:
+            self.checkpoint("vision_fallback_pass")
+            logger.info(
+                "application %s: vision fallback filled %d/%d field(s); %d already answered on the form.",
+                self.application_id, filled_count, len(outcome.results),
+                len(outcome.confirmed_already_filled),
+            )
+        return set(outcome.confirmed_already_filled)
+
+    def _still_missing_required(self, page: Page, vision_confirmed_filled: set[str]) -> list[str]:
+        """The required fields that are still empty — excluding any the vision
+        pass read as already answered.
+
+        That exclusion is narrow and evidence-based, not a loosening of the
+        check: `find_unfilled_required_fields` reads a control's OWN value, so
+        a widget whose visible selection lives elsewhere (react-select,
+        country pickers — the standard shape on a modern Greenhouse form)
+        reports empty while the page plainly shows a value, and every such form
+        would otherwise be permanently `manual_required` over answers that are
+        demonstrably there. Each exclusion is logged by name so a run's log
+        always shows what was waived and on what basis."""
+        missing = find_unfilled_required_fields(page)
+        if not vision_confirmed_filled:
+            return missing
+
+        waived = [name for name in missing if name in vision_confirmed_filled]
+        if waived:
+            logger.info(
+                "application %s: %d required field(s) reported empty but shown as already answered in "
+                "their screenshots — not treating these as missing: %s",
+                self.application_id, len(waived), ", ".join(waived),
+            )
+        return [name for name in missing if name not in vision_confirmed_filled]
+
+    def _recheck_resume(self, adapter: ATSAdapter, resume_result: FieldFillResult) -> None:
+        """Updates `resume_result` in place from a final, post-fill check of
+        whether the résumé is actually still attached — see
+        `ATSAdapter.ensure_resume_attached`. `None` from there means this page
+        has no upload field to check, in which case the original upload
+        result stands untouched."""
+        try:
+            attached = adapter.ensure_resume_attached()
+        except Exception:  # noqa: BLE001 - never let the re-check itself fail a run
+            logger.exception("application %s: the résumé re-check failed — leaving the original result.", self.application_id)
+            return
+
+        if attached is None or attached == resume_result.filled:
+            return
+
+        logger.warning(
+            "application %s: résumé attachment changed after filling — was %s, now %s.",
+            self.application_id, "attached" if resume_result.filled else "not attached",
+            "attached" if attached else "NOT attached",
+        )
+        resume_result.filled = attached
+        resume_result.confidence = 1.0 if attached else 0.0
+        self.checkpoint("resume_reattached" if attached else "resume_lost_after_upload")
 
     def _upload_resume(self, adapter: ATSAdapter) -> FieldFillResult:
         uploaded = adapter.upload_resume()

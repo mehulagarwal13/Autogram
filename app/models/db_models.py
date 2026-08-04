@@ -231,6 +231,77 @@ class CandidateProfile(Base):
     # `True`; `False` and `None` both leave it exactly as the page rendered it.
     marketing_opt_in = Column(Boolean, nullable=True)
 
+    # --- third tier of form-answer fields -----------------------------------
+    # Same rule as the two tiers above: one column per question real ATS forms
+    # ask that nothing already in this table could answer, and NOTHING here is
+    # ever inferred — every one is set only by the user through
+    # `POST`/`PATCH /profile`.
+    #
+    # Contact/identity block, all three asked on ordinary application forms and
+    # all three previously unfillable:
+    #
+    # `middle_name` — Workday and Taleo forms ask for a legal middle name right
+    # next to first/last. `full_name` can't answer it (splitting a full name on
+    # whitespace to guess which part is the middle name is exactly the kind of
+    # guess this codebase doesn't make).
+    #
+    # `postal_code` — the ZIP/postal field of the address block. Deliberately
+    # NOT folded into the Fernet-encrypted `address_encrypted`: it is asked as
+    # its own input, so it has to be readable as its own value, and it sits with
+    # `city`/`state`/`country` (also plaintext) rather than with the street
+    # address it would take to actually locate someone.
+    #
+    # `time_zone` — "Which time zone are you based in?", asked by nearly every
+    # remote posting. Free text in the form's own vocabulary ("IST", "GMT+5:30",
+    # "US Eastern") for the same reason `highest_education_level` is: the value's
+    # only job is to be matchable against the options a given form offers.
+    # Named `time_zone`, not `timezone`, so it can't be misread as the
+    # `datetime.timezone` this module imports.
+    middle_name = Column(String, nullable=True)
+    postal_code = Column(String, nullable=True)
+    time_zone = Column(String, nullable=True)
+
+    # The candidate's own summary/headline ("Tell us about yourself", "Profile
+    # summary"). Text, not String: it's a paragraph. Written by the user, which
+    # is the point — a summary field otherwise gets composed from scratch by the
+    # LLM on every single application, differently each time.
+    professional_summary = Column(Text, nullable=True)
+
+    # "What is your earliest start date?" — a DIFFERENT shape of the same fact
+    # as `notice_period_days`, and forms ask for it as a date, not a duration.
+    # Free-form string like the education/experience dates for the same reason:
+    # candidates give "2026-09-01", "September 2026", or "Immediately", and
+    # coercing that into a `Date` would reject two of the three.
+    earliest_start_date = Column(String, nullable=True)
+
+    # "Do you hold an active security clearance? If so, which level?" — asked on
+    # every US defense/government-adjacent posting. Free text ("Active Secret",
+    # "None") and never inferred: claiming a clearance the candidate doesn't
+    # hold is a false statement on a federal application.
+    security_clearance = Column(String, nullable=True)
+
+    # "If you were referred, who referred you?" — a SEPARATE field from
+    # `referral_source` on Greenhouse's referral block, and answering it with
+    # the source ("LinkedIn") puts a website where a person's name goes.
+    referrer_name = Column(String, nullable=True)
+
+    # Tri-state booleans, all five for the same reason `marketing_opt_in` is:
+    # `None` means the user was never asked, and none of these is ever answered
+    # from silence. Each one is a question a live posting asked that had no
+    # column to answer from.
+    age_over_18 = Column(Boolean, nullable=True)            # "Are you at least 18 years of age?"
+    willing_to_travel = Column(Boolean, nullable=True)      # "Are you willing to travel for this role?"
+    # "Do you require relocation assistance?" — NOT the same question as
+    # `willing_to_relocate`, and the distinction is money: a candidate can be
+    # happy to move and still need the employer to pay for it, or be happy to
+    # move at their own expense. `automation/forms/question_classifier.py`
+    # already refused to answer this one from `willing_to_relocate` (see its
+    # WILLING_TO_RELOCATE note) and so left it blank; this is where the real
+    # answer lives.
+    requires_relocation_assistance = Column(Boolean, nullable=True)
+    willing_drug_test = Column(Boolean, nullable=True)      # "Are you willing to complete a pre-employment drug screening?"
+    has_drivers_license = Column(Boolean, nullable=True)    # "Do you hold a valid driver's license?"
+
     # Skills — structured JSONB rather than a separate table: read/written as
     # one unit (`PUT /profile/skills`), never filtered/joined on independently.
     # Shape: {programming_languages, frameworks, tools, certifications,

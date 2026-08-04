@@ -24,7 +24,8 @@ _ENCRYPTED_FIELD_MAP = {"phone": "phone_encrypted", "address": "address_encrypte
 
 # Every other CandidateProfile column that's settable directly through the API.
 _PLAIN_PROFILE_FIELDS = [
-    "full_name", "first_name", "last_name", "email", "location", "city", "state", "country",
+    "full_name", "first_name", "middle_name", "last_name", "email", "location",
+    "city", "state", "postal_code", "country", "time_zone",
     "linkedin_url", "github_url", "portfolio_url", "website_url",
     "current_company", "current_role", "years_of_experience", "notice_period_days",
     "expected_salary", "expected_salary_currency", "work_authorization", "visa_status",
@@ -39,6 +40,14 @@ _PLAIN_PROFILE_FIELDS = [
     "highest_education_level", "willing_to_relocate", "marketing_opt_in",
     "preferred_name", "current_salary", "current_salary_currency", "referral_source",
     "employment_type_preference", "languages", "willing_background_check",
+    # Third tier (see db_models.py::CandidateProfile). `postal_code` is
+    # deliberately in the plaintext list above rather than routed through
+    # `_ENCRYPTED_FIELD_MAP` with `address`: a postal code is asked as its own
+    # input and has to be readable as its own value, and on its own it doesn't
+    # locate anyone the way a street address does.
+    "professional_summary", "earliest_start_date", "security_clearance", "referrer_name",
+    "age_over_18", "willing_to_travel", "requires_relocation_assistance",
+    "willing_drug_test", "has_drivers_license",
 ]
 
 
@@ -139,10 +148,13 @@ def delete_education(db: Session, entry: EducationEntry) -> None:
 # ---------- experience ----------
 
 def list_experience(db: Session, profile_id: str) -> list[ExperienceEntry]:
+    # `experience_id` breaks ties: a bulk insert writes every row inside one
+    # transaction, so several rows can share a `created_at` and `desc()` alone
+    # would order them arbitrarily (differently between two identical calls).
     return (
         db.query(ExperienceEntry)
         .filter(ExperienceEntry.profile_id == profile_id)
-        .order_by(ExperienceEntry.created_at.desc())
+        .order_by(ExperienceEntry.created_at.desc(), ExperienceEntry.experience_id)
         .all()
     )
 
@@ -151,12 +163,38 @@ def get_experience(db: Session, experience_id: str) -> ExperienceEntry | None:
     return db.query(ExperienceEntry).filter(ExperienceEntry.experience_id == experience_id).first()
 
 
+def add_experiences(db: Session, profile_id: str, items: list[dict]) -> list[ExperienceEntry]:
+    """Creates every entry in `items` for `profile_id` in ONE transaction.
+
+    All-or-nothing: the rows are staged, flushed together so the DB reports
+    any constraint violation while we can still act on it, and committed once.
+    If anything raises — a bad column in `items`, a FK violation because the
+    profile vanished under us, a lost connection mid-commit — the session is
+    rolled back and the error propagates, leaving *no* partial batch behind.
+    That guarantee is why the API layer must not commit around this call.
+
+    Returns the created entries in the order they were given.
+    """
+    entries: list[ExperienceEntry] = []
+    try:
+        for data in items:
+            entry = ExperienceEntry(experience_id=str(uuid.uuid4()), profile_id=profile_id, **data)
+            db.add(entry)
+            entries.append(entry)
+        db.flush()
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    for entry in entries:
+        db.refresh(entry)  # expire_on_commit=True — reload server-side defaults (created_at)
+    return entries
+
+
 def add_experience(db: Session, profile_id: str, data: dict) -> ExperienceEntry:
-    entry = ExperienceEntry(experience_id=str(uuid.uuid4()), profile_id=profile_id, **data)
-    db.add(entry)
-    db.commit()
-    db.refresh(entry)
-    return entry
+    """Single-entry create. Kept as-is for existing callers; delegates to
+    `add_experiences` so the one-row and many-row paths can't drift apart."""
+    return add_experiences(db, profile_id, [data])[0]
 
 
 def update_experience(db: Session, entry: ExperienceEntry, data: dict) -> ExperienceEntry:

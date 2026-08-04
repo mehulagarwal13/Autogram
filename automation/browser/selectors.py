@@ -201,6 +201,43 @@ def find_upload_trigger_button(page: Page) -> Locator | None:
     return _find_button_by_text(page, UPLOAD_TRIGGER_TEXT_CANDIDATES)
 
 
+# --- Waiting for a client-rendered form to be ready ---------------------------
+# `page.goto(..., wait_until="domcontentloaded")` returns as soon as the
+# server's HTML is parsed, which on a modern ATS is BEFORE the React/Remix app
+# has hydrated it. Filling in that window is not merely early, it can be
+# silently undone: Greenhouse's `job-boards.*` board logs React hydration
+# errors ("React recovered from an error during hydration") and re-creates part
+# of the form's DOM as it recovers, discarding anything already put into the
+# affected elements.
+#
+# That was observed live, not theorized: on a real Greenhouse posting the
+# résumé was attached at t=4.3s and verified attached (`input.files.length ==
+# 1`); hydration recovered at t=4.9s; from t=6.3s onward the same `#resume`
+# input was empty again and the form showed no attachment, so the run finished
+# with a "resume uploaded" checkpoint and no résumé on the application.
+#
+# Hence: settle first, and (see `ATSAdapter.ensure_resume_attached`) re-check
+# the résumé at the END rather than trusting a verification made seconds
+# before hydration ran.
+FORM_READY_TIMEOUT_MS = 15_000
+
+
+def wait_for_form_ready(page: Page, *, timeout_ms: int = FORM_READY_TIMEOUT_MS) -> None:
+    """Best-effort wait for a client-rendered application form to finish
+    loading and hydrating, before anything is typed into it.
+
+    Deliberately never raises and never fails a run: every wait here is a
+    bounded optimization, and a page that legitimately keeps a connection open
+    (analytics beacons, a chat widget's websocket, a polling request) would
+    otherwise time out on `networkidle` forever. Timing out just means filling
+    starts anyway — exactly the pre-existing behavior."""
+    for state in ("load", "networkidle"):
+        try:
+            page.wait_for_load_state(state, timeout=timeout_ms)
+        except PlaywrightError as e:
+            logger.debug("wait_for_form_ready: %r state not reached (%s) — continuing.", state, e)
+
+
 # Selects every field that could plausibly be "required" in the profile-
 # mapping sense — same exclusions `automation/ats/base.py`'s name/placeholder
 # pass uses (hidden/submit/button aren't real form fields; file inputs are
@@ -236,21 +273,18 @@ def _describe_unfilled_field(field: Locator) -> str:
     return "an unnamed field"
 
 
-def find_unfilled_required_fields(page: Page) -> list[str]:
-    """Scans the page's CURRENT DOM state — after every fill pass an adapter
-    runs has already had its turn — for any visible, required
-    input/select/textarea/checkbox/radio that's still empty/unchecked.
-    Returns a human-readable name per such field (empty if none). Used by
-    `ApplicationFlowManager` to decide `manual_required` (with a specific
-    reason) instead of guessing from an aggregate confidence score alone: a
-    required field with genuinely no value in the candidate's profile isn't
-    "low confidence," it's "automation cannot proceed without a human."
+def find_unfilled_required_field_locators(page: Page) -> list[tuple[str, Locator]]:
+    """`find_unfilled_required_fields` (below), but keeping each field's
+    `Locator` alongside its human-readable name.
 
-    Deliberately a fresh DOM scan rather than something every adapter/fill
-    pass has to separately track and report — this is what lets the check
-    work identically across every ATS platform and every fill path with no
-    per-adapter code at all."""
-    missing: list[str] = []
+    Same scan, two callers with different needs: the flow manager only ever
+    wanted the names for its `manual_required` reason string, while the vision
+    fallback pass (`automation/forms/vision_fallback.py`) has to actually
+    screenshot and then FILL these fields, which needs the locator. Kept as
+    one scan rather than two so "what counts as an unfilled required field"
+    can never drift between the check that reports a problem and the pass that
+    tries to fix it."""
+    missing: list[tuple[str, Locator]] = []
     try:
         candidates = page.locator(_REQUIRED_CANDIDATE_SELECTOR).all()
     except PlaywrightError:
@@ -273,9 +307,34 @@ def find_unfilled_required_fields(page: Page) -> list[str]:
             continue
 
         if not has_value:
-            missing.append(_describe_unfilled_field(field))
+            missing.append((_describe_unfilled_field(field), field))
 
     return missing
+
+
+def find_unfilled_required_fields(page: Page) -> list[str]:
+    """Scans the page's CURRENT DOM state — after every fill pass an adapter
+    runs has already had its turn — for any visible, required
+    input/select/textarea/checkbox/radio that's still empty/unchecked.
+    Returns a human-readable name per such field (empty if none). Used by
+    `ApplicationFlowManager` to decide `manual_required` (with a specific
+    reason) instead of guessing from an aggregate confidence score alone: a
+    required field with genuinely no value in the candidate's profile isn't
+    "low confidence," it's "automation cannot proceed without a human."
+
+    Deliberately a fresh DOM scan rather than something every adapter/fill
+    pass has to separately track and report — this is what lets the check
+    work identically across every ATS platform and every fill path with no
+    per-adapter code at all.
+
+    Note this reads the CONTROL's own value, which is why a custom widget
+    whose visible selection lives outside its backing input (a react-select
+    combobox, a country picker) can appear here while the page plainly shows a
+    value. That's deliberately not "fixed" by loosening the check — under-
+    reporting a genuinely empty required field is the dangerous direction —
+    and it's part of why the vision fallback pass is told to answer `null`
+    for any field whose screenshot already shows a value."""
+    return [name for name, _locator in find_unfilled_required_field_locators(page)]
 
 
 # --- Submission confirmation (§10 of both specs) ------------------------------

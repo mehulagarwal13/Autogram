@@ -10,7 +10,8 @@ from __future__ import annotations
 
 import logging
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from fastapi import APIRouter, Body, Depends, File, HTTPException, UploadFile
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.core.auth import get_current_user
@@ -35,8 +36,11 @@ from app.models.profile import (
     DocumentResponse,
     EducationRequest,
     EducationResponse,
+    ExperienceBatchCreate,
+    ExperienceCreate,
     ExperienceRequest,
     ExperienceResponse,
+    MAX_EXPERIENCE_BATCH,
     ProfileResponse,
     ProfileUpsertRequest,
     SkillsRequest,
@@ -93,6 +97,21 @@ def _validate_remote_preference(value: str | None) -> None:
 def _validate_choice(value: str | None, valid: set[str], field_name: str) -> None:
     if value is not None and value not in valid:
         raise HTTPException(status_code=400, detail=f"Invalid {field_name} '{value}'. Must be one of {sorted(valid)}.")
+
+
+def _validate_demographic_choices(data: dict) -> None:
+    """Every closed-vocabulary demographic field, in one place so `POST` and
+    `PUT /profile/demographics` can't drift apart on what they accept.
+
+    `pronouns`, `race_ethnicity` and `ethnicities` are deliberately NOT here —
+    see `DemographicsRequest`. Whatever the user stores is matched against the
+    options a given form actually offers
+    (`automation/forms/demographic_matching.py`), and a value no form has an
+    option for simply leaves that question for a human. Rejecting a legitimate
+    pronoun set or a non-US ethnicity category would be the worse failure."""
+    _validate_choice(data.get("gender"), VALID_GENDER_VALUES, "gender")
+    _validate_choice(data.get("veteran_status"), VALID_VETERAN_STATUS_VALUES, "veteran_status")
+    _validate_choice(data.get("disability_status"), VALID_DISABILITY_STATUS_VALUES, "disability_status")
 
 
 def _validate_profile_choices(data: dict) -> None:
@@ -190,15 +209,101 @@ def delete_education(
 
 # ---------- experience ----------
 
-@router.post("/experience", response_model=ExperienceResponse, status_code=201)
+_EXPERIENCE_BODY_EXAMPLES = {
+    "bulk": {
+        "summary": "Many entries (one transaction)",
+        "description": (
+            "A JSON array creates every entry atomically: if one is rejected, none are stored. "
+            f"Between 1 and {MAX_EXPERIENCE_BATCH} entries."
+        ),
+        "value": [
+            {
+                "company_name": "Acme Corp",
+                "job_title": "Senior Backend Engineer",
+                "start_date": "2021-03",
+                "end_date": None,
+                "description": "Owned the payments service.",
+                "skills_used": ["Python", "PostgreSQL"],
+            },
+            {
+                "company_name": "Globex",
+                "job_title": "Backend Engineer",
+                "start_date": "2018-06",
+                "end_date": "2021-02",
+                "skills_used": ["Django"],
+            },
+        ],
+    },
+    "single": {
+        "summary": "One entry (unchanged legacy shape)",
+        "description": "A JSON object still works and still returns a single object, not an array.",
+        "value": {
+            "company_name": "Acme Corp",
+            "job_title": "Senior Backend Engineer",
+            "start_date": "2021-03",
+            "skills_used": ["Python"],
+        },
+    },
+}
+
+
+@router.post(
+    "/experience",
+    response_model=list[ExperienceResponse] | ExperienceResponse,
+    status_code=201,
+    summary="Create one or many experience entries",
+    response_description=(
+        "The created entries — an array when an array was posted, a single object when a single "
+        "object was posted."
+    ),
+    responses={
+        400: {"description": "The batch could not be stored; nothing was created."},
+        401: {"description": "Missing or invalid credentials."},
+        404: {"description": "The authenticated user has no profile yet."},
+        422: {"description": "Body failed validation; nothing was created."},
+    },
+)
 def add_experience(
-    body: ExperienceRequest,
+    body: ExperienceBatchCreate | ExperienceCreate = Body(
+        ...,
+        openapi_examples=_EXPERIENCE_BODY_EXAMPLES,
+    ),
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    profile = _get_owned_profile(db, user)
-    entry = repo.add_experience(db, profile.profile_id, body.model_dump(exclude_unset=True))
-    return entry
+    """Adds work experience to the authenticated user's own profile.
+
+    Accepts either shape:
+
+    - a JSON **array** of entries — all created in a single transaction, so a
+      failure anywhere rolls the whole batch back and leaves the profile
+      exactly as it was;
+    - a JSON **object** — the original single-entry call, byte-for-byte
+      unchanged in both what it accepts and what it returns.
+
+    The response mirrors the request shape (array in, array out) so existing
+    single-entry clients keep parsing an object.
+    """
+    profile = _get_owned_profile(db, user)  # 404s unless this user owns a profile
+
+    is_batch = isinstance(body, ExperienceBatchCreate)
+    items = list(body.root) if is_batch else [body]
+    payloads = [item.model_dump(exclude_unset=True) for item in items]
+
+    try:
+        entries = repo.add_experiences(db, profile.profile_id, payloads)
+    except SQLAlchemyError:
+        # `add_experiences` already rolled the transaction back — no partial batch exists.
+        logger.exception(
+            "Failed to create %d experience entr%s for profile %s; transaction rolled back.",
+            len(payloads), "y" if len(payloads) == 1 else "ies", profile.profile_id,
+        )
+        raise HTTPException(
+            status_code=400,
+            detail=f"Could not save the {len(payloads)} submitted experience entries. No entries were created.",
+        )
+
+    return entries if is_batch else entries[0]
 
 
 @router.get("/experience", response_model=list[ExperienceResponse])
@@ -333,7 +438,7 @@ def delete_document(
 # Deliberately its own resource, not folded into GET/PATCH /profile — see
 # app/models/db_models.py::CandidateDemographics for the rationale. A `None`
 # field on GET means "never asked" (the automation layer should prompt the
-# user once and then PUT the answer), not "no opinion" — never inferred or
+# user once and then POST/PUT the answer), not "no opinion" — never inferred or
 # defaulted here or anywhere else.
 
 @router.get("/demographics", response_model=DemographicsResponse)
@@ -348,24 +453,46 @@ def get_demographics(user: User = Depends(get_current_user), db: Session = Depen
     return entry
 
 
+@router.post("/demographics", response_model=DemographicsResponse, status_code=201)
+def create_demographics(
+    body: DemographicsRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Creates the demographics row for the first time — the shape a client
+    reaches for when the user answers these questions once, during onboarding or
+    the first time an application surfaces an EEO question.
+
+    Same create/update split as `POST /profile` vs `PATCH /profile`, and for the
+    same reason: a `409` here is how a client learns the user has already
+    answered some of these, rather than silently overwriting what a previous
+    answer session stored. Use `PUT /profile/demographics` to change them.
+
+    Writes exactly what the user sent and nothing else: an omitted field stays
+    `None` — "never asked" — and is never defaulted to `decline_to_answer` or
+    anything else on their behalf."""
+    profile = _get_owned_profile(db, user)
+    if repo.get_demographics(db, profile.profile_id) is not None:
+        raise HTTPException(
+            status_code=409,
+            detail="Demographics already exist. Use PUT /profile/demographics to update them.",
+        )
+    data = body.model_dump(exclude_unset=True)
+    _validate_demographic_choices(data)
+    return repo.upsert_demographics(db, profile.profile_id, data)
+
+
 @router.put("/demographics", response_model=DemographicsResponse)
 def put_demographics(
     body: DemographicsRequest,
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """The ONLY write path for demographic data anywhere in this codebase —
-    always a direct, explicit user choice via this endpoint. Partial:
+    """Creates or replaces demographic answers — always a direct, explicit user
+    choice via this endpoint or its `POST` sibling above, which are together the
+    ONLY write path for demographic data anywhere in this codebase. Partial:
     fields omitted from the request body are left exactly as they were."""
     profile = _get_owned_profile(db, user)
     data = body.model_dump(exclude_unset=True)
-    _validate_choice(data.get("gender"), VALID_GENDER_VALUES, "gender")
-    _validate_choice(data.get("veteran_status"), VALID_VETERAN_STATUS_VALUES, "veteran_status")
-    _validate_choice(data.get("disability_status"), VALID_DISABILITY_STATUS_VALUES, "disability_status")
-    # `pronouns`, `race_ethnicity` and `ethnicities` are deliberately NOT
-    # validated against a closed set — see `DemographicsRequest`. Whatever the
-    # user stores is matched against the options a given form actually offers
-    # (`automation/forms/demographic_matching.py`), and a value no form has an
-    # option for simply leaves that question for a human. Rejecting a legitimate
-    # pronoun set or a non-US ethnicity category would be the worse failure.
+    _validate_demographic_choices(data)
     return repo.upsert_demographics(db, profile.profile_id, data)

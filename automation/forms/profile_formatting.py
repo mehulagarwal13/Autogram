@@ -194,6 +194,84 @@ def format_willing_to_relocate(profile: CandidateProfile) -> str | None:
     return _yes_no(profile.willing_to_relocate)
 
 
+def format_earliest_start_date(profile: CandidateProfile) -> str | None:
+    """Stored in whatever words the candidate used ("2026-09-01", "September
+    2026", "Immediately"), so there is nothing to reformat — this exists so the
+    attribute has an explicit entry in `PROFILE_VALUE_FORMATTERS` and so ""
+    comes back as `None` rather than as a blank filled into a date field."""
+    return (profile.earliest_start_date or "").strip() or None
+
+
+def format_notice_period_or_start_date(profile: CandidateProfile) -> str | None:
+    """The notice-period category covers both "what is your notice period?" and
+    "when can you start?" (see `question_classifier`'s NOTICE_PERIOD phrases), so
+    a candidate who recorded a concrete start date but no notice period can still
+    answer it — with the date, which is the honest answer to the availability
+    half of that category and beats leaving a required field blank.
+
+    Days win when both are set: the question is asked as a duration far more
+    often than as a date, and this is the same value that has always answered
+    it."""
+    return format_notice_period(profile) or format_earliest_start_date(profile)
+
+
+def format_security_clearance(profile: CandidateProfile) -> str | None:
+    """Never a guess: an empty column answers nothing, because claiming a
+    clearance the candidate doesn't hold is a false statement on a federal
+    application, and "None" is the candidate's own word to record if that's the
+    answer they want to give."""
+    return (profile.security_clearance or "").strip() or None
+
+
+def format_referrer_name(profile: CandidateProfile) -> str | None:
+    """Deliberately does NOT fall back to `referral_source`, unlike the way
+    `format_preferred_name` falls back to `first_name`: "who referred you?"
+    answered with "LinkedIn" puts a website where a person's name goes, and a
+    named referral is a claim about a real employee."""
+    return (profile.referrer_name or "").strip() or None
+
+
+def format_professional_summary(profile: CandidateProfile) -> str | None:
+    return (profile.professional_summary or "").strip() or None
+
+
+def format_time_zone(profile: CandidateProfile) -> str | None:
+    return (profile.time_zone or "").strip() or None
+
+
+def format_age_over_18(profile: CandidateProfile) -> str | None:
+    if profile.age_over_18 is None:
+        return None
+    return _yes_no(profile.age_over_18)
+
+
+def format_willing_to_travel(profile: CandidateProfile) -> str | None:
+    if profile.willing_to_travel is None:
+        return None
+    return _yes_no(profile.willing_to_travel)
+
+
+def format_requires_relocation_assistance(profile: CandidateProfile) -> str | None:
+    """Reads its OWN column and never `willing_to_relocate`. The two are
+    different facts — willingness to move vs. needing it paid for — and a
+    candidate can be True on either independently."""
+    if profile.requires_relocation_assistance is None:
+        return None
+    return _yes_no(profile.requires_relocation_assistance)
+
+
+def format_willing_drug_test(profile: CandidateProfile) -> str | None:
+    if profile.willing_drug_test is None:
+        return None
+    return _yes_no(profile.willing_drug_test)
+
+
+def format_has_drivers_license(profile: CandidateProfile) -> str | None:
+    if profile.has_drivers_license is None:
+        return None
+    return _yes_no(profile.has_drivers_license)
+
+
 def format_sponsorship_countries(profile: CandidateProfile) -> str | None:
     countries = profile.sponsorship_countries
     if not countries:
@@ -220,6 +298,19 @@ PROFILE_VALUE_FORMATTERS: dict[str, Callable[[CandidateProfile], str | None]] = 
     "employment_type_preference": format_employment_type,
     "willing_background_check": format_willing_background_check,
     "languages": format_languages,
+    # Third tier. `middle_name` and `postal_code` are absent on purpose: they
+    # are plain strings that go into the form exactly as stored, which is what
+    # `format_scalar` already does for `first_name`, `city` and `state`.
+    "professional_summary": format_professional_summary,
+    "earliest_start_date": format_earliest_start_date,
+    "security_clearance": format_security_clearance,
+    "referrer_name": format_referrer_name,
+    "time_zone": format_time_zone,
+    "age_over_18": format_age_over_18,
+    "willing_to_travel": format_willing_to_travel,
+    "requires_relocation_assistance": format_requires_relocation_assistance,
+    "willing_drug_test": format_willing_drug_test,
+    "has_drivers_license": format_has_drivers_license,
 }
 
 

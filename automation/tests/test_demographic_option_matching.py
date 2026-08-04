@@ -43,6 +43,7 @@ from automation.forms.question_classifier import (
     CATEGORY_DEMOGRAPHIC_PRONOUNS,
     CATEGORY_DEMOGRAPHIC_RACE_ETHNICITY,
     CATEGORY_HIGHEST_EDUCATION,
+    CATEGORY_RELOCATION_ASSISTANCE,
     CATEGORY_WILLING_TO_RELOCATE,
     classify_question,
     is_demographic,
@@ -218,8 +219,16 @@ def test_gender_pronouns_is_classified_as_pronouns_not_gender():
 
 def test_relocation_assistance_is_not_a_willingness_question():
     """A question about money, not willingness — answering it from
-    `willing_to_relocate` would be confidently wrong."""
-    assert classify_question("Do you require relocation assistance?") is None
+    `willing_to_relocate` would be confidently wrong. It used to classify as
+    `None` (there was no column to answer it from, so it was left blank); it now
+    has its own category and column, and the only thing that must never happen —
+    it resolving to WILLING_TO_RELOCATE — still doesn't. See
+    automation/tests/test_profile_answer_fields_tier_three.py for the answering
+    side of both questions."""
+    category = classify_question("Do you require relocation assistance?")
+
+    assert category == CATEGORY_RELOCATION_ASSISTANCE
+    assert category != CATEGORY_WILLING_TO_RELOCATE
 
 
 def test_an_education_start_date_year_is_not_an_education_level_question():

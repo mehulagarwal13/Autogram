@@ -54,21 +54,33 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field as _dc_field
+from pathlib import Path
 from typing import Any
 
 from playwright.sync_api import Error as PlaywrightError, Locator
 
 from app.core.crypto import decrypt_field
-from automation.browser.selectors import find_file_upload_input, find_upload_trigger_button
+from automation.browser.selectors import (
+    find_file_upload_input,
+    find_unfilled_required_field_locators,
+    find_upload_trigger_button,
+)
 from automation.forms.answer_engine import (
     DETERMINISTIC_CONFIDENCE,
     ApplicationAnswerEngine,
     Question,
 )
-from automation.forms.field_handlers import FieldFailure, describe_field, fill_field, read_field_options
+from automation.forms.field_handlers import (
+    Field,
+    FieldFailure,
+    describe_field,
+    fill_field,
+    read_field_options,
+)
 from automation.forms.field_mapper import FieldMapper, looks_like_opt_in_label
 from automation.forms.profile_formatting import format_profile_value
+from automation.forms.vision_fallback import VisionField, VisionFormAnswerer, save_debug_crops
 from automation.interfaces import CandidateProfile, ProfileDocument
 
 logger = logging.getLogger(__name__)
@@ -160,6 +172,14 @@ _ENCRYPTED_PROFILE_PROPERTIES = frozenset({"phone", "address"})
 # with.
 ANSWER_REVIEW_CONFIDENCE_THRESHOLD = 0.80
 
+# Short on purpose: this only ever runs over fields the required-field scan
+# already confirmed VISIBLE, so a scroll that can't complete quickly means
+# something about the element is unusual, and the crop attempt that follows
+# either works from wherever the page currently sits or is skipped. Waiting
+# Playwright's 30s default per field would turn one odd control into a
+# minutes-long stall at the very end of a run.
+_VISION_SCROLL_TIMEOUT_MS = 3_000
+
 _CONSENT_CHECKBOX_KEYWORDS = (
     "i agree", "agree to", "i consent", "consent to", "i acknowledge",
     "acknowledge that", "i accept", "accept the", "terms and conditions",
@@ -191,6 +211,27 @@ class FieldFillResult:
     confidence: float
     filled: bool
     failure: FieldFailure | None = None
+
+
+@dataclass
+class VisionPassOutcome:
+    """What the vision fallback pass (`fill_unfilled_fields_with_vision`) did.
+
+    Two separate answers, deliberately not flattened into one list:
+
+    - `results` — fields it actually tried to fill, scored like any other fill.
+    - `confirmed_already_filled` — fields whose SCREENSHOT showed a value the
+      required-field scan couldn't see (a react-select combobox, a country
+      picker: the visible selection lives outside the input whose value the
+      scan reads). Nothing was filled and nothing failed, so there is no
+      honest `FieldFillResult` to emit — but the flow manager needs to know,
+      because otherwise these fields keep every such form permanently in
+      `manual_required` over values that are demonstrably already there.
+      Names match `find_unfilled_required_fields`' naming exactly, so the flow
+      manager can reconcile the two lists."""
+
+    results: list[FieldFillResult] = _dc_field(default_factory=list)
+    confirmed_already_filled: list[str] = _dc_field(default_factory=list)
 
 
 class ATSAdapter(ABC):
@@ -296,17 +337,13 @@ class ATSAdapter(ABC):
         Google Drive / Enter manually" UIs only reveal the real input after
         a visible trigger is clicked — tried once as a fallback before
         giving up. Concrete rather than abstract: every adapter's
-        implementation was byte-identical, so it lives here once."""
-        upload_input = find_file_upload_input(self.page)
-        if upload_input is None:
-            trigger = find_upload_trigger_button(self.page)
-            if trigger is not None:
-                try:
-                    trigger.click()
-                    upload_input = find_file_upload_input(self.page)
-                except PlaywrightError as e:
-                    logger.debug("%s: clicking the upload trigger failed (%s).", self.name, e)
+        implementation was byte-identical, so it lives here once.
 
+        A `True` here means "the file was accepted at this moment," which on a
+        client-rendered form is NOT the same as "the application will carry a
+        résumé" — see `ensure_resume_attached`, which is what actually
+        guarantees that and is called at the end of the run."""
+        upload_input = self._find_resume_input()
         if upload_input is None:
             logger.warning("%s: no resume upload input found on page.", self.name)
             return False
@@ -319,6 +356,311 @@ class ATSAdapter(ABC):
             reason = outcome.failure.failure_reason if outcome.failure else "unknown"
             logger.warning("%s: resume upload could not be verified (%s).", self.name, reason)
         return outcome.filled
+
+    def _find_resume_input(self) -> Locator | None:
+        """The page's résumé file input, revealing it first if this ATS keeps
+        it behind an "Attach"/"Upload" trigger. `None` when this page has no
+        upload field at all (a later step of a multi-step form, a posting that
+        doesn't ask for a résumé)."""
+        upload_input = find_file_upload_input(self.page)
+        if upload_input is not None:
+            return upload_input
+
+        trigger = find_upload_trigger_button(self.page)
+        if trigger is None:
+            return None
+        try:
+            trigger.click()
+        except PlaywrightError as e:
+            logger.debug("%s: clicking the upload trigger failed (%s).", self.name, e)
+            return None
+        return find_file_upload_input(self.page)
+
+    #: Is a résumé visibly attached, as the FORM sees it? Checks the input's
+    #: own `files` first, then — for ATS UIs that upload to S3 and clear the
+    #: input, keeping the filename only in their own rendered state — whether
+    #: the uploaded file's name appears in the upload widget's text. Without
+    #: that second half, every such UI would look "empty" and get re-uploaded
+    #: on every check.
+    _RESUME_ATTACHED_JS = """
+    (el, filename) => {
+      if (el.files && el.files.length > 0) return true;
+      const group = el.closest('[class*="file-upload" i], [class*="upload" i], [class*="resume" i]')
+                 || el.parentElement;
+      const text = ((group && group.textContent) || '').toLowerCase();
+      return !!filename && text.includes(filename.toLowerCase());
+    }
+    """
+
+    def resume_attachment_state(self) -> str:
+        """`"attached"` | `"missing"` | `"no_field"` — what the LIVE page says
+        about the résumé right now, as opposed to what `upload_resume()`
+        verified when it ran.
+
+        `"no_field"` is a distinct answer from `"missing"` on purpose: a page
+        with no upload input isn't a page that lost the résumé, and treating
+        the two the same would make every later step of a multi-step form
+        re-attempt an upload it has no field for."""
+        upload_input = find_file_upload_input(self.page)
+        if upload_input is None:
+            return "no_field"
+        filename = Path(str(self.resume_document.stored_path)).name
+        try:
+            attached = bool(upload_input.evaluate(self._RESUME_ATTACHED_JS, filename))
+        except PlaywrightError as e:
+            logger.debug("%s: could not read the résumé input's state (%s).", self.name, e)
+            return "missing"
+        return "attached" if attached else "missing"
+
+    def ensure_resume_attached(self, *, max_attempts: int = 2) -> bool | None:
+        """Re-checks — at the END of the run, after every fill pass and after
+        the form has had time to hydrate — that the résumé is still attached,
+        and re-uploads it if it isn't. Returns `True`/`False` for
+        attached/not, or `None` when this page has no upload field to check
+        (so the caller leaves its earlier upload result alone rather than
+        recording a failure for a field that doesn't exist here).
+
+        This exists because a successful `upload_resume()` is not durable on a
+        client-rendered form. Observed on a live Greenhouse posting: the file
+        was set and verified (`input.files.length == 1`), React hydration
+        recovered from an error ~600ms later and re-created the upload widget,
+        and the application went on to be filled and handed over with the
+        résumé silently gone — while the run log said "resume upload
+        succeeded." A verification is only as good as the moment it was taken;
+        this is the one taken at the moment that matters."""
+        state = self.resume_attachment_state()
+        if state == "no_field":
+            logger.debug("%s: no résumé field on the current page — nothing to re-check.", self.name)
+            return None
+        if state == "attached":
+            logger.info("%s: résumé still attached at the end of the run.", self.name)
+            return True
+
+        for attempt in range(1, max_attempts + 1):
+            logger.warning(
+                "%s: the résumé is NO LONGER attached (the form dropped it after it was uploaded) "
+                "— re-uploading, attempt %d/%d.",
+                self.name, attempt, max_attempts,
+            )
+            self.upload_resume()
+            if self.resume_attachment_state() == "attached":
+                logger.info("%s: résumé re-attached successfully.", self.name)
+                return True
+
+        logger.error(
+            "%s: could not keep the résumé attached after %d attempt(s) — the application would be "
+            "submitted without it, so this run must go to a human.",
+            self.name, max_attempts,
+        )
+        return False
+
+    # ------------------------------------------------------------------
+    # Vision fallback — see automation/forms/vision_fallback.py
+    # ------------------------------------------------------------------
+
+    #: How much of the form around a field to include in its crop. The top
+    #: margin is by far the largest and is the whole point: the commonest field
+    #: this pass exists for is a conditional follow-up ("If yes to the above,
+    #: what role?") whose answer depends entirely on the question and answer
+    #: ABOVE it. A tight crop of the field itself would show the model exactly
+    #: what the DOM already showed the text engine — i.e. nothing new.
+    _VISION_CROP_PADDING = {"top": 240, "bottom": 80, "left": 48, "right": 48}
+
+    #: The clip rectangle for one field's crop, in VIEWPORT coordinates (what
+    #: `page.screenshot(clip=...)` takes when `full_page` is false), already
+    #: padded and clamped to the viewport so the caller can pass it straight
+    #: through. Climbs to the nearest ancestor with a real box when the control
+    #: itself has none — a custom widget's actual input is often a zero-size or
+    #: visually-hidden element whose rect would be unusable.
+    _VISION_CROP_RECT_JS = """
+    (el, pad) => {
+      let rect = null, cur = el;
+      for (let i = 0; i < 4 && cur; i++) {
+        const r = cur.getBoundingClientRect();
+        if (r.width > 1 && r.height > 1) { rect = r; break; }
+        cur = cur.parentElement;
+      }
+      if (!rect) return null;
+      const x = Math.max(0, rect.x - pad.left);
+      const y = Math.max(0, rect.y - pad.top);
+      const right = Math.min(window.innerWidth, rect.x + rect.width + pad.right);
+      const bottom = Math.min(window.innerHeight, rect.y + rect.height + pad.bottom);
+      if (right - x < 2 || bottom - y < 2) return null;
+      return {x: x, y: y, width: right - x, height: bottom - y};
+    }
+    """
+
+    #: The best question text the page exposes for a control: its ARIA name, a
+    #: `<label for>`, or a wrapping `<label>`. Returns `""` when there is none,
+    #: which is a real answer — a field whose question the DOM never connected
+    #: to it is precisely the kind this pass reads off a screenshot instead.
+    _FIELD_QUESTION_TEXT_JS = """
+    el => {
+      const clean = t => (t || '').replace(/\\s+/g, ' ').trim();
+      const aria = clean(el.getAttribute('aria-label'));
+      if (aria) return aria;
+      const labelledBy = el.getAttribute('aria-labelledby');
+      if (labelledBy) {
+        const parts = labelledBy.split(/\\s+/)
+          .map(id => { const n = document.getElementById(id); return n ? clean(n.textContent) : ''; })
+          .filter(Boolean);
+        if (parts.length) return parts.join(' ');
+      }
+      if (el.id) {
+        const forLabel = document.querySelector('label[for="' + el.id.replace(/"/g, '\\\\"') + '"]');
+        if (forLabel) { const t = clean(forLabel.textContent); if (t) return t; }
+      }
+      const wrapping = el.closest('label');
+      if (wrapping) { const t = clean(wrapping.textContent); if (t) return t; }
+      return '';
+    }
+    """
+
+    def _question_text_for(self, locator: Locator) -> str:
+        """The question a control is asking, as text — its own label/ARIA name
+        if it has one, else the nearby-text recovery the unlabeled-field pass
+        uses. `""` when neither finds anything."""
+        try:
+            labelled = _strip_required_marker(locator.evaluate(self._FIELD_QUESTION_TEXT_JS) or "")
+        except PlaywrightError:
+            labelled = ""
+        return labelled or self._nearby_question_text(locator)
+
+    def _vision_crop(self, locator: Locator) -> bytes | None:
+        """A PNG of `locator` in context, or `None` if it can't be captured.
+
+        Scrolls the field into view first — the crop is taken in viewport
+        coordinates, so a field below the fold would otherwise be clipped to
+        nothing (or to whatever unrelated part of the form happens to be on
+        screen, which is worse: the model would be reading the wrong
+        question)."""
+        try:
+            locator.scroll_into_view_if_needed(timeout=_VISION_SCROLL_TIMEOUT_MS)
+        except PlaywrightError as e:
+            logger.debug("%s: could not scroll a field into view for its crop (%s).", self.name, e)
+        try:
+            clip = locator.evaluate(self._VISION_CROP_RECT_JS, self._VISION_CROP_PADDING)
+            if not clip:
+                return None
+            return self.page.screenshot(clip=clip)
+        except PlaywrightError as e:
+            logger.debug("%s: could not capture a field crop (%s).", self.name, e)
+            return None
+
+    def collect_unfilled_fields_for_vision(self) -> list[tuple[VisionField, Field]]:
+        """Every still-unfilled required field, paired with the introspected
+        `Field` the eventual fill will reuse. Read-only apart from the option
+        probe (`read_field_options` opens a custom dropdown and closes it
+        again — see its docstring); the crop is taken BEFORE that probe so a
+        menu that fails to close can't end up in the next field's screenshot."""
+        collected: list[tuple[VisionField, Field]] = []
+        for name, locator in find_unfilled_required_field_locators(self.page):
+            question = self._question_text_for(locator)
+            screenshot = self._vision_crop(locator)
+            if screenshot is None:
+                logger.info(
+                    "%s: skipping %r in the vision pass — no screenshot could be taken of it.",
+                    self.name, question or name,
+                )
+                continue
+            described = describe_field(locator, label=question or name, page=self.page, profile_attribute="vision")
+            collected.append((
+                VisionField(
+                    name=name,
+                    question=question,
+                    screenshot=screenshot,
+                    options=read_field_options(described),
+                    widget=described.tag_name or described.input_type or "",
+                ),
+                described,
+            ))
+        return collected
+
+    def fill_unfilled_fields_with_vision(
+        self,
+        answerer: VisionFormAnswerer,
+        *,
+        debug_dir: Path | None = None,
+    ) -> VisionPassOutcome:
+        """LAST pass over the form: screenshots every required field still
+        empty after every other pass, asks `answerer` to read them, and fills
+        what comes back through the ordinary `fill_field()` pipeline (so a
+        vision answer is verified against the live DOM like any other).
+
+        Gated by the same `ANSWER_REVIEW_CONFIDENCE_THRESHOLD` as the text
+        answer engine — an answer the model isn't confident in is left for a
+        human rather than typed into an employer's form. See
+        `automation/forms/vision_fallback.py` for the rest of the guardrails
+        (demographics never asked, options re-resolved against the DOM,
+        meta-commentary discarded)."""
+        collected = self.collect_unfilled_fields_for_vision()
+        if not collected:
+            logger.info("%s: no unfilled required fields left — vision pass has nothing to do.", self.name)
+            return VisionPassOutcome()
+
+        vision_fields = [item for item, _described in collected]
+        logger.info(
+            "%s: vision pass looking at %d unfilled field(s): %s",
+            self.name, len(vision_fields),
+            ", ".join(item.question or item.name for item in vision_fields),
+        )
+        if debug_dir is not None:
+            save_debug_crops(vision_fields, debug_dir)
+
+        try:
+            answers = answerer.answer(vision_fields)
+        except Exception as e:  # noqa: BLE001 - a best-effort last pass must never abort the run
+            logger.warning("%s: vision pass failed (%s) — leaving its fields for a human.", self.name, e)
+            return VisionPassOutcome()
+
+        outcome = VisionPassOutcome()
+        for (item, described), answer in zip(collected, answers):
+            if answer.already_filled:
+                logger.info(
+                    "%s: %r is already answered on the form (%s) — leaving it alone.",
+                    self.name, item.question or item.name, answer.reason or "read off the screenshot",
+                )
+                outcome.confirmed_already_filled.append(item.name)
+                continue
+
+            profile_path = "vision"
+            if not answer.answered:
+                logger.info(
+                    "%s: vision pass could not answer %r (%s).",
+                    self.name, item.question or item.name, answer.reason or "declined",
+                )
+                outcome.results.append(FieldFillResult(
+                    field_key=item.question or item.name, profile_path=profile_path,
+                    value_used=None, confidence=0.0, filled=False,
+                ))
+                continue
+
+            if answer.confidence < ANSWER_REVIEW_CONFIDENCE_THRESHOLD:
+                logger.info(
+                    "%s: leaving %r for a human — vision answer confidence %.2f is below %.2f (%s).",
+                    self.name, item.question or item.name, answer.confidence,
+                    ANSWER_REVIEW_CONFIDENCE_THRESHOLD, answer.reason or "no reason given",
+                )
+                outcome.results.append(FieldFillResult(
+                    field_key=item.question or item.name, profile_path=profile_path,
+                    value_used=None, confidence=0.0, filled=False,
+                ))
+                continue
+
+            logger.info(
+                "%s: vision pass answering %r (%s).",
+                self.name, item.question or item.name, answer.reason or "no reason given",
+            )
+            fill_outcome = fill_field(described, answer.answer, context=self._fill_context())
+            self._mark_examined(described.locator)
+            outcome.results.append(FieldFillResult(
+                field_key=item.question or item.name, profile_path=profile_path,
+                value_used=answer.answer,
+                confidence=answer.confidence if fill_outcome.filled else 0.0,
+                filled=fill_outcome.filled, failure=fill_outcome.failure,
+            ))
+
+        return outcome
 
     def _fill_first_match(self, selectors: list[str], value: Any) -> tuple[bool, FieldFailure | None]:
         """Fills the first visible input matching any selector in `selectors`

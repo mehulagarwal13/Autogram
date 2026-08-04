@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, RootModel, field_validator, model_validator
 
 
 # ---------- personal + professional profile ----------
@@ -24,6 +24,7 @@ class ProfileUpsertRequest(BaseModel):
     # Personal
     full_name: str | None = None
     first_name: str | None = None
+    middle_name: str | None = None
     last_name: str | None = None
     email: str | None = None
     phone: str | None = None
@@ -31,7 +32,9 @@ class ProfileUpsertRequest(BaseModel):
     address: str | None = None
     city: str | None = None
     state: str | None = None
+    postal_code: str | None = None
     country: str | None = None
+    time_zone: str | None = None  # free text in the form's own words — "IST", "GMT+5:30", "US Eastern"
     linkedin_url: str | None = None
     github_url: str | None = None
     portfolio_url: str | None = None
@@ -72,6 +75,18 @@ class ProfileUpsertRequest(BaseModel):
     employment_type_preference: str | None = None  # see VALID_EMPLOYMENT_TYPES
     languages: list[LanguageEntry] | None = None
     willing_background_check: bool | None = None   # tri-state, like marketing_opt_in
+    # Third tier — see app/models/db_models.py::CandidateProfile for what each
+    # one answers. The five booleans are tri-state on purpose: omit one and it
+    # stays `None` ("never asked"), which is not the same as `false`.
+    professional_summary: str | None = None
+    earliest_start_date: str | None = None   # free-form: "2026-09-01", "September 2026", "Immediately"
+    security_clearance: str | None = None
+    referrer_name: str | None = None
+    age_over_18: bool | None = None
+    willing_to_travel: bool | None = None
+    requires_relocation_assistance: bool | None = None  # a question about money, NOT willing_to_relocate
+    willing_drug_test: bool | None = None
+    has_drivers_license: bool | None = None
 
 
 class ProfileResponse(BaseModel):
@@ -79,6 +94,7 @@ class ProfileResponse(BaseModel):
     user_id: str
     full_name: str | None = None
     first_name: str | None = None
+    middle_name: str | None = None
     last_name: str | None = None
     email: str | None = None
     phone: str | None = None
@@ -86,7 +102,9 @@ class ProfileResponse(BaseModel):
     address: str | None = None
     city: str | None = None
     state: str | None = None
+    postal_code: str | None = None
     country: str | None = None
+    time_zone: str | None = None
     linkedin_url: str | None = None
     github_url: str | None = None
     portfolio_url: str | None = None
@@ -117,6 +135,15 @@ class ProfileResponse(BaseModel):
     # `LanguageEntry`, matching how `skills` and `sponsorship_countries` behave.
     languages: list[dict] | None = None
     willing_background_check: bool | None = None
+    professional_summary: str | None = None
+    earliest_start_date: str | None = None
+    security_clearance: str | None = None
+    referrer_name: str | None = None
+    age_over_18: bool | None = None
+    willing_to_travel: bool | None = None
+    requires_relocation_assistance: bool | None = None
+    willing_drug_test: bool | None = None
+    has_drivers_license: bool | None = None
     skills: dict | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
@@ -143,17 +170,130 @@ class EducationResponse(EducationRequest):
 
 # ---------- experience ----------
 
-class ExperienceRequest(BaseModel):
+# How many entries one `POST /profile/experience` may create. A resume import
+# or a hand-filled profile is a handful of jobs; anything past this is a client
+# bug or an abusive payload, and the whole batch goes in one transaction, so an
+# unbounded list is an unbounded lock.
+MAX_EXPERIENCE_BATCH = 50
+
+_EXPERIENCE_TEXT_FIELDS = ("company_name", "job_title", "start_date", "end_date", "description")
+
+
+class ExperienceBase(BaseModel):
+    """The experience columns plus the normalisation every read and write
+    shares. Deliberately *not* used as a request body itself — see
+    `ExperienceCreate` (POST) and `ExperienceRequest` (PATCH).
+
+    No length caps live here on purpose: `ExperienceResponse` inherits these
+    fields, and a cap invented in the schema layer would make a legitimately
+    long stored `description` unserialisable on read.
+    """
+
+    model_config = ConfigDict(str_strip_whitespace=True)
+
     company_name: str | None = None
     job_title: str | None = None
     start_date: str | None = None
-    end_date: str | None = None
+    end_date: str | None = None  # None/"" == current role (see db_models.ExperienceEntry)
     description: str | None = None
     skills_used: list[str] | None = None
 
+    @field_validator(*_EXPERIENCE_TEXT_FIELDS, mode="after")
+    @classmethod
+    def _blank_to_none(cls, value: str | None) -> str | None:
+        """`""` and `"   "` are absence, not content. Collapsing them to None
+        keeps one representation in the DB, and for `end_date` "" and None
+        already mean the same thing (current role)."""
+        return value or None
 
-class ExperienceResponse(ExperienceRequest):
-    model_config = ConfigDict(from_attributes=True)
+    @field_validator("skills_used", mode="after")
+    @classmethod
+    def _clean_skills_used(cls, value: list[str] | None) -> list[str] | None:
+        """Drops blanks and case-insensitive duplicates, keeping first-seen
+        order and the caller's original casing."""
+        if value is None:
+            return None
+        cleaned: list[str] = []
+        seen: set[str] = set()
+        for raw in value:
+            skill = raw.strip()
+            if not skill or skill.casefold() in seen:
+                continue
+            seen.add(skill.casefold())
+            cleaned.append(skill)
+        return cleaned
+
+
+class ExperienceRequest(ExperienceBase):
+    """`PATCH /profile/experience/{id}` — partial update. Every field is
+    optional and only the fields actually sent are applied, so `{}` is a
+    no-op rather than an error."""
+
+
+class ExperienceCreate(ExperienceBase):
+    """One entry in a `POST /profile/experience` body.
+
+    Same fields as `ExperienceRequest`; the difference is that a *create* has
+    to say something. A partial update may legitimately send nothing, but an
+    empty create would persist a row that answers no question any form asks.
+    """
+
+    @model_validator(mode="after")
+    def _reject_empty_entry(self) -> "ExperienceCreate":
+        if not any(getattr(self, field) for field in (*_EXPERIENCE_TEXT_FIELDS, "skills_used")):
+            raise ValueError(
+                "An experience entry must set at least one field "
+                f"({', '.join((*_EXPERIENCE_TEXT_FIELDS, 'skills_used'))})."
+            )
+        return self
+
+
+class ExperienceBatchCreate(RootModel[list[ExperienceCreate]]):
+    """A JSON *array* body for `POST /profile/experience` — create many
+    experiences in one request/one transaction.
+
+    Exists as a named model rather than a bare `list[ExperienceCreate]` so the
+    batch-wide rules (size bounds, duplicate detection) are enforced by
+    Pydantic — i.e. reported as a normal 422 alongside the per-entry errors,
+    with a `loc` pointing at the offending index — instead of as a hand-rolled
+    check in the route.
+    """
+
+    root: list[ExperienceCreate] = Field(
+        ...,
+        min_length=1,
+        max_length=MAX_EXPERIENCE_BATCH,
+        description="One or more experience entries to create atomically.",
+    )
+
+    @model_validator(mode="after")
+    def _reject_duplicate_entries(self) -> "ExperienceBatchCreate":
+        """The same company + title + start date twice in one payload is a
+        double-submit or a bad merge on the client, never a real second job."""
+        seen: set[tuple] = set()
+        for index, entry in enumerate(self.root):
+            key = (
+                (entry.company_name or "").casefold(),
+                (entry.job_title or "").casefold(),
+                (entry.start_date or "").casefold(),
+            )
+            if key in seen:
+                raise ValueError(
+                    f"Duplicate experience entry at index {index}: "
+                    "company_name + job_title + start_date already appears earlier in this request."
+                )
+            seen.add(key)
+        return self
+
+    def __iter__(self):
+        return iter(self.root)
+
+    def __len__(self) -> int:
+        return len(self.root)
+
+
+class ExperienceResponse(ExperienceBase):
+    model_config = ConfigDict(from_attributes=True, str_strip_whitespace=True)
 
     experience_id: str
     profile_id: str

@@ -92,8 +92,11 @@ from automation.forms.demographic_matching import (
 )
 from automation.forms.option_matching import match_option as _match_option
 from automation.forms.question_classifier import (
+    CATEGORY_AGE_OVER_18,
     CATEGORY_BACKGROUND_CHECK,
     CATEGORY_CURRENT_SALARY,
+    CATEGORY_DRIVERS_LICENSE,
+    CATEGORY_DRUG_TEST,
     CATEGORY_EMPLOYMENT_TYPE,
     CATEGORY_EXPECTED_SALARY,
     CATEGORY_HIGHEST_EDUCATION,
@@ -101,9 +104,14 @@ from automation.forms.question_classifier import (
     CATEGORY_NOTICE_PERIOD,
     CATEGORY_PREFERRED_NAME,
     CATEGORY_REFERRAL_SOURCE,
+    CATEGORY_REFERRER_NAME,
+    CATEGORY_RELOCATION_ASSISTANCE,
     CATEGORY_REQUIRES_SPONSORSHIP,
+    CATEGORY_SECURITY_CLEARANCE,
+    CATEGORY_TIME_ZONE,
     CATEGORY_VISA_TYPE,
     CATEGORY_WILLING_TO_RELOCATE,
+    CATEGORY_WILLING_TO_TRAVEL,
     CATEGORY_WORK_AUTHORIZED,
     CATEGORY_YEARS_OF_EXPERIENCE,
     MULTI_VALUE_DEMOGRAPHIC_CATEGORIES,
@@ -111,18 +119,26 @@ from automation.forms.question_classifier import (
     is_demographic,
 )
 from automation.forms.profile_formatting import (
+    format_age_over_18,
     format_current_salary,
     format_employment_type,
     format_expected_salary,
+    format_has_drivers_license,
     format_highest_education_level,
     format_languages,
-    format_notice_period,
+    format_notice_period_or_start_date,
     format_preferred_name,
     format_referral_source,
+    format_referrer_name,
+    format_requires_relocation_assistance,
     format_requires_sponsorship,
+    format_security_clearance,
+    format_time_zone,
     format_visa_type,
     format_willing_background_check,
+    format_willing_drug_test,
     format_willing_to_relocate,
+    format_willing_to_travel,
     format_work_authorized,
     format_years_of_experience,
     normalized_languages,
@@ -212,7 +228,10 @@ _DETERMINISTIC_FORMATTERS: dict[str, Callable[[CandidateProfile], str | None]] =
     CATEGORY_REQUIRES_SPONSORSHIP: format_requires_sponsorship,
     CATEGORY_WORK_AUTHORIZED: format_work_authorized,
     CATEGORY_VISA_TYPE: format_visa_type,
-    CATEGORY_NOTICE_PERIOD: format_notice_period,
+    # Falls back to `earliest_start_date` when no notice period is stored — this
+    # category covers "when can you start?" as well as "what is your notice
+    # period?", and a stored start date answers the first honestly.
+    CATEGORY_NOTICE_PERIOD: format_notice_period_or_start_date,
     CATEGORY_EXPECTED_SALARY: format_expected_salary,
     CATEGORY_YEARS_OF_EXPERIENCE: format_years_of_experience,
     CATEGORY_HIGHEST_EDUCATION: format_highest_education_level,
@@ -222,6 +241,19 @@ _DETERMINISTIC_FORMATTERS: dict[str, Callable[[CandidateProfile], str | None]] =
     CATEGORY_REFERRAL_SOURCE: format_referral_source,
     CATEGORY_EMPLOYMENT_TYPE: format_employment_type,
     CATEGORY_BACKGROUND_CHECK: format_willing_background_check,
+    # Third tier of profile-backed categories. Every one of these answers from a
+    # column the user set themselves, and an unset column answers nothing — the
+    # five booleans are tri-state, so "never asked" falls through to the LLM/
+    # human path rather than consenting, declining, or claiming anything on the
+    # candidate's behalf.
+    CATEGORY_RELOCATION_ASSISTANCE: format_requires_relocation_assistance,
+    CATEGORY_WILLING_TO_TRAVEL: format_willing_to_travel,
+    CATEGORY_DRUG_TEST: format_willing_drug_test,
+    CATEGORY_DRIVERS_LICENSE: format_has_drivers_license,
+    CATEGORY_AGE_OVER_18: format_age_over_18,
+    CATEGORY_SECURITY_CLEARANCE: format_security_clearance,
+    CATEGORY_REFERRER_NAME: format_referrer_name,
+    CATEGORY_TIME_ZONE: format_time_zone,
     # The free-text "which languages do you speak?" form of the question. The
     # yes/no "are you fluent in <language>?" form can't be answered from the
     # profile alone — see `_language_fluency_answer`, which intercepts this
@@ -283,9 +315,29 @@ LLM_CONFIDENCE = 0.6
 #:   covers the standard phrasings, so there is no reason for a model to be
 #:   composing prose around it.
 #: - `preferred_name` — a name, so it falls under the exclusion above.
+#: - `middle_name`, `postal_code`, `referrer_name` — names and address parts,
+#:   same reasoning; `FieldMapper` owns all three, and a referrer's name is a
+#:   claim about a real employee of the company being applied to.
+#: - `willing_drug_test` — a consent, exactly like `willing_background_check`.
+#: - `age_over_18`, `security_clearance`, `has_drivers_license` — attestations.
+#:   Each is a statement the candidate makes about their own legal standing or
+#:   credentials, the deterministic categories cover the standard phrasings, and
+#:   a model that can see them will happily assert them in prose against a
+#:   question that asked something adjacent.
 _PROMPT_PROFILE_ATTRIBUTES: tuple[str, ...] = (
     "highest_education_level",
     "willing_to_relocate",
+    # Same logistics bucket as `willing_to_relocate` and `notice_period_days`:
+    # constantly asked, and phrased too many ways for the deterministic
+    # categories to catch all of them.
+    "requires_relocation_assistance",
+    "willing_to_travel",
+    "earliest_start_date",
+    "time_zone",
+    # The candidate's own summary, in their own words — the one field here that
+    # exists to be read as prose, and the reason a "tell us about yourself" box
+    # no longer has to be composed from nothing on every application.
+    "professional_summary",
     "current_salary",
     "current_salary_currency",
     "referral_source",
@@ -943,12 +995,13 @@ class ApplicationAnswerEngine:
             logger.exception("application_answer LLM call failed for %d question(s)", len(questions))
             return [(None, 0.0)] * len(questions)
 
-    def _build_prompt(self, questions: list[Question]) -> str:
-        """`questions` stays a flat list of strings — the shape this prompt
-        has always had. Options ride alongside in an index-parallel `options`
-        list (`null` for a free-text question), and the key is omitted
-        entirely when nothing in the batch has options, so a free-text-only
-        form produces byte-for-byte the prompt it did before."""
+    def profile_payload(self) -> dict:
+        """Everything this engine knows about the candidate, as the JSON-ready
+        dict that goes into the prompt. Public because the vision fallback pass
+        (`automation/forms/vision_fallback.py`) answers from the same facts and
+        must not assemble its own, subtly different, view of the candidate —
+        two prompts disagreeing about what the profile says is exactly how the
+        same question gets answered two different ways on one form."""
         profile_summary = {
             "current_role": self.profile.current_role,
             "current_company": self.profile.current_company,
@@ -977,8 +1030,23 @@ class ApplicationAnswerEngine:
         # question was unanswerable from the given context and correctly came
         # back null. See `automation/forms/resume_context.py`.
         profile_summary.update(self._get_resume_context().as_prompt_payload())
+        return profile_summary
+
+    def has_resume_context(self) -> bool:
+        """Whether the candidate has stored résumé facts to reason over —
+        decides whether `_RESUME_PROMPT` is worth appending. Public for the
+        same reason as `profile_payload()`: the vision pass makes the identical
+        decision and shouldn't reach into a private attribute to make it."""
+        return bool(self._get_resume_context())
+
+    def _build_prompt(self, questions: list[Question]) -> str:
+        """`questions` stays a flat list of strings — the shape this prompt
+        has always had. Options ride alongside in an index-parallel `options`
+        list (`null` for a free-text question), and the key is omitted
+        entirely when nothing in the batch has options, so a free-text-only
+        form produces byte-for-byte the prompt it did before."""
         payload = {
-            "candidate_profile": profile_summary,
+            "candidate_profile": self.profile_payload(),
             "job_description": self.job_description,
             "questions": [question.text for question in questions],
         }

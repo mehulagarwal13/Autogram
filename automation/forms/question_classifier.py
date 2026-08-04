@@ -72,6 +72,18 @@ CATEGORY_LANGUAGE_FLUENCY = "language_fluency"
 CATEGORY_YEARS_OF_EXPERIENCE = "years_of_experience"
 CATEGORY_HIGHEST_EDUCATION = "highest_education_level"
 CATEGORY_WILLING_TO_RELOCATE = "willing_to_relocate"
+#: "Do you require relocation assistance?" — a question about MONEY, and a
+#: different one from WILLING_TO_RELOCATE above. Kept apart because a candidate
+#: can be happy to move and still need it paid for; answering this one from
+#: `willing_to_relocate` is the wrong-answer bug this category prevents.
+CATEGORY_RELOCATION_ASSISTANCE = "requires_relocation_assistance"
+CATEGORY_WILLING_TO_TRAVEL = "willing_to_travel"
+CATEGORY_DRUG_TEST = "willing_drug_test"
+CATEGORY_DRIVERS_LICENSE = "has_drivers_license"
+CATEGORY_AGE_OVER_18 = "age_over_18"
+CATEGORY_SECURITY_CLEARANCE = "security_clearance"
+CATEGORY_REFERRER_NAME = "referrer_name"
+CATEGORY_TIME_ZONE = "time_zone"
 CATEGORY_DEMOGRAPHIC_GENDER = "demographic_gender"
 CATEGORY_DEMOGRAPHIC_VETERAN_STATUS = "demographic_veteran_status"
 CATEGORY_DEMOGRAPHIC_DISABILITY_STATUS = "demographic_disability_status"
@@ -120,6 +132,22 @@ _CATEGORY_PHRASES: list[tuple[str, list[str]]] = [
         "legally eligible to work", "eligible to work in", "legally permitted to work",
         "work permit", "right to work in",
     ]),
+    # "Do you hold an active security clearance?" — standard on US
+    # defense/government-adjacent postings, and answered ONLY from the stored
+    # column: a clearance the candidate doesn't hold is a false statement on a
+    # federal application, so an empty column leaves this for a human.
+    (CATEGORY_SECURITY_CLEARANCE, [
+        "security clearance", "active clearance", "clearance level",
+        "level of clearance", "hold a clearance", "government clearance",
+    ]),
+    # Before YEARS_OF_EXPERIENCE purely as documentation — neither list's
+    # phrases appear inside the other's ("18 years of age" doesn't contain
+    # "years of experience") — and never answered from a date of birth, which
+    # this system deliberately doesn't store.
+    (CATEGORY_AGE_OVER_18, [
+        "at least 18", "18 years of age", "18 years or older", "18 or older",
+        "over the age of 18", "age of 18 or", "are you 18", "legal working age",
+    ]),
     (CATEGORY_NOTICE_PERIOD, [
         "notice period", "when can you start", "how soon can you start",
         "start date availability",
@@ -134,6 +162,13 @@ _CATEGORY_PHRASES: list[tuple[str, list[str]]] = [
         # Education block has "Start date year" fields (see the education
         # questions in automation/tests/test_resume_context.py), and answering
         # those with a notice period would be confidently wrong.
+    ]),
+    # "Which time zone are you based in?" — asked by most remote postings and
+    # unanswerable from `location`/`country`, which don't imply one zone (the US
+    # has six). Answered from `CandidateProfile.time_zone`, in the candidate's
+    # own words.
+    (CATEGORY_TIME_ZONE, [
+        "time zone", "timezone", "which zone are you", "utc offset",
     ]),
     # CURRENT before EXPECTED, and "current ctc" MOVED out of the expected
     # bucket where it used to live. That listing was a wrong-answer bug, not a
@@ -196,6 +231,16 @@ _CATEGORY_PHRASES: list[tuple[str, list[str]]] = [
         "how you heard about", "where did you find this",
         "how did you learn about", "referral source", "source of application",
     ]),
+    # AFTER referral source, deliberately: a combined "How did you hear about
+    # this job? (If referred by an employee, give their name)" is asked as a
+    # single free-text field, and the leading question is the one being asked, so
+    # `referral_source` should win it. A form that asks separately for the
+    # referrer's name reaches this bucket, and gets a person's name rather than
+    # the "LinkedIn" that would otherwise be typed into it.
+    (CATEGORY_REFERRER_NAME, [
+        "who referred you", "referred you to", "name of the person who referred",
+        "referred by", "referrer name", "name of the employee who referred",
+    ]),
     (CATEGORY_EMPLOYMENT_TYPE, [
         "type of employment", "employment type", "type of role are you looking",
         "employment preference", "full-time or part-time", "full time or part time",
@@ -205,6 +250,21 @@ _CATEGORY_PHRASES: list[tuple[str, list[str]]] = [
         "background check", "background screening", "background verification",
         "criminal record check",
     ]),
+    # Its own category rather than a phrase in the background-check bucket: a
+    # candidate can consent to one and not the other, and consenting to a drug
+    # test on their behalf because they agreed to a background check is exactly
+    # the inference the tri-state columns exist to prevent.
+    (CATEGORY_DRUG_TEST, [
+        "drug test", "drug screen", "drug screening", "drug and alcohol",
+        "substance screening",
+    ]),
+    (CATEGORY_DRIVERS_LICENSE, [
+        "driver's license", "driver’s license", "drivers license", "driver license",
+        "driving license", "driving licence", "driver's licence", "valid license to drive",
+        # NOTE: no bare "license"/"licence" — "Do you hold a professional
+        # license?" (nursing, PE, legal) is a different question, and this
+        # column would answer it wrongly.
+    ]),
     (CATEGORY_WILLING_TO_RELOCATE, [
         "willing to relocate", "able to relocate", "open to relocation",
         "open to relocating", "would you relocate", "willing to move to",
@@ -212,7 +272,24 @@ _CATEGORY_PHRASES: list[tuple[str, list[str]]] = [
         # NOTE: a bare "relocate"/"relocation" is deliberately NOT here.
         # "Do you require relocation assistance?" is a question about money, not
         # about willingness, and answering it "Yes" from `willing_to_relocate`
-        # would be confidently wrong.
+        # would be confidently wrong. It now has its own category and column
+        # (immediately below) instead of being left blank.
+    ]),
+    # AFTER willing-to-relocate, and the order is load-bearing in that
+    # direction: "Are you willing to relocate? (a relocation package is
+    # available)" is a willingness question that happens to mention the package,
+    # and the bucket above should keep claiming it. A form asking only "Do you
+    # require relocation assistance?" matches nothing above and lands here.
+    (CATEGORY_RELOCATION_ASSISTANCE, [
+        "relocation assistance", "relocation support", "relocation package",
+        "help with relocation", "relocation benefits", "assistance with relocation",
+    ]),
+    (CATEGORY_WILLING_TO_TRAVEL, [
+        "willing to travel", "able to travel", "open to travel", "open to traveling",
+        "comfortable traveling", "comfortable with travel", "travel requirement",
+        "willing to travel up to", "amount of travel",
+        # NOTE: no bare "travel". "Do you require travel reimbursement?" and
+        # "have you travelled to the US before?" are different questions.
     ]),
     # Before GENDER, not after: some forms label this "Gender pronouns", and the
     # GENDER bucket's deliberately-bare "gender" phrase would otherwise claim
