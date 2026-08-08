@@ -153,6 +153,209 @@ def find_next_button(page: Page) -> Locator | None:
     return _find_button_by_text(page, NEXT_BUTTON_TEXT_CANDIDATES)
 
 
+# --- Overlays: cookie banners, consent walls, loading spinners ---------------
+# `_is_inside_distraction` already stops a cookie banner's "Continue" from being
+# mistaken for the form's own Next button. That is not enough on a multi-page
+# application: a banner that merely SITS THERE also intercepts pointer events
+# over whatever it covers, so the real Next button becomes unclickable
+# ("element is not stable"/"intercepts pointer events" from Playwright) and the
+# run stalls on page 1 of 5. Avoiding the banner is a read-time concern;
+# dismissing it is a write-time one, and both are needed.
+#
+# Text is matched against the SAME distraction containers `_is_inside_distraction`
+# recognises, never the page at large. That restriction is what makes it safe to
+# look for words as generic as "Accept" and "I agree": the form's own required
+# "I agree to the Privacy Policy" checkbox (see `automation/ats/base.py`'s
+# `_fill_consent_checkboxes`) lives in the form, not in a cookie container, so
+# nothing here can ever reach it.
+OVERLAY_DISMISS_TEXT_CANDIDATES = [
+    "Accept all", "Accept All Cookies", "Accept cookies", "Allow all", "Accept",
+    "I agree", "Agree", "Got it", "Understood", "OK", "Okay",
+    "No thanks", "Decline", "Reject all", "Close", "Dismiss",
+]
+
+#: Full-page "please wait" overlays. Between steps, a Workday-style SPA covers
+#: the form with one of these while it fetches the next page; clicking or
+#: reading through it produces either an interception error or a snapshot of the
+#: OLD page, which is precisely how a multi-page run silently refills page 1.
+LOADING_OVERLAY_HINTS = [
+    "loading", "spinner", "progress-overlay", "busy-indicator", "please-wait",
+]
+_LOADING_OVERLAY_SELECTOR = ", ".join(
+    f"[class*='{hint}' i], [id*='{hint}' i], [data-automation-id*='{hint}' i]"
+    for hint in LOADING_OVERLAY_HINTS
+)
+#: A cookie banner is one container with many nested elements, every one of
+#: which matches `_DISTRACTION_CLOSEST_SELECTOR`. Only the outermost few are
+#: worth inspecting — this caps the work, it isn't a limit on how many distinct
+#: banners can be dismissed across repeated calls.
+_MAX_OVERLAY_CONTAINERS = 12
+_OVERLAY_CLICK_TIMEOUT_MS = 2_000
+
+
+def dismiss_overlays(page: Page) -> list[str]:
+    """Clicks the accept/close control of any visible cookie/consent/newsletter/
+    chat overlay, returning a short description of each one dismissed.
+
+    Best-effort and never raises: an overlay that can't be dismissed is left
+    alone, and the caller's next click falls back to a JS click that ignores
+    interception anyway. Safe to call repeatedly — once a banner is gone it is
+    no longer visible, so subsequent calls are no-ops."""
+    dismissed: list[str] = []
+    try:
+        containers = page.locator(_DISTRACTION_CLOSEST_SELECTOR).all()
+    except PlaywrightError:
+        return dismissed
+
+    for container in containers[:_MAX_OVERLAY_CONTAINERS]:
+        try:
+            if not container.is_visible():
+                continue
+        except PlaywrightError:
+            continue
+
+        for text in OVERLAY_DISMISS_TEXT_CANDIDATES:
+            try:
+                button = container.locator(_CLICKABLE_SELECTOR).filter(
+                    has_text=re.compile(rf"^\s*{re.escape(text)}\s*$", re.IGNORECASE)
+                )
+                if button.count() == 0:
+                    continue
+                target = button.first
+                if not (target.is_visible() and target.is_enabled()):
+                    continue
+                target.click(timeout=_OVERLAY_CLICK_TIMEOUT_MS)
+            except PlaywrightError:
+                continue
+            logger.info("Dismissed an overlay by clicking %r.", text)
+            dismissed.append(text)
+            break  # this container is handled; don't click it twice
+
+    return dismissed
+
+
+def has_loading_overlay(page: Page) -> bool:
+    """Whether a visible "loading"/spinner overlay is currently covering the
+    page. A hidden one (every SPA ships one permanently in the DOM) does not
+    count — same visibility-not-presence rule as `page_has_captcha`."""
+    try:
+        candidates = page.locator(_LOADING_OVERLAY_SELECTOR).all()
+    except PlaywrightError:
+        return False
+    for node in candidates:
+        try:
+            if node.is_visible():
+                return True
+        except PlaywrightError:
+            continue
+    return False
+
+
+def wait_for_overlays_to_clear(page: Page, *, timeout_ms: int = 15_000) -> bool:
+    """Waits for every visible loading overlay to disappear. Returns whether the
+    page came clear within `timeout_ms` — `False` is informational (the caller
+    proceeds anyway), never an error: a permanently-visible element that merely
+    has "loading" in its class name must not be able to stall a run forever."""
+    deadline_polls = max(1, timeout_ms // 250)
+    for _ in range(deadline_polls):
+        if not has_loading_overlay(page):
+            return True
+        try:
+            page.wait_for_timeout(250)
+        except PlaywrightError:
+            return False
+    logger.debug("A loading overlay was still visible after %dms — continuing anyway.", timeout_ms)
+    return False
+
+
+# --- Where am I in a multi-page application? ---------------------------------
+#: "Step 2 of 5", "Page 3 of 4", "2/5". Read from the page's own progress UI —
+#: the only place that knows how long an application actually is. Never used to
+#: DECIDE anything (the number of pages is not assumed anywhere); it is a
+#: navigation signal — a step indicator that changed proves the form advanced —
+#: and the single most useful thing to have in a run's log.
+_STEP_INDICATOR_RE = re.compile(
+    r"(?:step|page|section)\s*(\d{1,2})\s*(?:of|/)\s*(\d{1,2})", re.IGNORECASE
+)
+_BARE_FRACTION_RE = re.compile(r"\b(\d{1,2})\s*/\s*(\d{1,2})\b")
+_STEP_INDICATOR_SELECTOR = (
+    "[aria-current='step'], [data-automation-id*='progressBar' i], "
+    "[class*='progress' i], [class*='step' i], [role='progressbar']"
+)
+_MAX_STEP_INDICATOR_TEXT_LEN = 120
+
+
+def find_step_indicator(page: Page) -> str:
+    """The page's own "Step 2 of 5"-style progress text, or `""` when the form
+    doesn't show one (most single-page ATS forms don't)."""
+    try:
+        nodes = page.locator(_STEP_INDICATOR_SELECTOR).all()
+    except PlaywrightError:
+        nodes = []
+
+    for node in nodes[:20]:
+        try:
+            if not node.is_visible():
+                continue
+            text = " ".join((node.inner_text(timeout=1_000) or "").split())
+        except PlaywrightError:
+            continue
+        if not text or len(text) > _MAX_STEP_INDICATOR_TEXT_LEN:
+            continue
+        match = _STEP_INDICATOR_RE.search(text) or _BARE_FRACTION_RE.search(text)
+        if match:
+            return match.group(0)
+
+    match = _STEP_INDICATOR_RE.search(_visible_page_text(page))
+    return match.group(0) if match else ""
+
+
+#: The last page before submission on a long application: everything already
+#: entered, shown back for a final look. Recognising it matters because it is
+#: where the run must STOP and hand over — an application is never submitted
+#: from here without explicit authorization (see `decide_action`).
+REVIEW_PAGE_TEXT_PATTERNS = [
+    "review your application", "review and submit", "review & submit",
+    "please review your", "review the information", "review your information",
+    "almost done", "summary of your application",
+]
+_HEADING_SELECTOR = "h1, h2, [role='heading'], legend, [data-automation-id='pageHeader']"
+_MAX_HEADING_LEN = 200
+
+
+def find_page_heading(page: Page) -> str:
+    """The current page's own heading — what a human would call this step ("My
+    Experience", "Voluntary Disclosures"). `""` when the page has none.
+
+    Worth having for two reasons: it is the most legible thing a multi-page run
+    can put in its log, and a heading that changed is strong evidence the form
+    actually advanced (see `automation/applications/page_navigator.py`)."""
+    try:
+        nodes = page.locator(_HEADING_SELECTOR).all()
+    except PlaywrightError:
+        return ""
+    for node in nodes[:10]:
+        try:
+            if not node.is_visible():
+                continue
+            text = " ".join((node.inner_text(timeout=1_000) or "").split())
+        except PlaywrightError:
+            continue
+        if text and len(text) <= _MAX_HEADING_LEN:
+            return text
+    return ""
+
+
+def looks_like_review_page(page: Page) -> bool:
+    """Whether the current page is the final review/summary step."""
+    heading = find_page_heading(page).lower()
+    text = _visible_page_text(page)
+    for pattern in REVIEW_PAGE_TEXT_PATTERNS:
+        if pattern in heading or pattern in text:
+            return True
+    return heading.strip() in ("review", "review your application", "summary")
+
+
 def find_submit_button(page: Page) -> Locator | None:
     """Returns the page's final submit control (see
     `SUBMIT_BUTTON_TEXT_CANDIDATES`), or `None` if none is found."""

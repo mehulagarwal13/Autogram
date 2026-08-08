@@ -108,18 +108,113 @@ shared fill helpers (`_fill_first_match`, `_fill_known_questions`,
 and `ats/lever/lever_adapter.py` are implemented (Phase 4) — real field
 selectors, resume upload, label-matched question answering, and submit —
 tested against realistic HTML fixtures in `automation/tests/test_greenhouse_adapter.py`
-/ `test_lever_adapter.py`. `ats/registry.py` maps a detected ATS platform
-name to its real adapter class (only `greenhouse`/`lever` today) — callers
-check `get_adapter_class(...) is None` and route to `needs_review` instead
-of invoking a still-stub adapter. `applications/application_flow_manager.py`
-is also implemented (Phase 4): `ApplicationFlowManager` drives one
-application end-to-end through any `ATSAdapter` — CAPTCHA short-circuit
-before ever filling anything, resume upload, a multi-step Next-button loop
-capped at `MAX_STEPS`, the auto-submit/needs-review/copilot-review decision
-(`decide_action()`, mirroring ARCHITECTURE.md's decision table exactly), and
-a screenshot/trace/error-log captured for every run — tested end-to-end
-against a real headless browser and `data:` URLs in
+/ `test_lever_adapter.py`. `ats/workday/workday_adapter.py` is implemented
+too — see "Long, multi-page applications" below for why it couldn't be
+registered before that support existed. `ats/registry.py` maps a detected ATS
+platform name to its real adapter class (`greenhouse`/`lever`/`workday`
+today) — callers check `get_adapter_class(...) is None` and route to
+`needs_review` instead of invoking a still-stub adapter (SmartRecruiters,
+Taleo, iCIMS, Ashby, BambooHR, Oracle HCM). `applications/application_flow_manager.py`
+is also implemented: `ApplicationFlowManager` drives one application
+end-to-end through any `ATSAdapter` — CAPTCHA/human-gate checks on EVERY page,
+résumé upload on whichever page asks for it, a verified page-by-page
+navigation loop (see below) capped at `MAX_PAGES`, the auto-submit/needs-review/
+copilot-review decision (`decide_action()`, mirroring ARCHITECTURE.md's
+decision table exactly), and a screenshot/trace/error-log captured for every
+run — tested end-to-end against a real headless browser and `data:` URLs in
 `automation/tests/test_application_flow_manager.py`.
+
+## Long, multi-page applications
+
+A Greenhouse posting is one page. A Workday application is 4-6 — My
+Information, My Experience, Application Questions, Voluntary Disclosures,
+Self Identify, Review — each an SPA transition rather than a page load. The
+original step loop assumed the first shape and broke on the second in three
+separate ways, all reproduced on a real 5-page fixture before the fix:
+
+1. **No wait after clicking Next.** `click()` returns the instant the click
+   lands, not when the next step has rendered — so the following fill pass ran
+   against the PREVIOUS page's DOM.
+2. **No proof the click did anything.** A validation-blocked click looked
+   identical to a successful one, so a rejected page was refilled and
+   re-clicked until the step cap ran out — then treated as the final page. A
+   5-page application was scored, and could be handed over, on the basis of
+   page 1.
+3. **The résumé uploaded exactly once, before the loop.** Useless on a form
+   whose upload field lives on page 2, as Workday's does.
+
+**The fix is `automation/applications/page_navigator.py`.** It defines a
+`PageSignature` — a page's URL, title, heading, its own "Step 2 of 5"-style
+progress text, and the IDENTITIES (never values) of its visible controls — and
+`advance_to_next_page()`, which clicks, waits for the page to settle, and
+compares signatures before and after to decide whether the form genuinely
+moved. Two properties this is built to guarantee:
+
+- **Filling a field must never look like navigation.** The signature excludes
+  every field's value and the page's body text on purpose — both change the
+  moment a field is typed into, and a check that fired on that would report
+  every page as "advanced" without the run ever leaving page 1.
+- **A revealed conditional field must never be mistaken for a page turn.**
+  `PageSignature.newly_visible_controls()` is what tells the fill loop
+  ("Do you require sponsorship?" → "Which visa do you hold?") to run another
+  fill round on the SAME page rather than navigating past a field that just
+  appeared.
+
+`ApplicationFlowManager._process_page()` is the resulting per-page cycle: settle
+and dismiss cookie/consent overlays (`browser/selectors.py::dismiss_overlays`,
+`wait_for_overlays_to_clear`) → check CAPTCHA/human-gates (now on EVERY page,
+not just the first) → upload the résumé if THIS page asks for one
+(`_upload_resume_if_offered`, keyed on `resume_attachment_state() == "missing"`,
+not on which page number this happens to be) → fill in rounds until nothing new
+is revealed (`MAX_FILL_ROUNDS`) → run the vision fallback over whatever is still
+empty HERE, not only on the final page → ask the adapter whether this is the
+last page. If not, `_advance_to_next_page()` navigates with proof and retries
+at most once, and only after something demonstrably changed (an overlay
+dismissed, a validation-flagged field filled) — never twice against an
+identical page, which is the endless-retry loop the old attempt cap was a
+band-aid for. Navigation that can't be proven ends the run as
+`manual_required` with the form's own validation errors attached, rather than
+silently continuing against a page the application never left.
+
+**Nothing in the loop is ATS-specific.** Which control advances the form,
+whether this is the last page, and what this page is called are all
+`ATSAdapter` methods (`find_next_control`, `find_submit_control`,
+`is_final_page`, `is_review_page`, `page_label`, `dismiss_distractions`) with
+working generic defaults built on `browser/selectors.py` — so a platform
+overrides only what it needs to.
+
+**A subtle correctness fix that fell out of this work:** the generic
+label/name-or-placeholder sweeps in `ats/base.py` used to read every label on
+the page regardless of which step it belonged to. On a wizard that keeps every
+step in the DOM and toggles `display` (Workday's own accordions, and most
+hand-rolled multi-step forms), that meant a field belonging to a LATER page was
+both scored as a failure on this one (diluting confidence with fields that
+were never on screen — 0.17 vs. the correct 1.0 on the integration fixture) and
+marked "examined" — permanently, since that marker is never cleared — making it
+unfillable once the form actually reached it. Both sweeps now skip a matched
+field that isn't currently *visible*, without marking it, so it is judged
+exactly once: on the page where the user can actually see it.
+
+**Workday** (`ats/workday/workday_adapter.py`) is the concrete adapter this
+work targets. Its fields are found by `data-automation-id` rather than by
+label text or CSS class — ids from Workday's own shared component library,
+stable across tenants and redesigns. Its single quirk worth an override: ONE
+button (`bottom-navigation-next-button`) drives the whole application, reading
+"Next"/"Save and Continue" throughout and "Submit" on the review page — so
+`is_final_page()` reads that button's own label rather than asking "is there a
+Next button?", which would say "keep going" forever on the review page.
+Workday requires an account (this app never creates one — see "No password
+harvesting" below) and is deliberately absent from `PUBLIC_ATS_PLATFORMS`, so
+`decide_action()` can never return `AUTO_SUBMIT` for it: a completed Workday
+application is always handed to a human to submit, confirmed at 1.0 confidence
+in the integration run.
+
+Tested in `automation/tests/test_page_navigator.py` (the signature/navigation
+primitives, against real rendered pages), `automation/tests/test_workday_adapter.py`,
+and the multi-page end-to-end tests in `test_application_flow_manager.py` —
+which drive `data:` URLs whose inline JS genuinely turns the page (heading
+changes, fields swap, the button relabels to "Submit"), 1/2/3/5 pages, so what
+they exercise is real page-turning behavior, not a simulation of it.
 
 **Manual review handoff.** `needs_review`/`copilot_review`/`manual_required`
 all mean "a human needs to look at the actual page" — but the browser used
@@ -989,3 +1084,217 @@ name" — the other order fills the preferred-name box with the legal first name
 and leaves the real one empty. And `languages` has no bare `"languages"` synonym:
 "Programming languages" is a near-universal field on engineering applications,
 and filling it with spoken languages would be confidently wrong.
+
+## A résumé that uploaded, verified, and then wasn't there
+
+A real run against a live Greenhouse posting (`job-boards.greenhouse.io`)
+finished with `resume_uploaded` in its checkpoints, `resume_upload succeeded` in
+its log, and no résumé on the application. The final screenshot shows the
+Resume/CV section still offering "Attach / Dropbox / Google Drive / Enter
+manually" — nothing attached — under a form that was otherwise filled correctly.
+
+The Playwright trace says exactly what happened, to the millisecond:
+
+| t | event |
+|---|---|
+| 4.27s | `set_input_files` on `#resume` succeeds |
+| 4.27s | verification passes — `el.files.length == 1`, `files[0].name` is the résumé |
+| 4.89s | `Minified React error #418` — hydration error |
+| 4.92s | `React recovered from an error during hydration` (×4, errors #425/#418/#423) |
+| 6.35s | the same `#resume` input reads back **empty**; the Attach buttons are back |
+
+`page.goto(..., wait_until="domcontentloaded")` returns when the server's HTML
+is parsed, which on a Remix/React ATS is *before* the app hydrates. The upload
+went into the pre-hydration DOM; React recovered from a hydration error by
+re-creating that part of the tree; the file went with the element that was
+discarded. Verification never caught it because verification ran 600ms **before**
+the DOM was thrown away — it was correct at the moment it was taken and
+worthless by the end of the run.
+
+Two changes, and the second is the one that actually guarantees the outcome:
+
+1. **`selectors.wait_for_form_ready(page)`** after navigation — a bounded,
+   never-raising wait for `load` then `networkidle`, so filling starts on a
+   hydrated form rather than racing it.
+2. **`ATSAdapter.ensure_resume_attached()`**, called by
+   `ApplicationFlowManager` at the *end* of the run. It re-reads the live page
+   (`resume_attachment_state()` → `attached` / `missing` / `no_field`) and
+   re-uploads if the form dropped the file. `no_field` is deliberately distinct
+   from `missing`: a later step of a multi-step form isn't a page that lost the
+   résumé, and conflating the two would make every such step re-attempt an
+   upload it has no field for. If the résumé still won't stick, the run's
+   résumé result flips to unfilled — a run that would submit without a résumé
+   has to go to a human, and reporting it as uploaded is the one outcome worse
+   than failing.
+
+`resume_attachment_state()` checks the input's own `files` first and *then*
+whether the upload widget's text contains the filename, because some ATS UIs
+upload straight to S3 and clear the input — reading `files` alone would call
+those "missing" and re-upload on every check.
+
+Waiting for hydration alone would not have been enough, which is why the
+end-of-run re-check exists: hydration recovery can fire at any point, and a
+verification is only ever a statement about the moment it was taken.
+
+## Vision fallback — the fields no amount of DOM reading can answer
+
+Every pass before this one reads the DOM. `FieldMapper` matches a label to a
+profile field; `ApplicationAnswerEngine` answers from the profile or from one
+batched text LLM call. Both are limited to the text the ATS *exposes*, and on
+the same live Greenhouse run three kinds of field survived them — all of them
+obvious to anyone looking at the page:
+
+- **A conditional follow-up.** `If yes to the above question, what role and what
+  governmental organization?` — required, and preceded by a "government
+  official?" question answered **No**. Read on its own the field is
+  unanswerable, so the text engine correctly declined rather than invent an
+  employer and a role. A person types `N/A` without thinking about it.
+- **A control whose visible value isn't its own value.** `candidate-location`
+  and `country` were reported as unfilled required fields while the form plainly
+  showed "Noida, Uttar Pradesh, India" and "+91" — react-select and country
+  pickers keep the selection outside the input whose value the scan reads.
+- **A field whose label the DOM never connects to it**, so no pass ever knew
+  what it was asking.
+
+`forms/vision_fallback.py` runs last, over only the required fields still empty,
+and sends what a person would look at: a **cropped screenshot per field** —
+generously padded upward (`_VISION_CROP_PADDING`, 240px) so the question above
+and its answer are in frame, which is the entire point for a conditional
+follow-up — plus the same candidate payload the text engine uses
+(`ApplicationAnswerEngine.profile_payload()`, shared rather than re-derived, so
+the two passes can never disagree about what the profile says). One batched
+vision call, then answers are filled through the ordinary `fill_field()`
+pipeline, so a vision answer is verified against the live DOM exactly like any
+other.
+
+It is a fallback, never a shortcut: it is the most expensive path in the system
+(one high-detail image per field, capped at `MAX_FIELDS_PER_CALL`, anything over
+the cap named in the log rather than silently dropped), and anything it answers
+*repeatedly* is a signal the cheap deterministic path is missing a case. Off via
+`AUTOMATION_VISION_FALLBACK=false`.
+
+The guardrails are the text path's guardrails, because the output goes to the
+same place — an employer's form, in the candidate's name:
+
+- **Demographic/EEO questions are dropped before the call**, not answered. A
+  screenshot doesn't change who may answer a question about gender, race,
+  disability, veteran status, or pronouns; only the candidate can, via
+  `PUT /profile/demographics`.
+- **Options are re-resolved against the DOM's real option list**
+  (`option_matching.match_option`) and an unmatched answer is discarded, so the
+  model cannot invent a choice — the prompt asks, the code decides.
+- **Meta-commentary is discarded** ("the candidate profile does not specify...").
+- **`already_filled` is respected, not overwritten.** A field the screenshot
+  shows as answered is left alone and reported back separately
+  (`VisionPassOutcome.confirmed_already_filled`); the flow manager then stops
+  counting it as a missing required field, logging each waiver by name. That is
+  the narrow, evidence-based fix for the react-select false positives above —
+  without it every such form is permanently `manual_required` over values that
+  are demonstrably already there.
+- **Answers are gated by the same `ANSWER_REVIEW_CONFIDENCE_THRESHOLD` (0.80)**
+  as generated text answers, and an entry with no usable confidence is treated
+  as unanswered rather than trusted.
+- **Response entries are matched by the model's own `field` number**, not by
+  position: a reordered or partial response must not shift answers onto the
+  wrong questions, which is the one failure mode here that types a real answer
+  into the wrong employer's field.
+
+The crops sent to the model are saved to `logs/<application_id>/vision-field-N.png`
+— the first thing worth looking at when a vision answer seems wrong.
+
+## Running in the user's own Chrome — `AUTOMATION_BROWSER_MODE`
+
+Every run used to start with `chromium.launch()` + `browser.new_context()`. That
+pair is a brand-new browser with a brand-new, **incognito-equivalent** profile:
+no cookies, no logged-in LinkedIn/Gmail/Workday/Greenhouse session, and a second
+window competing with the browser the user is actually sitting in front of. On
+any ATS behind a login that meant hitting an account wall (`find_human_gate` →
+`manual_required`) on runs that would have sailed through in the user's own
+browser, where they're already signed in.
+
+`BrowserManager` now selects between three ways of getting a context
+(`AUTOMATION_BROWSER_MODE`, implemented in `browser/chrome_attach.py`):
+
+| mode | what you get | closes the browser? |
+| --- | --- | --- |
+| `cdp` **(default)** | Playwright `connect_over_cdp()` to the user's **already-running** Chrome; the job opens as a **new tab** in their existing window, on their real profile | never — only the tabs we opened |
+| `persistent` | our own normal (**not** incognito) window on a real, reusable profile directory; cookies survive between runs | yes, it's ours |
+| `launch` | the original throwaway browser + empty context seeded from the encrypted `SessionStore` — for CI and headless servers | yes, it's ours |
+
+Three details in `cdp` mode carry the whole feature:
+
+- **`browser.contexts[0]`, never `browser.new_context()`.** Over CDP,
+  `new_context()` creates a fresh *incognito* context **inside** the user's
+  Chrome — a separate cookie jar with none of their logins, i.e. the exact
+  problem we set out to fix. The default context is the only one wired to the
+  on-disk profile.
+- **We don't own that browser.** `close()` closes the tabs this run opened and
+  drops the driver connection. `browser.close()` is never called on an attached
+  browser: over CDP it only disconnects today, but it is one API change away
+  from taking a human's whole browser down, so it isn't in that path at all.
+- **An attached browser reports `headless=False`.** That's what
+  `should_keep_browser_open()` reads to decide whether there's anything for a
+  human to review, so a `copilot_review` run leaves its tab on screen instead of
+  closing the one thing the human was supposed to look at.
+
+### Starting Chrome so we can attach to it
+
+Chrome only speaks CDP if it was started with the flag, and — this is the part
+that surprises everyone — **a second `chrome.exe` aimed at a profile that is
+already open just forwards its command line to the running instance and exits,
+so the port never opens.** To attach to the Chrome holding your real logins,
+close Chrome completely first, then start it yourself:
+
+```powershell
+& "C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9222
+```
+
+Use it as your normal browser from then on; every Autogram run opens a tab in it.
+If nothing is listening on the port, `AUTOMATION_CDP_AUTOLAUNCH` (default on)
+starts Chrome with the port open on a dedicated profile under
+`storage/chrome_profile/cdp/<user_id>/` and attaches to that. That Chrome is
+started **detached** and deliberately left running, so the second and every
+later application land as new tabs in the same browser — you log into an ATS
+once, by hand, and it stays logged in. Set
+`AUTOMATION_CHROME_USER_DATA_DIR=chrome-default` to autolaunch against your real
+Chrome profile instead (only works while Chrome is fully closed, for the reason
+above).
+
+`--user-data-dir` **must be absolute.** A relative path is resolved against
+Chrome's own working directory, and when Chrome can't use it, it falls back to a
+default profile *without opening the debug port* — a silent failure that looks
+like a 30-second timeout next to a perfectly healthy Chrome window. Our default
+(`storage/chrome_profile`) is relative, so `launch_chrome_with_remote_debugging`
+resolves it; this cost a real debugging session to find.
+
+### Limitations of CDP, and what happens instead
+
+- **The port has to be open before we can attach.** Nothing can retrofit remote
+  debugging onto an already-running Chrome — no API, no injection. Hence the
+  autolaunch-and-reuse path above.
+- **Enterprise policy can forbid it** (`RemoteDebuggingAllowed=false`), as can a
+  port already taken by something else.
+- **Tracing may be unavailable** on a context we attached to rather than
+  launched, because Playwright doesn't control that browser's launch arguments.
+  `start_trace()` returns `False` instead of raising, and the run continues
+  without a `trace.zip` — screenshots and the error log are unaffected.
+- **We can't apply `SessionStore` storage-state to an attached context**, and
+  don't try: `save_session()` is a no-op in `cdp`/`persistent` mode. Chrome's own
+  profile persists cookies better than we can, and exporting `storage_state()`
+  from an attached context would copy the user's *entire* cookie jar — every
+  site, not just this ATS — into our storage. Not needed, and not ours to take.
+- **`ats/detector.py::detect_ats_for_url` still opens its own throwaway headless
+  browser**, but only for URLs that tier-1 pattern matching can't classify, and
+  it closes it immediately. Inside the apply flow the detector is normally given
+  the already-open page instead.
+
+Anything that stops `cdp` from working falls through to `persistent` — a normal
+window on a persistent profile. Note what it never falls back to: `launch`.
+Silently downgrading to an empty incognito context would strip away every login
+the user expects to still have, which presents as "the ATS logged me out again"
+rather than as the misconfiguration it is.
+
+Selection, ownership and cleanup are covered by
+`automation/tests/test_browser_attach.py`, which fakes Playwright — including
+the two assertions that matter most: no `new_context()` inside the user's
+Chrome, and no `browser.close()` on a browser that isn't ours.

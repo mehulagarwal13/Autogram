@@ -62,9 +62,14 @@ from playwright.sync_api import Error as PlaywrightError, Locator
 
 from app.core.crypto import decrypt_field
 from automation.browser.selectors import (
+    dismiss_overlays,
     find_file_upload_input,
+    find_next_button,
+    find_page_heading,
+    find_submit_button,
     find_unfilled_required_field_locators,
     find_upload_trigger_button,
+    looks_like_review_page,
 )
 from automation.forms.answer_engine import (
     DETERMINISTIC_CONFIDENCE,
@@ -296,6 +301,58 @@ class ATSAdapter(ABC):
         """Click submit — only ever called after the decision logic in
         ARCHITECTURE.md ("Compliance & Risk") authorizes it."""
         raise NotImplementedError
+
+    # ------------------------------------------------------------------
+    # Multi-page navigation — concrete defaults, overridable per platform
+    # ------------------------------------------------------------------
+    # These are NOT abstract, and that is the design: every method below has a
+    # working generic implementation built on `automation/browser/selectors.py`,
+    # so a long application works on any ATS without per-platform code, and
+    # every adapter written before multi-page support existed keeps behaving
+    # exactly as it did. A platform whose markup the generic heuristics can't
+    # read (Workday, whose buttons are identified by `data-automation-id`
+    # rather than by their text) overrides just the one method it needs.
+    #
+    # `ApplicationFlowManager` calls only these — never `find_next_button` and
+    # friends directly — which is what keeps the page loop free of any
+    # knowledge of a specific ATS.
+
+    def find_next_control(self) -> Locator | None:
+        """The control that advances to the next page, or `None` on the last
+        one. Generic default: a "Next"/"Continue"/"Save and Continue" button
+        that isn't inside a cookie banner (see `find_next_button`)."""
+        return find_next_button(self.page)
+
+    def find_submit_control(self) -> Locator | None:
+        """The control that submits the completed application, or `None`."""
+        return find_submit_button(self.page)
+
+    def is_final_page(self) -> bool:
+        """Whether the application has reached its last page — the review or
+        submit step, where the run stops and hands over.
+
+        Generic default: no Next control means there is nowhere left to go. That
+        is exactly the rule the flow manager applied inline before multi-page
+        support existed, so single-page platforms (Greenhouse, Lever) are
+        unaffected. A platform that keeps a Next-shaped button on its review
+        page overrides this."""
+        return self.find_next_control() is None
+
+    def is_review_page(self) -> bool:
+        """Whether this page is showing the application back for a final check
+        before submission. Informational — it sharpens the run log and the
+        handoff message; `is_final_page` is what actually stops the loop."""
+        return looks_like_review_page(self.page)
+
+    def page_label(self) -> str:
+        """What a human would call the current page ("My Experience"), for the
+        run log. `""` when the page has no heading of its own."""
+        return find_page_heading(self.page)
+
+    def dismiss_distractions(self) -> list[str]:
+        """Closes cookie/consent/chat overlays that would otherwise intercept
+        clicks on this page's own controls. Returns what was dismissed."""
+        return dismiss_overlays(self.page)
 
     # ------------------------------------------------------------------
     # Shared helpers — concrete, available to every subclass
@@ -865,7 +922,23 @@ class ATSAdapter(ABC):
                 is_visible = False
 
             if not is_visible:
-                results.append(FieldFillResult(field_key=text, profile_path=attribute, value_used=value, confidence=0.0, filled=False))
+                # Not on the page the user is looking at — so neither scored nor
+                # marked. Both halves matter on a multi-page application.
+                #
+                # Not scored: a wizard that keeps every step in the DOM and
+                # toggles `display` (Workday's accordions, and most custom
+                # multi-step forms) exposes ALL of its labels on every page. This
+                # sweep runs once per page, so counting the other pages' fields
+                # as failures buries the run's confidence under fields that were
+                # never on screen — and `find_unfilled_required_fields` already
+                # ignores hidden fields, so scoring them here made the two halves
+                # of the same judgement disagree.
+                #
+                # Not marked: the examined marker persists for the whole
+                # document, and this field may well be the one this form shows
+                # three pages from now. Marking it would make it permanently
+                # unfillable at the exact moment it becomes relevant.
+                logger.debug("Skipping %r — its control is not visible on this page.", text)
                 continue
 
             field = describe_field(input_locator, label=text, page=self.page, profile_attribute=attribute)
@@ -1248,6 +1321,17 @@ class ATSAdapter(ABC):
         for input_locator in candidates:
             if self._has_own_label_or_aria(input_locator):
                 continue
+            # Same rule as the other two sweeps: a control on a step that isn't
+            # on screen is not this page's field. Recovering its question text
+            # works perfectly well on a hidden element, so without this check
+            # the whole rest of a wizard's form gets answered from page 1 —
+            # into controls the user cannot see, which the ATS may well
+            # discard, and at the cost of an LLM call per question.
+            try:
+                if not input_locator.is_visible():
+                    continue
+            except PlaywrightError:
+                continue
             question = self._nearby_question_text(input_locator)
             if not question:
                 continue
@@ -1350,10 +1434,12 @@ class ATSAdapter(ABC):
                 is_visible = False
 
             if not is_visible:
-                # Nothing to fill, but it HAS been examined — mark it so no
-                # later pass reconsiders it.
-                self._mark_examined(input_locator)
-                results.append(FieldFillResult(field_key=field_key, profile_path=attribute, value_used=value, confidence=0.0, filled=False))
+                # Left completely alone — not scored, and deliberately NOT
+                # marked examined, for the reasons spelled out in the matching
+                # branch of `_fill_questions_by_label`. This branch used to mark
+                # it, which on a multi-page form meant a field belonging to a
+                # later step was retired on page 1 and could never be filled
+                # once the form actually reached it.
                 continue
 
             field = describe_field(input_locator, label=field_key, page=self.page, profile_attribute=attribute)

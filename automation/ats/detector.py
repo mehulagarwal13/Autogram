@@ -56,7 +56,11 @@ class DetectionResult:
 URL_PATTERNS: dict[str, list[str]] = {
     "greenhouse": ["boards.greenhouse.io", "job-boards.greenhouse.io"],
     "lever": ["jobs.lever.co"],
-    "workday": ["myworkdayjobs.com"],
+    # `myworkdaysite.com` is the same product on a different host (several
+    # tenants are served from it), and `/wday/` is the path segment every
+    # Workday apply flow carries even when a company fronts it with its own
+    # domain — the case tier 1 would otherwise miss entirely.
+    "workday": ["myworkdayjobs.com", "myworkdaysite.com", "/wday/"],
     "smartrecruiters": ["jobs.smartrecruiters.com"],
     "taleo": ["taleo.net"],
     "icims": ["icims.com"],

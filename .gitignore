@@ -15,6 +15,11 @@ __pycache__/
 .DS_Store
 Thumbs.db
 
+# Browser profiles for AUTOMATION_BROWSER_MODE=cdp/persistent (see
+# automation/browser/chrome_attach.py) — hundreds of MB of Chrome's own binary
+# state, and it holds the user's live login cookies. Never commit it.
+storage/chrome_profile/
+
 # Playwright artifacts
 trace.zip
 *.trace

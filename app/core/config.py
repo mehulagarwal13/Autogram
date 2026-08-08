@@ -43,8 +43,48 @@ JOB_SYNC_INTERVAL_HOURS = int(os.getenv("JOB_SYNC_INTERVAL_HOURS", "6"))
 JOB_SYNC_COUNTRY = os.getenv("JOB_SYNC_COUNTRY", "gb")
 
 # --- Automation / browser engine (Phase 2+, automation/browser/*) ---
+# How BrowserManager gets a browser. See automation/browser/chrome_attach.py.
+#   "cdp"        (default) Attach to the user's ALREADY-RUNNING Google Chrome over
+#                the Chrome DevTools Protocol and open the job in a NEW TAB, reusing
+#                their real profile — cookies, Gmail/LinkedIn/Workday/Greenhouse
+#                logins, everything. Nothing is listening on the debug port? Chrome
+#                is started with the port open (AUTOMATION_CDP_AUTOLAUNCH) and left
+#                running, so later runs attach to that one. Falls back to
+#                "persistent" if Chrome can't be attached to at all.
+#   "persistent" Skip CDP; open a normal (NOT incognito) window on a real, reusable
+#                on-disk profile directory. Cookies/logins persist across runs.
+#   "launch"     The original Phase 2 behavior: a throwaway browser with an empty,
+#                incognito-equivalent context seeded from the encrypted
+#                storage-state in AUTOMATION_SESSION_DIR. Keep this for CI/headless
+#                servers where there is no user Chrome to attach to.
+AUTOMATION_BROWSER_MODE = os.getenv("AUTOMATION_BROWSER_MODE", "cdp").strip().lower()
+if AUTOMATION_BROWSER_MODE not in ("cdp", "persistent", "launch"):
+    raise RuntimeError(
+        "AUTOMATION_BROWSER_MODE must be 'cdp', 'persistent' or 'launch', "
+        f"got: {AUTOMATION_BROWSER_MODE!r}"
+    )
+# Chrome's DevTools endpoint. Accepts "9222", "localhost:9222" or a full URL.
+AUTOMATION_CDP_URL = os.getenv("AUTOMATION_CDP_URL", "http://127.0.0.1:9222").strip()
+# May we start Chrome ourselves (with --remote-debugging-port) when nothing is
+# listening? Set to false to require that the user starts Chrome with the flag.
+AUTOMATION_CDP_AUTOLAUNCH = os.getenv("AUTOMATION_CDP_AUTOLAUNCH", "true").strip().lower() != "false"
+# How long to wait for a Chrome we started to open the debug port.
+AUTOMATION_CDP_LAUNCH_TIMEOUT_S = float(os.getenv("AUTOMATION_CDP_LAUNCH_TIMEOUT_S", "30"))
+# Full path to chrome.exe / Google Chrome. Unset = auto-detect the standard
+# install locations for this OS.
+AUTOMATION_CHROME_PATH = os.getenv("AUTOMATION_CHROME_PATH") or None
+# Profile directory used when WE start the browser (autolaunch or "persistent").
+# A per-Autogram-user subdirectory is created underneath it, so two users of this
+# deployment never share a cookie jar. The special value "chrome-default" points
+# at the user's REAL Chrome profile — that only works while Chrome is completely
+# closed (Chrome's profile lock means a second process on a live profile never
+# opens the debug port), so it is opt-in, not the default.
+AUTOMATION_CHROME_USER_DATA_DIR = os.getenv("AUTOMATION_CHROME_USER_DATA_DIR", "storage/chrome_profile")
 # Headless by default; set AUTOMATION_HEADLESS=false to watch the browser run
 # (e.g. for the manual-login flow — see ARCHITECTURE.md "No password harvesting").
+# Only consulted in AUTOMATION_BROWSER_MODE=launch: attaching to a human's Chrome
+# (or opening a window they may take over for copilot review) is visible by
+# definition, so "cdp"/"persistent" runs are never headless.
 AUTOMATION_HEADLESS = os.getenv("AUTOMATION_HEADLESS", "true").strip().lower() != "false"
 # Encrypted Playwright storage-state (cookies/local-storage) per (user, ATS platform).
 AUTOMATION_SESSION_DIR = os.getenv("AUTOMATION_SESSION_DIR", "storage/automation_sessions")
