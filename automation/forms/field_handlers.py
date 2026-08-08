@@ -234,15 +234,29 @@ def _normalize_for_compare(text: str) -> str:
 def _values_match(expected, actual) -> bool:
     """Case/whitespace-insensitive, substring-tolerant in either direction —
     deliberately loose rather than exact-equality, since plenty of real
-    widgets reformat what you typed (a phone input mask, a select whose
-    visible option text is a slightly longer/shorter variant of the profile
-    value: "United States" vs "United States of America")."""
+    widgets render a slightly longer/shorter value (for example, "United
+    States" vs "United States of America")."""
     if expected is None or actual is None:
         return False
     e, a = _normalize_for_compare(str(expected)), _normalize_for_compare(str(actual))
     if not e or not a:
         return False
     return e == a or e in a or a in e
+
+
+def _phone_values_match(expected, actual) -> bool:
+    """Compare phone values after removing display formatting.
+
+    International telephone widgets commonly insert spaces, parentheses or
+    hyphens as a user types. Those changes do not mean the number failed to
+    stick; they are presentation-only. Keep this comparison exact after
+    normalisation so a different phone number is never accepted.
+    """
+    if expected is None or actual is None:
+        return False
+    expected_digits = re.sub(r"\D", "", str(expected))
+    actual_digits = re.sub(r"\D", "", str(actual))
+    return bool(expected_digits) and expected_digits == actual_digits
 
 
 _COUNTRY_ALIASES = {
@@ -399,6 +413,8 @@ class TextInputHandler(FieldHandler):
 
     def verify(self, field: Field, value) -> tuple[bool, str | None]:
         actual = field.locator.input_value()
+        if field.input_type == "tel":
+            return _phone_values_match(value, actual), actual
         return _values_match(value, actual), actual
 
 
@@ -928,7 +944,16 @@ class FileUploadHandler(FieldHandler):
         return field.tag_name == "input" and field.input_type == "file"
 
     def fill(self, field: Field, value) -> None:
-        field.locator.set_input_files(str(value))
+        path = self._resolve_local_path(value)
+        if not path.is_file():
+            # A missing document is a candidate-data issue, not an automation
+            # crash. `fill_field()` translates this refusal into a structured
+            # result so the flow hands the open form to the user for review.
+            raise FieldFillRefused(
+                "upload_file_missing",
+                f"The file selected for upload no longer exists: {path}",
+            )
+        field.locator.set_input_files(str(path))
 
     def verify(self, field: Field, value) -> tuple[bool, str | None]:
         try:
@@ -946,7 +971,7 @@ class FileUploadHandler(FieldHandler):
         # render the real <input> off-screen but still show the filename
         # somewhere nearby once JS processes the upload — best-effort
         # fallback so verification doesn't just assume failure.
-        basename = Path(str(value)).name
+        basename = self._resolve_local_path(value).name
         try:
             visible_hint = field.page.get_by_text(basename, exact=False)
             if visible_hint.count() > 0:
@@ -954,6 +979,22 @@ class FileUploadHandler(FieldHandler):
         except PlaywrightError:
             pass
         return False, None
+
+    @staticmethod
+    def _resolve_local_path(value) -> Path:
+        """Resolve DB-stored file paths on the machine running Playwright.
+
+        Stored document paths can outlive a Windows-to-Linux move. Normalize
+        backslashes before creating ``Path`` so ``storage\\documents\\...``
+        keeps referring to the project storage folder rather than becoming one
+        literal filename. Relative paths are anchored to the repository root,
+        not the server process's current directory.
+        """
+        raw_path = str(value).strip().replace("\\", "/")
+        path = Path(raw_path).expanduser()
+        if not path.is_absolute():
+            path = Path(__file__).resolve().parents[2] / path
+        return path
 
 
 # ---------------------------------------------------------------------------

@@ -837,9 +837,30 @@ def page_has_captcha(page: Page) -> bool:
             continue
         for i in range(count):
             try:
-                if locator.nth(i).is_visible():
-                    logger.info("CAPTCHA hint '%s' detected (visible) on %s", hint, page.url)
-                    return True
+                candidate = locator.nth(i)
+                if not candidate.is_visible():
+                    continue
+
+                # reCAPTCHA Enterprise creates a *visible badge iframe* even
+                # when configured with `size=invisible`. It is not a challenge
+                # the applicant can solve and must not block the entire form.
+                # A real challenge is rendered in a separate frame/widget and
+                # does not carry this setting, so it still reaches the normal
+                # human-review path below. Greenhouse uses this passive badge
+                # on public application forms.
+                src = (candidate.get_attribute("src") or "").lower()
+                data_size = (candidate.get_attribute("data-size") or "").lower()
+                class_names = (candidate.get_attribute("class") or "").lower().split()
+                is_recaptcha_badge = any(
+                    class_name in {"grecaptcha-badge", "grecaptcha-logo", "grecaptcha-error"}
+                    for class_name in class_names
+                )
+                if "size=invisible" in src or data_size == "invisible" or is_recaptcha_badge:
+                    logger.debug("Ignoring passive invisible CAPTCHA badge on %s", page.url)
+                    continue
+
+                logger.info("CAPTCHA hint '%s' detected (visible) on %s", hint, page.url)
+                return True
             except PlaywrightError:
                 continue
     return False

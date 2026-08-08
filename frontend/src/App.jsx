@@ -1,10 +1,11 @@
 import { useEffect, useState, useCallback } from "react";
-import { BrainCircuit, CheckCircle2, AlertCircle, Info, X, LogOut, Loader2 } from "lucide-react";
+import { BrainCircuit, CheckCircle2, AlertCircle, Info, X, LogOut, Loader2, LayoutDashboard, Braces } from "lucide-react";
 import { api, auth, setUnauthorizedHandler } from "./api";
 import AuthPage from "./components/AuthPage";
 import UploadPanel from "./components/UploadPanel";
 import JobsPanel from "./components/JobsPanel";
 import MatchesPanel from "./components/MatchesPanel";
+import DebugPanel from "./components/DebugPanel";
 
 let toastId = 0;
 
@@ -14,6 +15,7 @@ export default function App() {
   const [resume, setResume] = useState(null);
   const [health, setHealth] = useState(null);
   const [toasts, setToasts] = useState([]);
+  const [section, setSection] = useState("dashboard");
 
   const toast = useCallback((message, type = "info") => {
     const id = ++toastId;
@@ -111,14 +113,28 @@ export default function App() {
         </div>
       </header>
 
-      {/* Layout: left rail (resume + jobs) / right (matches) */}
-      <main className="grid gap-5 lg:grid-cols-[400px_1fr]">
-        <div className="space-y-5">
-          <UploadPanel resume={resume} setResume={setResume} toast={toast} />
-          <JobsPanel toast={toast} />
-        </div>
-        <MatchesPanel resume={resume} toast={toast} />
-      </main>
+      <nav className="mb-5 flex w-fit gap-1 rounded-xl border border-white/10 bg-slate-900/50 p-1" aria-label="Application sections">
+        <button onClick={() => setSection("dashboard")}
+          className={`flex items-center gap-2 rounded-lg px-3.5 py-2 text-sm font-semibold transition ${section === "dashboard" ? "bg-indigo-500/25 text-indigo-200" : "text-slate-500 hover:text-slate-300"}`}>
+          <LayoutDashboard size={15} /> Dashboard
+        </button>
+        <button onClick={() => setSection("debug")}
+          className={`flex items-center gap-2 rounded-lg px-3.5 py-2 text-sm font-semibold transition ${section === "debug" ? "bg-indigo-500/25 text-indigo-200" : "text-slate-500 hover:text-slate-300"}`}>
+          <Braces size={16} /> Debug
+        </button>
+      </nav>
+
+      {section === "dashboard" ? (
+        <main className="grid gap-5 lg:grid-cols-[400px_1fr]">
+          <div className="space-y-5">
+            <UploadPanel resume={resume} setResume={setResume} toast={toast} />
+            <JobsPanel toast={toast} />
+          </div>
+          <MatchesPanel resume={resume} toast={toast} />
+        </main>
+      ) : (
+        <main><DebugPanel resume={resume} /></main>
+      )}
 
       {/* Toasts */}
       <div className="fixed bottom-5 right-5 z-[60] flex w-80 flex-col gap-2">

@@ -69,6 +69,31 @@ def test_fill_field_fills_and_verifies_a_plain_text_input(page):
     assert page.locator("#f").input_value() == "ada@example.com"
 
 
+def test_fill_field_accepts_phone_display_formatting(page):
+    # Mirrors Greenhouse's international-phone widget: it reformats a valid
+    # number while keeping every digit intact.
+    _render(
+        page,
+        """
+        <input id="phone" type="tel">
+        <script>
+          document.getElementById('phone').addEventListener('input', (event) => {
+            if (event.target.value.replace(/\\D/g, '') === '15550100') {
+              event.target.value = '+1 555-010-0';
+            }
+          });
+        </script>
+        """,
+    )
+    field = describe_field(page.locator("#phone"), label="Phone", page=page)
+
+    outcome = fill_field(field, "+15550100")
+
+    assert outcome.filled is True
+    assert outcome.failure is None
+    assert page.locator("#phone").input_value() == "+1 555-010-0"
+
+
 def test_fill_field_skips_empty_values_without_touching_the_dom(page):
     _render(page, '<input id="f" type="text" value="untouched">')
     field = describe_field(page.locator("#f"), label="f", page=page)
@@ -243,6 +268,30 @@ def test_file_upload_handler_works_on_a_hidden_input(page, tmp_path):
     outcome = fill_field(field, str(resume_path))
 
     assert outcome.filled is True  # FileUploadHandler never checks is_visible()
+
+
+def test_file_upload_handler_accepts_a_windows_style_stored_path(page, tmp_path):
+    resume_path = tmp_path / "resume.pdf"
+    resume_path.write_bytes(b"%PDF-1.4 fake resume bytes")
+    _render(page, '<input id="f" type="file">')
+
+    field = describe_field(page.locator("#f"), label="resume_upload", page=page)
+    windows_style_path = str(resume_path).replace("/", "\\")
+    outcome = fill_field(field, windows_style_path)
+
+    assert outcome.filled is True
+    assert outcome.actual_value == "resume.pdf"
+
+
+def test_file_upload_handler_reports_a_missing_file_without_crashing(page):
+    _render(page, '<input id="f" type="file">')
+    field = describe_field(page.locator("#f"), label="resume_upload", page=page)
+
+    outcome = fill_field(field, "storage\\documents\\resume\\missing.pdf")
+
+    assert outcome.filled is False
+    assert outcome.failure is not None
+    assert outcome.failure.failure_reason == "upload_file_missing"
 
 
 # ---------------------------------------------------------------------------

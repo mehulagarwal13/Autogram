@@ -399,6 +399,29 @@ def test_ignores_an_invisible_hcaptcha_widget(page):
     assert page_has_captcha(page) is False
 
 
+def test_ignores_a_visible_recaptcha_invisible_mode_badge(page):
+    # reCAPTCHA Enterprise leaves a small, visible badge iframe on the page
+    # when running in invisible mode. It is disclosure UI, not an interactive
+    # challenge, and Greenhouse includes it on otherwise fillable forms.
+    _render(
+        page,
+        '<iframe src="https://www.recaptcha.net/recaptcha/enterprise/anchor?size=invisible" '
+        'style="width:70px;height:60px"></iframe>',
+    )
+    assert page_has_captcha(page) is False
+
+
+def test_ignores_visible_recaptcha_badge_wrapper(page):
+    # The badge's wrapper and logo are visible too, and the generic class
+    # selector sees them before it reaches the invisible-mode iframe.
+    _render(
+        page,
+        '<div class="grecaptcha-badge" style="width:256px;height:60px">'
+        '<div class="grecaptcha-logo">reCAPTCHA</div></div>',
+    )
+    assert page_has_captcha(page) is False
+
+
 def test_detects_a_hidden_captcha_iframe_the_same_way(page):
     _render(page, '<iframe src="https://newassets.hcaptcha.com/captcha/v1/x" style="display:none"></iframe>')
     assert page_has_captcha(page) is False

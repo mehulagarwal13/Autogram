@@ -38,6 +38,45 @@ async function request(path, options = {}) {
   return body;
 }
 
+// A non-throwing request helper for the in-app Debug console. Unlike `request`,
+// it deliberately returns unsuccessful responses too, so their status, headers,
+// and body can be inspected without losing the server's error detail.
+export async function debugRequest(path, { method = "GET", body, headers = {} } = {}) {
+  const requestHeaders = { ...headers };
+  const token = auth.getToken();
+  if (token) requestHeaders.Authorization = `Bearer ${token}`;
+
+  const startedAt = performance.now();
+  try {
+    const res = await fetch(`/api${path}`, { method, headers: requestHeaders, body });
+    const text = await res.text();
+    let responseBody = null;
+    try {
+      responseBody = text ? JSON.parse(text) : null;
+    } catch {
+      responseBody = text;
+    }
+
+    return {
+      ok: res.ok,
+      status: res.status,
+      statusText: res.statusText,
+      durationMs: Math.round(performance.now() - startedAt),
+      headers: Object.fromEntries(res.headers.entries()),
+      body: responseBody,
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      status: 0,
+      statusText: "Network error",
+      durationMs: Math.round(performance.now() - startedAt),
+      headers: {},
+      body: { error: error.message },
+    };
+  }
+}
+
 export const api = {
   health: () => request("/health"),
 
