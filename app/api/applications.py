@@ -45,8 +45,9 @@ from app.models.application import (
     AutomationRunResponse,
     DuplicateCheckResponse,
     QuestionReviewRequest,
+    ReportStatusRequest,
 )
-from app.models.db_models import Application, User
+from app.models.db_models import Application, User, VALID_APPLICATION_SOURCES
 from app.services import (
     answer_cache_repository,
     application_question_repository,
@@ -170,6 +171,11 @@ def start_application(
     inserting a second one. An IN_PROGRESS_STATUSES or COMPLETED_STATUSES
     attempt is rejected with 409 rather than silently doing nothing, so a
     caller can't mistake "no-op" for "started"."""
+    if body.source not in VALID_APPLICATION_SOURCES:
+        raise HTTPException(
+            status_code=400, detail=f"Invalid source {body.source!r}. Must be one of {sorted(VALID_APPLICATION_SOURCES)}.",
+        )
+
     job_url = str(body.job_url)
     existing = application_repository.get_by_user_and_url(db, user.user_id, job_url)
 
@@ -207,18 +213,25 @@ def start_application(
             autopilot_enabled=body.autopilot_enabled,
             company=body.company,
             position=body.position,
+            source=body.source,
         )
     else:
         # Retry: same row (same application_id/created_at/job_url_hash), so
         # the unique constraint stays satisfied and its AutomationRun
         # history from apply_run_result is kept.
         application = application_repository.retry_application(
-            db, existing, company=body.company, position=body.position, autopilot_enabled=body.autopilot_enabled,
+            db, existing, company=body.company, position=body.position,
+            autopilot_enabled=body.autopilot_enabled, source=body.source,
         )
 
-    background_tasks.add_task(
-        _run_application, application.application_id, resume_document_id, body.job_description,
-    )
+    if body.source == "server_automation":
+        background_tasks.add_task(
+            _run_application, application.application_id, resume_document_id, body.job_description,
+        )
+    # source == "browser_extension": there is no server-side Playwright run
+    # to dispatch — the extension itself fills the form in the user's own
+    # tab and reports progress via POST /applications/{id}/report-status.
+    # The row stays "pending" until it does.
 
     return application
 
@@ -447,6 +460,37 @@ def reject_application(
     _record_audit_event(
         db, application_id=application.application_id, user_id=user.user_id,
         event_type="human_rejected", actor=user.user_id, metadata={"reason": reason} if reason else None,
+    )
+    return application
+
+
+@router.post("/{application_id}/report-status", response_model=ApplicationResponse)
+def report_application_status(
+    application_id: str,
+    body: ReportStatusRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """The browser extension's own self-reported progress — there is no
+    server-side Playwright run to derive this from (`source ==
+    "browser_extension"`, see `start_application`), so the extension calls
+    this directly after every state change: `manual_required` while it waits
+    on a human for a CAPTCHA, and a final `applied`/`failed`/`needs_review`/
+    `copilot_review`/`cancelled` once the human has reviewed and (for v1,
+    copilot-only) clicked submit on the real page themselves. Not restricted
+    to extension-sourced applications — a server-automation caller could use
+    it too, though today only the extension does."""
+    application = _get_owned_application(db, application_id, user)
+    try:
+        application = application_repository.report_status(
+            db, application, status=body.status, reason=body.reason, confidence=body.confidence,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    _record_audit_event(
+        db, application_id=application.application_id, user_id=user.user_id,
+        event_type="extension_status_reported", actor=user.user_id,
+        metadata={"status": body.status, "reason": body.reason},
     )
     return application
 

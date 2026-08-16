@@ -4,7 +4,7 @@ from fastapi import FastAPI, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
 
-from app.api import applications, auth, resumes, jobs, profile
+from app.api import applications, auth, automation, resumes, jobs, profile
 from app.core.auth import get_current_user
 from app.core.config import CORS_ORIGINS
 from app.core.database import Base, engine
@@ -55,6 +55,7 @@ app.include_router(auth.router)
 app.include_router(resumes.router)  # endpoints take the user dependency individually
 app.include_router(profile.router)  # endpoints take the user dependency individually
 app.include_router(applications.router)  # endpoints take the user dependency individually
+app.include_router(automation.router)  # browser-extension field mapping; endpoints take the user dependency individually
 app.include_router(jobs.router, dependencies=[Depends(get_current_user)])
 
 

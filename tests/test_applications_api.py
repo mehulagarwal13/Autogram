@@ -18,6 +18,7 @@ from app.api.applications import (
     get_applications_overview,
     list_applications_needing_review,
     reject_application,
+    report_application_status,
     review_application_question,
     start_application,
 )
@@ -80,6 +81,7 @@ def _fake_start_body(**overrides):
         position=None,
         resume_document_id=None,
         job_description=None,
+        source="server_automation",
     )
     defaults.update(overrides)
     return MagicMock(**defaults)
@@ -119,7 +121,9 @@ def test_start_application_retries_a_retryable_application_on_the_same_row(monke
 
     assert result is fake_retried
     assert retry_calls["app"] is fake_existing
-    assert retry_calls["kwargs"] == {"company": "Acme", "position": "Backend Engineer", "autopilot_enabled": True}
+    assert retry_calls["kwargs"] == {
+        "company": "Acme", "position": "Backend Engineer", "autopilot_enabled": True, "source": "server_automation",
+    }
     assert not create_calls  # a retry must never insert a second row for this job
     assert response.status_code == 599  # left at 202 default, not forced to 200/409
     assert len(background_tasks.tasks) == 1
@@ -178,6 +182,7 @@ class _FakeApplication:
         self.applied_date = None
         self.company = None
         self.position = None
+        self.source = "server_automation"
 
 
 def _run_enqueued_background_task(background_tasks):
@@ -198,8 +203,9 @@ def test_start_application_retries_after_a_failure_and_stops_retrying_once_appli
 
     store: dict[str, _FakeApplication] = {}
 
-    def fake_create_application(db, user_id, job_url, *, autopilot_enabled=False, company=None, position=None):
+    def fake_create_application(db, user_id, job_url, *, autopilot_enabled=False, company=None, position=None, source="server_automation"):
         app = _FakeApplication("app-1", user_id, job_url, autopilot_enabled)
+        app.source = source
         store[job_url] = app
         return app
 
@@ -213,13 +219,14 @@ def test_start_application_retries_after_a_failure_and_stops_retrying_once_appli
         app.status = "processing"
         return app
 
-    def fake_retry_application(db, app, *, company, position, autopilot_enabled):
+    def fake_retry_application(db, app, *, company, position, autopilot_enabled, source="server_automation"):
         app.status = "pending"
         app.failure_reason = None
         app.confidence_score = 0.0
         app.company = company
         app.position = position
         app.autopilot_enabled = autopilot_enabled
+        app.source = source
         return app
 
     def fake_apply_run_result(db, app, result):
@@ -584,3 +591,107 @@ def test_reject_application_closes_the_review_session_and_cancels(monkeypatch):
     assert close_calls == ["app-1"]
     assert result.status == "cancelled"
     assert result.failure_reason == "Changed my mind"
+
+
+# ---------------------------------------------------------------------------
+# Browser extension: source="browser_extension" skips the server-side
+# Playwright dispatch entirely; report-status is how it self-reports progress
+# since there is no server-side run to derive that from.
+# ---------------------------------------------------------------------------
+
+def test_start_application_skips_background_dispatch_for_browser_extension_source(monkeypatch):
+    import app.api.applications as applications_module
+
+    fake_profile = MagicMock(profile_id="profile-1")
+    fake_resume = MagicMock(document_id="doc-1", is_default=True)
+    fake_application = MagicMock(application_id="app-1", source="browser_extension")
+
+    monkeypatch.setattr(applications_module.application_repository, "get_by_user_and_url", lambda db, uid, url: None)
+    monkeypatch.setattr(applications_module.profile_repository, "get_by_user_id", lambda db, uid: fake_profile)
+    monkeypatch.setattr(applications_module.profile_repository, "list_documents", lambda db, pid, document_type=None: [fake_resume])
+    create_calls = []
+    monkeypatch.setattr(
+        applications_module.application_repository, "create_application",
+        lambda *a, **kw: (create_calls.append(kw), fake_application)[-1],
+    )
+
+    background_tasks = BackgroundTasks()
+    body = _fake_start_body(source="browser_extension")
+
+    result = start_application(body, background_tasks, Response(), user=MagicMock(user_id="user-1"), db=MagicMock())
+
+    assert result is fake_application
+    assert create_calls[0]["source"] == "browser_extension"
+    assert not background_tasks.tasks  # no server-side Playwright run dispatched
+
+
+def test_start_application_rejects_an_invalid_source(monkeypatch):
+    import app.api.applications as applications_module
+
+    monkeypatch.setattr(applications_module.application_repository, "get_by_user_and_url", lambda db, uid, url: None)
+    background_tasks = BackgroundTasks()
+    body = _fake_start_body(source="not-a-real-source")
+
+    with pytest.raises(HTTPException) as exc_info:
+        start_application(body, background_tasks, Response(), user=MagicMock(user_id="user-1"), db=MagicMock())
+
+    assert exc_info.value.status_code == 400
+    assert not background_tasks.tasks
+
+
+def test_report_application_status_updates_the_row_and_records_an_audit_event(monkeypatch):
+    import app.api.applications as applications_module
+
+    application = _owned_application(monkeypatch, source="browser_extension")
+    audit_calls = []
+    monkeypatch.setattr(applications_module, "_record_audit_event", lambda *a, **kw: audit_calls.append(kw))
+
+    def fake_report_status(db, app, *, status, reason=None, confidence=None):
+        app.status = status
+        app.failure_reason = reason
+        app.confidence_score = confidence
+        return app
+
+    monkeypatch.setattr(applications_module.application_repository, "report_status", fake_report_status)
+
+    from app.models.application import ReportStatusRequest
+    body = ReportStatusRequest(status="manual_required", reason="CAPTCHA on the page", confidence=0.0)
+
+    result = report_application_status("app-1", body, user=MagicMock(user_id="user-1"), db=MagicMock())
+
+    assert result.status == "manual_required"
+    assert result.failure_reason == "CAPTCHA on the page"
+    assert audit_calls[0]["event_type"] == "extension_status_reported"
+
+
+def test_report_application_status_rejects_an_invalid_status(monkeypatch):
+    import app.api.applications as applications_module
+
+    _owned_application(monkeypatch)
+
+    def fake_report_status(db, app, *, status, reason=None, confidence=None):
+        raise ValueError(f"Invalid status {status!r}.")
+
+    monkeypatch.setattr(applications_module.application_repository, "report_status", fake_report_status)
+
+    from app.models.application import ReportStatusRequest
+    body = ReportStatusRequest(status="not-a-real-status")
+
+    with pytest.raises(HTTPException) as exc_info:
+        report_application_status("app-1", body, user=MagicMock(user_id="user-1"), db=MagicMock())
+
+    assert exc_info.value.status_code == 400
+
+
+def test_report_application_status_404s_for_an_unowned_application(monkeypatch):
+    import app.api.applications as applications_module
+
+    monkeypatch.setattr(applications_module.application_repository, "get_by_id", lambda db, aid: None)
+
+    from app.models.application import ReportStatusRequest
+    body = ReportStatusRequest(status="applied")
+
+    with pytest.raises(HTTPException) as exc_info:
+        report_application_status("app-1", body, user=MagicMock(user_id="user-1"), db=MagicMock())
+
+    assert exc_info.value.status_code == 404

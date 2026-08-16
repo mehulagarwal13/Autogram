@@ -210,6 +210,21 @@ class AnswerResult:
 #: of either guessing or silently leaving a required EEO question blank.
 SOURCE_NEEDS_USER_INPUT = "needs_user_input"
 
+# `AnswerResult.source` -> `ApplicationQuestion.source` (see
+# `app/models/db_models.py::VALID_QUESTION_SOURCES`). "cache"/"answer_memory"
+# (an exact-hash or semantic hit against this user's own answer history) both
+# read as `answer_memory` to the ledger — the review UI cares that this came
+# from the candidate's own history, not which lookup found it. Public/
+# module-level so `app/api/automation.py`'s browser-extension field-mapping
+# endpoint can reuse the exact same mapping instead of redefining it.
+QUESTION_SOURCE_MAP = {
+    "deterministic": "profile",
+    "cache": "answer_memory",
+    "answer_memory": "answer_memory",
+    "llm": "llm",
+    SOURCE_NEEDS_USER_INPUT: SOURCE_NEEDS_USER_INPUT,
+}
+
 
 # --- deterministic classification -------------------------------------
 # Phase 8: classification itself now lives in `question_classifier.py`
@@ -534,18 +549,10 @@ class ApplicationAnswerEngine:
     caller without a DB session handy) can still use the deterministic + LLM
     paths without a persistent cache."""
 
-    #: `AnswerResult.source` -> `ApplicationQuestion.source` (see
-    #: `app/models/db_models.py::VALID_QUESTION_SOURCES`). "cache"/"answer_memory"
-    #: (an exact-hash or semantic hit against this user's own answer history)
-    #: both read as `answer_memory` to the ledger — the review UI cares that
-    #: this came from the candidate's own history, not which lookup found it.
-    _QUESTION_SOURCE_MAP = {
-        "deterministic": "profile",
-        "cache": "answer_memory",
-        "answer_memory": "answer_memory",
-        "llm": "llm",
-        SOURCE_NEEDS_USER_INPUT: SOURCE_NEEDS_USER_INPUT,
-    }
+    # `_QUESTION_SOURCE_MAP` is now the module-level `QUESTION_SOURCE_MAP`
+    # (see below) so `app/api/automation.py`'s browser-extension field-mapping
+    # endpoint can reuse the exact same mapping instead of redefining it.
+    _QUESTION_SOURCE_MAP = QUESTION_SOURCE_MAP
 
     def __init__(
         self,

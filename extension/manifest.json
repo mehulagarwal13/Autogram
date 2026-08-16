@@ -1,0 +1,16 @@
+{
+  "manifest_version": 3,
+  "name": "Autogram — Apply from Job Link",
+  "version": "0.1.0",
+  "description": "Fills job applications in your own logged-in Chrome tab using your Autogram profile. CAPTCHA and final submission always stay in your hands — this never runs in Incognito.",
+  "permissions": ["storage", "activeTab", "scripting"],
+  "host_permissions": ["<all_urls>"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup/popup.html",
+    "default_title": "Autogram — Fill This Application"
+  },
+  "options_page": "options.html"
+}

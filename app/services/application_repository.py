@@ -22,7 +22,7 @@ from datetime import datetime, timezone
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from app.models.db_models import Application, AutomationRun
+from app.models.db_models import Application, AutomationRun, VALID_APPLICATION_STATUSES
 
 # HITL platform — every DB status mapped to the cleaner vocabulary the
 # dashboard/API expose (`ApplicationResponse.display_status`). Purely a
@@ -95,6 +95,7 @@ def create_application(
     autopilot_enabled: bool = False,
     company: str | None = None,
     position: str | None = None,
+    source: str = "server_automation",
 ) -> Application:
     application = Application(
         application_id=str(uuid.uuid4()),
@@ -105,6 +106,7 @@ def create_application(
         position=position,
         status="pending",
         autopilot_enabled=autopilot_enabled,
+        source=source,
     )
     db.add(application)
     db.commit()
@@ -119,6 +121,7 @@ def retry_application(
     company: str | None,
     position: str | None,
     autopilot_enabled: bool,
+    source: str = "server_automation",
 ) -> Application:
     """Re-arms a `failed`/`manual_required`/`needs_review` Application for
     another attempt on the SAME row: keeps `application_id`, `created_at`,
@@ -126,13 +129,16 @@ def retry_application(
     its `AutomationRun` history in `apply_run_result` stays intact), but
     clears every field the previous attempt left behind and refreshes the
     per-run fields from this new request — exactly what a brand-new
-    Application would get, just without inserting a second row."""
+    Application would get, just without inserting a second row. `source` is
+    refreshed too, so retrying via the extension after a server-automation
+    attempt failed (or vice versa) switches delivery mechanism cleanly."""
     application.status = "pending"
     application.failure_reason = None
     application.confidence_score = 0.0
     application.company = company
     application.position = position
     application.autopilot_enabled = autopilot_enabled
+    application.source = source
     application.updated_at = datetime.now(timezone.utc)
     db.commit()
     db.refresh(application)
@@ -141,6 +147,32 @@ def retry_application(
 
 def mark_processing(db: Session, application: Application) -> Application:
     application.status = "processing"
+    application.updated_at = datetime.now(timezone.utc)
+    db.commit()
+    db.refresh(application)
+    return application
+
+
+def report_status(
+    db: Session, application: Application, *, status: str, reason: str | None = None, confidence: float | None = None,
+) -> Application:
+    """`POST /applications/{id}/report-status` — the browser extension's own
+    self-reported progress (there is no server-side Playwright run to derive
+    this from, since `source == "browser_extension"`; see
+    `app/api/applications.py::start_application`). One endpoint covers both
+    "waiting on you for a CAPTCHA" (`status="manual_required"`) and a final
+    outcome (`applied`/`failed`/`needs_review`/`copilot_review`/`cancelled`)
+    after the human clicks submit on the real page themselves — the caller
+    validates `status` against `VALID_APPLICATION_STATUSES` before this is
+    ever called."""
+    if status not in VALID_APPLICATION_STATUSES:
+        raise ValueError(f"Invalid status {status!r}. Must be one of {sorted(VALID_APPLICATION_STATUSES)}.")
+    application.status = status
+    application.failure_reason = reason
+    if confidence is not None:
+        application.confidence_score = confidence
+    if status == "applied":
+        application.applied_date = datetime.now(timezone.utc)
     application.updated_at = datetime.now(timezone.utc)
     db.commit()
     db.refresh(application)

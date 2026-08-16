@@ -21,6 +21,13 @@ class ApplicationStartRequest(BaseModel):
     # screening questions ("Why do you want to work here?"). Optional and
     # not persisted anywhere — purely a per-run hint.
     job_description: str | None = None
+    # Browser-extension delivery — see db_models.py::Application.source.
+    # "server_automation" (default) dispatches the existing server-side
+    # Playwright run; "browser_extension" only creates/returns the tracking
+    # row (same idempotency/duplicate-check either way) — the extension
+    # itself does the filling in the user's own tab and reports progress via
+    # POST /applications/{id}/report-status.
+    source: str = "server_automation"
 
 
 class ApplicationResponse(BaseModel):
@@ -39,6 +46,7 @@ class ApplicationResponse(BaseModel):
     confidence_score: float | None = None
     failure_reason: str | None = None
     pages_completed: int | None = None
+    source: str = "server_automation"
     created_at: datetime | None = None
     updated_at: datetime | None = None
 
@@ -151,3 +159,46 @@ class AuditLogEntryResponse(BaseModel):
     actor: str
     event_metadata: dict | None = Field(default=None, alias="event_metadata")
     created_at: datetime | None = None
+
+
+# ---------- Browser extension: field mapping + self-reported status ----------
+
+class FieldQuery(BaseModel):
+    """One field the extension's content script found on the page and
+    couldn't confidently fill itself — everything it knows about it, sent as
+    plain data (no DOM handle) to `POST /automation/map-fields`."""
+
+    question_text: str
+    field_type: str | None = None  # "text"/"textarea"/"select"/"radio"/"checkbox"/"date"/"number"
+    options: list[str] | None = None  # the field's real, visible choices, if any
+
+
+class FieldMapRequest(BaseModel):
+    application_id: str
+    job_description: str | None = None
+    page_number: int | None = None
+    fields: list[FieldQuery]
+
+
+class FieldMapResult(BaseModel):
+    """One field's answer — mirrors `ApplicationQuestionResponse`'s
+    confidence semantics exactly (same HIGH/MEDIUM/LOW buckets, same
+    thresholds `decide_action` uses) since both paths write to the same
+    `application_questions` ledger via the same `ApplicationAnswerEngine`."""
+
+    question_text: str
+    answer: str
+    confidence: float
+    confidence_level: str
+    source: str
+
+
+class ReportStatusRequest(BaseModel):
+    """`POST /applications/{id}/report-status` — the extension's own status
+    self-reports (waiting on a human for a CAPTCHA, or a final outcome after
+    the human clicked submit on the real page). `status` must be one of
+    `VALID_APPLICATION_STATUSES`."""
+
+    status: str
+    reason: str | None = None
+    confidence: float | None = None

@@ -61,6 +61,11 @@ def ensure_vector_schema() -> None:
             "autopilot_globally_disabled BOOLEAN NOT NULL DEFAULT FALSE"
         ))
         conn.execute(text("ALTER TABLE applications ADD COLUMN IF NOT EXISTS pages_completed INTEGER"))
+        # Browser-extension delivery — see Application.source.
+        conn.execute(text(
+            "ALTER TABLE applications ADD COLUMN IF NOT EXISTS "
+            "source VARCHAR NOT NULL DEFAULT 'server_automation'"
+        ))
         conn.execute(text("ALTER TABLE automation_runs ADD COLUMN IF NOT EXISTS log_lines JSONB"))
         conn.execute(text(
             f"ALTER TABLE answer_cache ADD COLUMN IF NOT EXISTS embedding_vector vector({EMBEDDING_DIM})"
