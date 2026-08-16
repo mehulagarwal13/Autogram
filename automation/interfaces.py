@@ -287,6 +287,20 @@ class ApplicationRunResult:
     screenshot_paths: list[str] = field(default_factory=list)
     trace_path: str | None = None
     error_log: str | None = None
+    # HITL platform: how many pages of a multi-page application this run
+    # actually processed — see `Application.pages_completed`.
+    pages_completed: int | None = None
+    # HITL platform (§18 Observability): this run's structured progress log,
+    # captured by a per-run logging handler — see `AutomationRun.log_lines`.
+    log_lines: list[dict] = field(default_factory=list)
+    # "Apply from Job Link": best-effort (title, company) read off the job
+    # posting page itself — see
+    # `automation/browser/selectors.py::find_job_posting_title_and_company`.
+    # `app/services/application_repository.py::apply_run_result` fills
+    # `Application.company`/`.position` from these ONLY when the caller
+    # didn't already supply one, never overwriting an explicit hint.
+    detected_company: str | None = None
+    detected_position: str | None = None
 
 
 class LLMCallable(Protocol):

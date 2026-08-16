@@ -11,7 +11,16 @@ from unittest.mock import MagicMock, patch
 import pytest
 from fastapi import BackgroundTasks, HTTPException, Response
 
-from app.api.applications import _pick_resume_document_id, start_application
+from app.api.applications import (
+    _pick_resume_document_id,
+    approve_application,
+    check_duplicate_application,
+    get_applications_overview,
+    list_applications_needing_review,
+    reject_application,
+    review_application_question,
+    start_application,
+)
 
 
 def test_pick_resume_document_id_uses_explicit_override_when_it_belongs_to_the_profile():
@@ -377,3 +386,201 @@ def test_run_application_still_runs_when_building_the_answer_engine_fails(monkey
     applications_module._run_application("app-1", "doc-1")  # must not raise
 
     assert captured["manager_kwargs"]["answer_engine"] is None
+
+
+# ---------------------------------------------------------------------------
+# HITL platform — dashboard, review queue, duplicate check, question review,
+# approve/reject. Every collaborator is monkeypatched; no live DB/browser.
+# ---------------------------------------------------------------------------
+
+def test_get_applications_overview_delegates_to_the_repository(monkeypatch):
+    import app.api.applications as applications_module
+
+    fake_counts = {"total": 3, "submitted": 1, "in_progress": 1, "waiting_for_human": 0, "waiting_for_review": 1, "failed": 0, "cancelled": 0}
+    monkeypatch.setattr(applications_module.application_repository, "get_overview_counts", lambda db, uid: fake_counts)
+
+    result = get_applications_overview(user=MagicMock(user_id="user-1"), db=MagicMock())
+
+    assert result == fake_counts
+
+
+def test_list_applications_needing_review_delegates_to_the_repository(monkeypatch):
+    import app.api.applications as applications_module
+
+    fake_apps = [MagicMock(), MagicMock()]
+    monkeypatch.setattr(applications_module.application_repository, "list_reviews_for_user", lambda db, uid: fake_apps)
+
+    result = list_applications_needing_review(user=MagicMock(user_id="user-1"), db=MagicMock())
+
+    assert result is fake_apps
+
+
+def test_check_duplicate_application_reports_no_duplicate_when_none_found(monkeypatch):
+    import app.api.applications as applications_module
+
+    monkeypatch.setattr(applications_module.application_repository, "find_possible_duplicate", lambda *a, **kw: None)
+
+    result = check_duplicate_application(company="Acme", position="Engineer", user=MagicMock(user_id="user-1"), db=MagicMock())
+
+    assert result.possible_duplicate is False
+    assert result.existing_application_id is None
+
+
+def test_check_duplicate_application_reports_the_existing_attempt(monkeypatch):
+    import app.api.applications as applications_module
+
+    fake_existing = MagicMock(application_id="app-1", status="needs_review")
+    monkeypatch.setattr(applications_module.application_repository, "find_possible_duplicate", lambda *a, **kw: fake_existing)
+
+    result = check_duplicate_application(company="Acme", position="Engineer", user=MagicMock(user_id="user-1"), db=MagicMock())
+
+    assert result.possible_duplicate is True
+    assert result.existing_application_id == "app-1"
+    assert result.existing_status == "needs_review"
+
+
+def _owned_application(monkeypatch, **overrides):
+    """Patches `application_repository.get_by_id` so `_get_owned_application`
+    resolves to a fake row owned by `user-1` — the shared setup every
+    ownership-checked HITL route below needs."""
+    import app.api.applications as applications_module
+
+    defaults = dict(application_id="app-1", user_id="user-1", status="copilot_review")
+    defaults.update(overrides)
+    fake_application = MagicMock(**defaults)
+    monkeypatch.setattr(applications_module.application_repository, "get_by_id", lambda db, aid: fake_application)
+    return fake_application
+
+
+def test_review_question_404s_when_the_question_does_not_belong_to_this_application(monkeypatch):
+    import app.api.applications as applications_module
+    from app.models.application import QuestionReviewRequest
+
+    _owned_application(monkeypatch)
+    other_apps_question = MagicMock(application_id="some-other-app")
+    monkeypatch.setattr(applications_module.application_question_repository, "get", lambda db, qid: other_apps_question)
+
+    with pytest.raises(HTTPException) as exc_info:
+        review_application_question(
+            "app-1", "q-1", QuestionReviewRequest(action="approve"),
+            user=MagicMock(user_id="user-1"), db=MagicMock(),
+        )
+    assert exc_info.value.status_code == 404
+
+
+def test_review_question_approve_caches_the_answer_for_future_applications(monkeypatch):
+    import app.api.applications as applications_module
+    from app.models.application import QuestionReviewRequest
+
+    application = _owned_application(monkeypatch)
+    fake_question = MagicMock(application_id="app-1", question_text="Notice period?", answer="30 days", human_answer=None)
+    monkeypatch.setattr(applications_module.application_question_repository, "get", lambda db, qid: fake_question)
+    monkeypatch.setattr(applications_module.application_question_repository, "apply_review", lambda db, q, **kw: fake_question)
+    save_calls = []
+    monkeypatch.setattr(
+        applications_module.answer_cache_repository, "save_answer",
+        lambda db, uid, text, **kw: save_calls.append((uid, text, kw)),
+    )
+
+    result = review_application_question(
+        "app-1", "q-1", QuestionReviewRequest(action="approve"),
+        user=MagicMock(user_id="user-1"), db=MagicMock(),
+    )
+
+    assert result is fake_question
+    assert len(save_calls) == 1
+    assert save_calls[0][0] == "user-1"
+    assert save_calls[0][1] == "Notice period?"
+    assert save_calls[0][2]["answer"] == "30 days"
+
+
+def test_review_question_reject_never_touches_the_answer_cache(monkeypatch):
+    import app.api.applications as applications_module
+    from app.models.application import QuestionReviewRequest
+
+    _owned_application(monkeypatch)
+    fake_question = MagicMock(application_id="app-1", answer=None, human_answer=None)
+    monkeypatch.setattr(applications_module.application_question_repository, "get", lambda db, qid: fake_question)
+    monkeypatch.setattr(applications_module.application_question_repository, "apply_review", lambda db, q, **kw: fake_question)
+    save_calls = []
+    monkeypatch.setattr(
+        applications_module.answer_cache_repository, "save_answer",
+        lambda db, uid, text, **kw: save_calls.append((uid, text, kw)),
+    )
+
+    review_application_question(
+        "app-1", "q-1", QuestionReviewRequest(action="reject"),
+        user=MagicMock(user_id="user-1"), db=MagicMock(),
+    )
+
+    assert save_calls == []
+
+
+def test_approve_application_requires_copilot_review_status(monkeypatch):
+    _owned_application(monkeypatch, status="processing")
+
+    with pytest.raises(HTTPException) as exc_info:
+        approve_application("app-1", user=MagicMock(user_id="user-1"), db=MagicMock())
+    assert exc_info.value.status_code == 409
+
+
+def test_approve_application_404s_when_no_review_session_is_open(monkeypatch):
+    import app.api.applications as applications_module
+
+    _owned_application(monkeypatch, status="copilot_review")
+    monkeypatch.setattr(applications_module, "submit_open_review_session", lambda aid: None)
+
+    with pytest.raises(HTTPException) as exc_info:
+        approve_application("app-1", user=MagicMock(user_id="user-1"), db=MagicMock())
+    assert exc_info.value.status_code == 409
+
+
+def test_approve_application_persists_a_confirmed_submission(monkeypatch):
+    import app.api.applications as applications_module
+
+    application = _owned_application(monkeypatch, status="copilot_review")
+    monkeypatch.setattr(applications_module, "submit_open_review_session", lambda aid: ("applied", None))
+    monkeypatch.setattr(applications_module, "_record_audit_event", lambda *a, **kw: None)
+
+    result = approve_application("app-1", user=MagicMock(user_id="user-1"), db=MagicMock())
+
+    assert result.status == "applied"
+    assert application.status == "applied"
+    assert application.applied_date is not None
+    assert application.failure_reason is None
+
+
+def test_approve_application_persists_an_unconfirmed_submission_as_needs_review(monkeypatch):
+    import app.api.applications as applications_module
+
+    application = _owned_application(monkeypatch, status="copilot_review")
+    monkeypatch.setattr(
+        applications_module, "submit_open_review_session",
+        lambda aid: ("needs_review", "Submit was clicked but no confirmation could be detected."),
+    )
+    monkeypatch.setattr(applications_module, "_record_audit_event", lambda *a, **kw: None)
+
+    result = approve_application("app-1", user=MagicMock(user_id="user-1"), db=MagicMock())
+
+    assert result.status == "needs_review"
+    assert application.status == "needs_review"
+    assert application.failure_reason is not None
+
+
+def test_reject_application_closes_the_review_session_and_cancels(monkeypatch):
+    import app.api.applications as applications_module
+
+    application = _owned_application(monkeypatch, status="copilot_review")
+    close_calls = []
+    monkeypatch.setattr(applications_module, "close_review_session", lambda aid: close_calls.append(aid))
+    monkeypatch.setattr(
+        applications_module.application_repository, "mark_cancelled",
+        lambda db, app, reason=None: (setattr(app, "status", "cancelled"), setattr(app, "failure_reason", reason), app)[-1],
+    )
+    monkeypatch.setattr(applications_module, "_record_audit_event", lambda *a, **kw: None)
+
+    result = reject_application("app-1", reason="Changed my mind", user=MagicMock(user_id="user-1"), db=MagicMock())
+
+    assert close_calls == ["app-1"]
+    assert result.status == "cancelled"
+    assert result.failure_reason == "Changed my mind"

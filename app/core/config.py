@@ -100,6 +100,12 @@ AUTOMATION_LOGS_DIR = os.getenv("AUTOMATION_LOGS_DIR", "logs")
 # capped at vision_fallback.MAX_FIELDS_PER_CALL), so a deployment watching cost
 # may reasonably want it off.
 AUTOMATION_VISION_FALLBACK = os.getenv("AUTOMATION_VISION_FALLBACK", "true").strip().lower() != "false"
+# HITL platform: how long ApplicationFlowManager waits, polling, for a human
+# to clear a detected CAPTCHA/human-gate before giving up and falling back to
+# manual_required (see application_flow_manager.py's "wait-and-resume"). Long
+# enough for someone who's actually watching to solve a CAPTCHA; short enough
+# that an unattended run doesn't tie up a browser/thread indefinitely.
+AUTOMATION_HUMAN_WAIT_TIMEOUT_S = float(os.getenv("AUTOMATION_HUMAN_WAIT_TIMEOUT_S", "600"))
 
 # --- Object storage (Phase 2 hardening — see PHASE2_ARCHITECTURE.md Initiative 4) ---
 # "local" (default) keeps today's on-disk behavior under storage/. "s3" routes

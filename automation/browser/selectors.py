@@ -11,6 +11,7 @@ file only holds patterns generic enough to be useful across ATS platforms.
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 
@@ -360,6 +361,122 @@ def find_submit_button(page: Page) -> Locator | None:
     """Returns the page's final submit control (see
     `SUBMIT_BUTTON_TEXT_CANDIDATES`), or `None` if none is found."""
     return _find_button_by_text(page, SUBMIT_BUTTON_TEXT_CANDIDATES)
+
+
+# --- "Apply from Job Link": entering an application from a job LISTING page --
+# A pasted job URL is often a job DESCRIPTION page (a company careers page, an
+# aggregator listing) that sits in front of the real application form —
+# reached only by clicking its own "Apply"/"Apply Now"/"Start Application"
+# control. Distinct from `find_submit_button` above: that one finds the FINAL
+# control on an already-open application FORM (`SUBMIT_BUTTON_TEXT_CANDIDATES`
+# even includes the bare word "Apply" for that reason — some ATS's last button
+# literally says "Apply"). This one finds the ENTRY control on a page that has
+# no form fields yet. The two are never searched for on the same page in the
+# same call, so the text overlap between them causes no ambiguity in practice.
+#
+# More specific phrases first — same ordering rule `NEXT_BUTTON_TEXT_CANDIDATES`
+# uses, since `_find_button_by_text`'s loose (substring) tier stops at the
+# first candidate that matches anything, and a bare "Apply" would otherwise
+# take priority over the page's own more specific wording.
+APPLY_ENTRY_BUTTON_TEXT_CANDIDATES = [
+    "Apply Now", "Apply for this Job", "Apply for this job", "Apply for this Position",
+    "Apply for this position", "Start Application", "Start Your Application",
+    "Begin Application", "Apply Online", "Apply Today", "Apply",
+]
+
+
+def find_apply_entry_button(page: Page) -> Locator | None:
+    """The "Apply"/"Apply Now"/"Start Application" control on a job LISTING
+    page — the first click of an "Apply from Job Link" run, before any ATS
+    has even been identified. `None` if this doesn't look like a listing page
+    at all (already an application form, or neither)."""
+    return _find_button_by_text(page, APPLY_ENTRY_BUTTON_TEXT_CANDIDATES)
+
+
+# --- Job posting metadata: title/company, for a pasted link with no hints ---
+# Read-only, best-effort, and NEVER a guess: only structured signals a real
+# posting itself publishes are used, in order of reliability. A field that
+# can't be confidently read stays `None` — the same "never fabricate personal
+# facts" discipline the answer engine applies, extended to job metadata.
+_JOB_POSTING_JSONLD_SELECTOR = 'script[type="application/ld+json"]'
+_MAX_JSONLD_SCRIPTS_CHECKED = 10
+
+
+def _job_posting_from_json_ld(page: Page) -> tuple[str | None, str | None]:
+    """Tier 1: schema.org `JobPosting` structured data
+    (https://schema.org/JobPosting) — the same markup Google for Jobs relies
+    on, and the single most reliable signal since it's machine-readable by
+    design. Most real ATS/job-board postings (Greenhouse, Lever, Workday,
+    LinkedIn, Indeed, and most company careers pages) emit it purely for SEO."""
+    try:
+        scripts = page.locator(_JOB_POSTING_JSONLD_SELECTOR).all()
+    except PlaywrightError:
+        return None, None
+
+    for node in scripts[:_MAX_JSONLD_SCRIPTS_CHECKED]:
+        try:
+            raw = node.text_content(timeout=1_000) or ""
+        except PlaywrightError:
+            continue
+        try:
+            data = json.loads(raw)
+        except (ValueError, TypeError):
+            continue
+
+        candidates = data if isinstance(data, list) else [data]
+        for entry in candidates:
+            if not isinstance(entry, dict):
+                continue
+            entry_type = entry.get("@type")
+            types = entry_type if isinstance(entry_type, list) else [entry_type]
+            if not any(str(t).lower() == "jobposting" for t in types if t):
+                continue
+            title = entry.get("title")
+            org = entry.get("hiringOrganization")
+            company = org.get("name") if isinstance(org, dict) else org
+            title = title.strip() if isinstance(title, str) and title.strip() else None
+            company = company.strip() if isinstance(company, str) and company.strip() else None
+            if title or company:
+                return title, company
+
+    return None, None
+
+
+def _job_posting_from_open_graph(page: Page) -> tuple[str | None, str | None]:
+    """Tier 2: Open Graph meta tags (`og:title`/`og:site_name`) — a common
+    fallback for pages without JobPosting structured data, though less
+    reliable (`og:title` is often the page's marketing title, not
+    necessarily the exact role name, and `og:site_name` is the SITE's brand,
+    which usually but not always matches the hiring company)."""
+    title = company = None
+    try:
+        title_meta = page.locator('meta[property="og:title"]').first
+        if title_meta.count() > 0:
+            title = (title_meta.get_attribute("content") or "").strip() or None
+    except PlaywrightError:
+        pass
+    try:
+        site_meta = page.locator('meta[property="og:site_name"]').first
+        if site_meta.count() > 0:
+            company = (site_meta.get_attribute("content") or "").strip() or None
+    except PlaywrightError:
+        pass
+    return title, company
+
+
+def find_job_posting_title_and_company(page: Page) -> tuple[str | None, str | None]:
+    """Best-effort `(title, company)` for whatever job posting `page` shows —
+    used to fill in `Application.company`/`.position` when the caller pasted
+    a bare job URL with no hints of its own (§"Apply from Job Link"). Tries
+    schema.org JobPosting data first, then Open Graph tags; returns
+    `(None, None)` fields it can't confidently read rather than ever
+    guessing one from the page's plain `<title>` (too unreliable — company
+    names in a browser tab title are inconsistently formatted across sites)."""
+    title, company = _job_posting_from_json_ld(page)
+    if title and company:
+        return title, company
+    fallback_title, fallback_company = _job_posting_from_open_graph(page)
+    return title or fallback_title, company or fallback_company
 
 
 def find_file_upload_input(page: Page, *, prefer_hints: list[str] = RESUME_FILE_INPUT_HINTS) -> Locator | None:

@@ -31,6 +31,8 @@ from app.models.db_models import (
     VALID_VETERAN_STATUS_VALUES,
 )
 from app.models.profile import (
+    AutomationSettingsRequest,
+    AutomationSettingsResponse,
     DemographicsRequest,
     DemographicsResponse,
     DocumentResponse,
@@ -347,6 +349,22 @@ def set_skills(
     profile = _get_owned_profile(db, user)
     profile = repo.update_skills(db, profile, body.model_dump())
     return ProfileResponse(**repo.profile_to_dict(profile))
+
+
+# ---------- automation settings (HITL platform) ----------
+
+@router.put("/automation-settings", response_model=AutomationSettingsResponse)
+def update_automation_settings(
+    body: AutomationSettingsRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """The account-level autopilot kill switch: when `autopilot_globally_disabled`
+    is `True`, every autopilot run for this user hard-stops (checked fresh from
+    the DB at the top of every page in `ApplicationFlowManager`'s loop, fail
+    closed) regardless of any per-application `autopilot_enabled` flag."""
+    profile = _get_owned_profile(db, user)
+    return repo.update_automation_settings(db, profile, autopilot_globally_disabled=body.autopilot_globally_disabled)
 
 
 # ---------- documents ----------

@@ -70,6 +70,7 @@ def profile_to_dict(profile: CandidateProfile) -> dict:
         "phone": decrypt_field(profile.phone_encrypted),
         "address": decrypt_field(profile.address_encrypted),
         "skills": profile.skills,
+        "autopilot_globally_disabled": profile.autopilot_globally_disabled,
         "created_at": profile.created_at,
         "updated_at": profile.updated_at,
     }
@@ -95,6 +96,19 @@ def create_profile(db: Session, user_id: str, data: dict) -> CandidateProfile:
 
 def update_profile(db: Session, profile: CandidateProfile, data: dict) -> CandidateProfile:
     _apply_profile_fields(profile, data)
+    profile.updated_at = datetime.now(timezone.utc)
+    db.commit()
+    db.refresh(profile)
+    return profile
+
+
+def update_automation_settings(db: Session, profile: CandidateProfile, *, autopilot_globally_disabled: bool) -> CandidateProfile:
+    """The account-level autopilot kill switch (PHASE2_ARCHITECTURE.md
+    Initiative 3) — deliberately its own function, not folded into
+    `update_profile`/`_apply_profile_fields`, so it can never be flipped as a
+    side effect of an unrelated `PATCH /profile` call. The only write path is
+    `PUT /profile/automation-settings`."""
+    profile.autopilot_globally_disabled = autopilot_globally_disabled
     profile.updated_at = datetime.now(timezone.utc)
     db.commit()
     db.refresh(profile)

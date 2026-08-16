@@ -49,4 +49,26 @@ def ensure_vector_schema() -> None:
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_resumes_user_id ON resumes (user_id)"))
         conn.execute(text("DROP INDEX IF EXISTS ix_resumes_file_hash"))
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_resumes_file_hash ON resumes (file_hash)"))
-    logger.info("vector columns, HNSW index, dedup_key, and user ownership columns ready")
+
+        # HITL platform — additive columns on pre-existing tables. `create_all`
+        # only creates missing TABLES, never alters an existing one, so every
+        # one of these needs the same idempotent ALTER ... ADD COLUMN IF NOT
+        # EXISTS pattern as the columns above (the two brand-new tables,
+        # application_questions/application_audit_log, need no such statement
+        # here — create_all already creates a table that doesn't exist yet).
+        conn.execute(text(
+            "ALTER TABLE candidate_profiles ADD COLUMN IF NOT EXISTS "
+            "autopilot_globally_disabled BOOLEAN NOT NULL DEFAULT FALSE"
+        ))
+        conn.execute(text("ALTER TABLE applications ADD COLUMN IF NOT EXISTS pages_completed INTEGER"))
+        conn.execute(text("ALTER TABLE automation_runs ADD COLUMN IF NOT EXISTS log_lines JSONB"))
+        conn.execute(text(
+            f"ALTER TABLE answer_cache ADD COLUMN IF NOT EXISTS embedding_vector vector({EMBEDDING_DIM})"
+        ))
+        conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_answer_cache_embedding_vector_hnsw "
+            "ON answer_cache USING hnsw (embedding_vector vector_cosine_ops)"
+        ))
+    logger.info(
+        "vector columns, HNSW indexes, dedup_key, user ownership, and HITL platform columns ready"
+    )

@@ -62,6 +62,8 @@ from automation.applications.application_flow_manager import (
     decide_action,
     list_open_review_sessions,
     should_keep_browser_open,
+    submit_and_confirm,
+    submit_open_review_session,
 )
 
 
@@ -189,8 +191,11 @@ def test_finish_browser_session_closes_and_does_not_register_for_non_review_stat
 
 
 def test_close_review_session_closes_and_forgets_a_registered_browser():
+    # (BrowserManager, adapter, page) — see `submit_open_review_session`'s
+    # docstring for why the adapter/page ride alongside the browser manager;
+    # `None`/`None` here since this test only exercises closing the session.
     fake_browser_manager = MagicMock()
-    _OPEN_REVIEW_SESSIONS["app-registry-manual-close"] = fake_browser_manager
+    _OPEN_REVIEW_SESSIONS["app-registry-manual-close"] = (fake_browser_manager, None, None)
 
     try:
         assert close_review_session("app-registry-manual-close") is True
@@ -202,6 +207,61 @@ def test_close_review_session_closes_and_forgets_a_registered_browser():
 
 def test_close_review_session_returns_false_when_nothing_is_open():
     assert close_review_session("no-such-application-id") is False
+
+
+def test_submit_open_review_session_replays_submit_against_the_open_page(monkeypatch):
+    """`POST /applications/{id}/approve`'s mechanism: replays a submit click
+    against the kept-open (adapter, page) from a `copilot_review` run, via the
+    SAME confirmation logic `submit_and_confirm` uses for AUTO_SUBMIT — so a
+    human-approved copilot submission and an autopilot one can never disagree
+    about what counts as confirmed."""
+    fake_adapter = MagicMock()
+    fake_adapter.submit_application.return_value = True
+    fake_page = MagicMock()
+    fake_browser_manager = MagicMock()
+    _OPEN_REVIEW_SESSIONS["app-approve-1"] = (fake_browser_manager, fake_adapter, fake_page)
+    monkeypatch.setattr(
+        "automation.applications.application_flow_manager.wait_for_submission_confirmation",
+        lambda page: "success banner",
+    )
+
+    try:
+        outcome = submit_open_review_session("app-approve-1")
+        assert outcome == ("applied", None)
+        fake_adapter.submit_application.assert_called_once()
+        # The session is closed and forgotten either way — there is nothing
+        # left to approve a second time.
+        assert "app-approve-1" not in list_open_review_sessions()
+        fake_browser_manager.close.assert_called_once()
+    finally:
+        _OPEN_REVIEW_SESSIONS.pop("app-approve-1", None)
+
+
+def test_submit_open_review_session_reports_unconfirmed_without_claiming_applied(monkeypatch):
+    fake_adapter = MagicMock()
+    fake_adapter.submit_application.return_value = True
+    fake_page = MagicMock()
+    fake_browser_manager = MagicMock()
+    _OPEN_REVIEW_SESSIONS["app-approve-2"] = (fake_browser_manager, fake_adapter, fake_page)
+    monkeypatch.setattr(
+        "automation.applications.application_flow_manager.wait_for_submission_confirmation",
+        lambda page: None,
+    )
+    monkeypatch.setattr(
+        "automation.applications.application_flow_manager.find_validation_errors",
+        lambda page: [],
+    )
+
+    try:
+        status, error = submit_open_review_session("app-approve-2")
+        assert status == "needs_review"
+        assert error is not None
+    finally:
+        _OPEN_REVIEW_SESSIONS.pop("app-approve-2", None)
+
+
+def test_submit_open_review_session_returns_none_when_nothing_is_open():
+    assert submit_open_review_session("no-such-application-id") is None
 
 
 def test_decide_action_copilot_review_in_the_middle_band():
@@ -415,7 +475,16 @@ def test_run_holds_for_copilot_review_when_autopilot_is_off(requires_chromium, t
     assert "decision_copilot_review" in manager.steps_completed
 
 
-def test_run_stops_before_filling_anything_when_captcha_is_present(requires_chromium, tmp_path):
+def test_run_fills_the_page_before_checking_for_captcha_and_then_waits(requires_chromium, tmp_path):
+    """CAPTCHA is checked LAST on each page, after everything fillable has
+    been attempted — a CAPTCHA widget on a real ATS form typically gates
+    SUBMISSION, not the fields, so automation fills in what it can first and
+    only then asks a human to clear the CAPTCHA. A CAPTCHA that never clears
+    still ends in `manual_required` (per the HITL wait-and-poll contract —
+    see `ApplicationFlowManager._wait_for_human`), same as before this
+    reordering; the difference is that filling was genuinely attempted first.
+    `human_wait_timeout_s=0` keeps this test fast — the fixture's static HTML
+    never resolves the CAPTCHA no matter how long a real run would wait."""
     adapter_cls = _make_fake_adapter_cls(_HIGH_CONFIDENCE_RESULTS)
     manager = ApplicationFlowManager(
         application_id="app-captcha-1",
@@ -427,15 +496,260 @@ def test_run_stops_before_filling_anything_when_captcha_is_present(requires_chro
         resume_document=_resume_document(tmp_path / "resume.pdf"),
         browser_manager=_isolated_browser_manager(tmp_path),
         autopilot_enabled=True,
+        human_wait_timeout_s=0,
     )
 
     result = manager.run()
 
     assert result.status == "manual_required"
     assert result.confidence == 0.0
+    # Filling was genuinely attempted before the CAPTCHA ever blocked anything.
+    assert adapter_cls.calls["fill_personal_information"] >= 1
+    assert adapter_cls.calls["upload_resume"] >= 1
+    assert "captcha_detected" in manager.steps_completed
+    assert "waiting_for_human" in manager.steps_completed
+    # Order matters: the fill-related checkpoints must come BEFORE the
+    # CAPTCHA ones, not after — that's the whole point of this reordering.
+    fill_index = manager.steps_completed.index("step_0_filled")
+    captcha_index = manager.steps_completed.index("captcha_detected")
+    assert fill_index < captcha_index
+
+
+_CAPTCHA_CLEARS_HTML = (
+    "data:text/html,<html><body>"
+    "<div id='captcha' class='g-recaptcha' style='width:304px;height:78px'></div>"
+    "<p>Verify you're human.</p>"
+    "<script>setTimeout(() => { document.getElementById('captcha').remove(); }, 2000);</script>"
+    "</body></html>"
+)
+
+
+def test_run_resumes_automatically_once_a_captcha_clears(requires_chromium, tmp_path):
+    """The core HITL contract (§5/§10 of the platform spec): detect -> wait ->
+    if the gate clears within the timeout, resume the SAME run rather than
+    stopping — never a restart, never a second browser. The fixture's CAPTCHA
+    removes itself 2s after load (standing in for a human solving it), which
+    the first poll (`HUMAN_WAIT_POLL_INTERVAL_S` later) picks up. Real
+    wall-clock cost here is one poll interval — small and worth paying for an
+    end-to-end assertion that resuming actually works, not just that timing
+    out does."""
+    adapter_cls = _make_fake_adapter_cls(_HIGH_CONFIDENCE_RESULTS)
+    manager = ApplicationFlowManager(
+        application_id="app-captcha-clears-1",
+        user_id="user-1",
+        job_url=_CAPTCHA_CLEARS_HTML,
+        ats_platform="greenhouse",
+        adapter_cls=adapter_cls,
+        profile=_profile(),
+        resume_document=_resume_document(tmp_path / "resume.pdf"),
+        browser_manager=_isolated_browser_manager(tmp_path),
+        autopilot_enabled=True,
+    )
+
+    result = manager.run()
+
+    assert result.status != "manual_required"
+    assert "captcha_detected" in manager.steps_completed
+    assert "waiting_for_human" in manager.steps_completed
+    assert "human_verification_completed" in manager.steps_completed
+    # The run actually continued and filled the page — not just noticed the
+    # gate cleared and gave up anyway.
+    assert adapter_cls.calls["fill_personal_information"] >= 1
+
+
+def test_kill_switch_engaged_stops_the_run_before_the_first_page(requires_chromium, tmp_path):
+    """PHASE2_ARCHITECTURE.md Initiative 3's belt-and-suspenders backstop:
+    checked fresh at the top of every page, so an account-level kill switch
+    stops a run even though nothing about THIS application's own
+    `autopilot_enabled` flag changed."""
+    adapter_cls = _make_fake_adapter_cls(_HIGH_CONFIDENCE_RESULTS)
+    manager = ApplicationFlowManager(
+        application_id="app-kill-switch-1",
+        user_id="user-1",
+        job_url=_NO_CAPTCHA_NO_NEXT_HTML,
+        ats_platform="greenhouse",
+        adapter_cls=adapter_cls,
+        profile=_profile(),
+        resume_document=_resume_document(tmp_path / "resume.pdf"),
+        browser_manager=_isolated_browser_manager(tmp_path),
+        autopilot_enabled=True,
+        is_kill_switch_engaged=lambda: True,
+    )
+
+    result = manager.run()
+
+    assert result.status == "manual_required"
     assert adapter_cls.calls["fill_personal_information"] == 0
-    assert adapter_cls.calls["upload_resume"] == 0
-    assert manager.steps_completed == ["navigated", "captcha_detected"]
+    assert "kill_switch_engaged" in manager.steps_completed
+
+
+def test_kill_switch_check_that_raises_fails_closed(requires_chromium, tmp_path):
+    """The explicit product requirement (Initiative 3 §8): never auto-submit
+    without permission. A broken kill-switch check (DB unreachable, etc.) must
+    be treated as engaged, never as "assume disabled"."""
+    def _broken_check():
+        raise RuntimeError("DB unreachable")
+
+    adapter_cls = _make_fake_adapter_cls(_HIGH_CONFIDENCE_RESULTS)
+    manager = ApplicationFlowManager(
+        application_id="app-kill-switch-2",
+        user_id="user-1",
+        job_url=_NO_CAPTCHA_NO_NEXT_HTML,
+        ats_platform="greenhouse",
+        adapter_cls=adapter_cls,
+        profile=_profile(),
+        resume_document=_resume_document(tmp_path / "resume.pdf"),
+        browser_manager=_isolated_browser_manager(tmp_path),
+        autopilot_enabled=True,
+        is_kill_switch_engaged=_broken_check,
+    )
+
+    result = manager.run()
+
+    assert result.status == "manual_required"
+    assert adapter_cls.calls["fill_personal_information"] == 0
+
+
+_LISTING_PAGE_NO_APPLY_HTML = "data:text/html,<html><body><p>Just a plain description page.</p></body></html>"
+_LISTING_PAGE_DOM_FINGERPRINT_HTML = "data:text/html,<html><body><div id='grnhse_app'></div></body></html>"
+_LISTING_PAGE_WITH_APPLY_BUTTON_HTML = (
+    "data:text/html,<html><body>"
+    "<h1>Software Engineer</h1>"
+    "<button id='apply'>Apply Now</button>"
+    "<script>document.getElementById('apply').addEventListener('click', function () {"
+    "  var d = document.createElement('div'); d.id = 'grnhse_app'; document.body.appendChild(d);"
+    "  document.title = 'Application Form';"
+    "});</script>"
+    "</body></html>"
+)
+
+
+def _manager_for_listing_page(tmp_path, job_url, **overrides) -> ApplicationFlowManager:
+    """"Apply from Job Link" tests: `adapter_cls=None`/`ats_platform="custom"`
+    is exactly what pre-flight detection hands the flow manager when a pasted
+    URL doesn't match any known ATS by itself — see
+    `app/api/applications.py::_run_application`."""
+    defaults = dict(
+        application_id="app-listing-1", user_id="user-1", job_url=job_url,
+        ats_platform="custom", adapter_cls=None,
+        profile=_profile(), resume_document=_resume_document(tmp_path / "resume.pdf"),
+        browser_manager=_isolated_browser_manager(tmp_path),
+    )
+    defaults.update(overrides)
+    return ApplicationFlowManager(**defaults)
+
+
+class TestApplyFromJobLink:
+    """"Apply from Job Link": a pasted URL that pre-flight detection couldn't
+    identify at all (`ats_platform == "custom"`, `adapter_cls=None`) might be
+    a job LISTING page in front of a supported ATS, not itself unsupported —
+    see `ApplicationFlowManager._resolve_adapter_from_listing_page`. Uses the
+    same "each test launches its own real, isolated Playwright browser via
+    BrowserManager" pattern as the rest of this file (never the shared
+    `browser`/`page` fixture — see this module's docstring)."""
+
+    def test_detects_a_supported_ats_directly_from_the_dom_with_no_click_needed(self, requires_chromium, tmp_path):
+        manager = _manager_for_listing_page(tmp_path, _LISTING_PAGE_DOM_FINGERPRINT_HTML)
+        manager.browser_manager.launch_context()
+        page = manager.browser_manager.new_page()
+        try:
+            page.goto(_LISTING_PAGE_DOM_FINGERPRINT_HTML)
+            resolved = manager._resolve_adapter_from_listing_page(page)
+            assert resolved is not None
+            adapter_cls, resolved_page = resolved
+            assert adapter_cls.name == "greenhouse"
+            assert manager.ats_platform == "greenhouse"
+            assert "ats_detected_on_live_page" in manager.steps_completed
+        finally:
+            manager.browser_manager.close()
+
+    def test_clicks_the_apply_button_and_detects_the_resulting_form(self, requires_chromium, tmp_path):
+        manager = _manager_for_listing_page(tmp_path, _LISTING_PAGE_WITH_APPLY_BUTTON_HTML)
+        manager.browser_manager.launch_context()
+        page = manager.browser_manager.new_page()
+        try:
+            page.goto(_LISTING_PAGE_WITH_APPLY_BUTTON_HTML)
+            resolved = manager._resolve_adapter_from_listing_page(page)
+            assert resolved is not None
+            adapter_cls, resolved_page = resolved
+            assert adapter_cls.name == "greenhouse"
+            assert "apply_entry_button_clicked" in manager.steps_completed
+            assert "ats_detected_after_apply_click" in manager.steps_completed
+        finally:
+            manager.browser_manager.close()
+
+    def test_clicks_an_apply_button_that_opens_a_new_tab(self, requires_chromium, tmp_path):
+        """Many real postings' Apply links use `target="_blank"` — the click
+        opens a NEW TAB rather than navigating in place. The resolved page
+        must be the NEW tab (not the original, now-stale listing page), and
+        it must be handed to `BrowserManager` for cleanup (`adopt_page`).
+
+        Opens the new tab via `window.open('about:blank')` + `document.write`
+        rather than an `<a target="_blank" href="data:...">` — Chromium
+        blocks top-level navigation to a `data:` URL triggered by a link
+        click as a security measure, which would make this test fail on a
+        Chrome restriction rather than on anything this code actually does."""
+        listing_html = (
+            "data:text/html,<html><body>"
+            "<button id='apply'>Apply Now</button>"
+            "<script>document.getElementById('apply').addEventListener('click', function () {"
+            "  var w = window.open('about:blank', '_blank');"
+            "  w.document.write('<div id=\\'grnhse_app\\'></div>');"
+            "  w.document.close();"
+            "});</script>"
+            "</body></html>"
+        )
+        manager = _manager_for_listing_page(tmp_path, listing_html)
+        manager.browser_manager.launch_context()
+        page = manager.browser_manager.new_page()
+        try:
+            page.goto(listing_html)
+            pages_before = len(manager.browser_manager._pages)
+
+            resolved = manager._resolve_adapter_from_listing_page(page)
+
+            assert resolved is not None
+            adapter_cls, resolved_page = resolved
+            assert adapter_cls.name == "greenhouse"
+            assert resolved_page is not page  # the NEW tab, not the original
+            assert len(manager.browser_manager._pages) == pages_before + 1  # adopted for cleanup
+        finally:
+            manager.browser_manager.close()
+
+    def test_returns_none_when_nothing_is_recognizable_and_no_apply_button_exists(self, requires_chromium, tmp_path):
+        manager = _manager_for_listing_page(tmp_path, _LISTING_PAGE_NO_APPLY_HTML)
+        manager.browser_manager.launch_context()
+        page = manager.browser_manager.new_page()
+        try:
+            page.goto(_LISTING_PAGE_NO_APPLY_HTML)
+            assert manager._resolve_adapter_from_listing_page(page) is None
+        finally:
+            manager.browser_manager.close()
+
+    def test_stops_on_a_captcha_present_on_the_listing_page_itself(self, requires_chromium, tmp_path):
+        manager = _manager_for_listing_page(tmp_path, _CAPTCHA_HTML, human_wait_timeout_s=0)
+        manager.browser_manager.launch_context()
+        page = manager.browser_manager.new_page()
+        try:
+            page.goto(_CAPTCHA_HTML)
+            assert manager._resolve_adapter_from_listing_page(page) is None
+            assert "captcha_detected" in manager.steps_completed
+        finally:
+            manager.browser_manager.close()
+
+    def test_run_reaches_needs_review_with_a_clear_reason_when_nothing_is_resolvable(self, requires_chromium, tmp_path):
+        """End-to-end via `run()`: `adapter_cls=None` must never crash the
+        run — it either resolves a real adapter (see the tests above) or
+        lands cleanly in `needs_review` with a reason a human can act on,
+        exactly like an already-known-unsupported platform would."""
+        manager = _manager_for_listing_page(tmp_path, _LISTING_PAGE_NO_APPLY_HTML, autopilot_enabled=True)
+
+        result = manager.run()
+
+        assert result.status == "needs_review"
+        assert result.confidence == 0.0
+        assert "unsupported_ats" in manager.steps_completed
+        assert "Apply" in Path(result.error_log).read_text(encoding="utf-8")
 
 
 def test_run_stops_immediately_when_clicking_next_does_not_advance(requires_chromium, tmp_path):
@@ -679,6 +993,7 @@ def test_run_stops_on_a_login_wall_before_filling_anything(requires_chromium, tm
         resume_document=_resume_document(tmp_path / "resume.pdf"),
         browser_manager=_isolated_browser_manager(tmp_path),
         autopilot_enabled=True,
+        human_wait_timeout_s=0,
     )
 
     result = manager.run()
@@ -1185,6 +1500,7 @@ def test_a_human_gate_on_a_later_page_still_stops_the_run(requires_chromium, tmp
         resume_document=_resume_document(tmp_path / "resume.pdf"),
         browser_manager=_isolated_browser_manager(tmp_path),
         autopilot_enabled=True,
+        human_wait_timeout_s=0,
     )
 
     result = manager.run()

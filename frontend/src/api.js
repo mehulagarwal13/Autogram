@@ -94,4 +94,73 @@ export const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ status }),
     }),
+
+  // ---------- Profile (master candidate profile) ----------
+  getProfile: () => request("/profile"),
+  createProfile: (body) =>
+    request("/profile", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }),
+  updateProfile: (body) =>
+    request("/profile", { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }),
+  setSkills: (body) =>
+    request("/profile/skills", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }),
+  updateAutomationSettings: (body) =>
+    request("/profile/automation-settings", {
+      method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+    }),
+
+  listEducation: () => request("/profile/education"),
+  addEducation: (body) =>
+    request("/profile/education", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }),
+  updateEducation: (id, body) =>
+    request(`/profile/education/${id}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }),
+  deleteEducation: (id) => request(`/profile/education/${id}`, { method: "DELETE" }),
+
+  listExperience: () => request("/profile/experience"),
+  addExperience: (body) =>
+    request("/profile/experience", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }),
+  updateExperience: (id, body) =>
+    request(`/profile/experience/${id}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }),
+  deleteExperience: (id) => request(`/profile/experience/${id}`, { method: "DELETE" }),
+
+  listDocuments: (documentType) => request(`/profile/documents${documentType ? `?document_type=${documentType}` : ""}`),
+  uploadDocument: (file, { documentType, label, jobTypeTag } = {}) => {
+    const form = new FormData();
+    form.append("file", file);
+    const params = new URLSearchParams({ document_type: documentType || "resume" });
+    if (label) params.set("label", label);
+    if (jobTypeTag) params.set("job_type_tag", jobTypeTag);
+    return request(`/profile/documents/upload?${params}`, { method: "POST", body: form });
+  },
+  setDefaultDocument: (id) => request(`/profile/documents/${id}/set-default`, { method: "PATCH" }),
+  deleteDocument: (id) => request(`/profile/documents/${id}`, { method: "DELETE" }),
+
+  getDemographics: () => request("/profile/demographics"),
+  putDemographics: (body) =>
+    request("/profile/demographics", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }),
+
+  // ---------- Applications (auto-apply / HITL platform) ----------
+  startApplication: (body) =>
+    request("/applications/start", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }),
+  listApplications: () => request("/applications"),
+  getApplication: (id) => request(`/applications/${id}`),
+  listApplicationRuns: (id) => request(`/applications/${id}/runs`),
+  getApplicationsOverview: () => request("/applications/overview"),
+  listApplicationReviews: () => request("/applications/reviews"),
+  checkDuplicateApplication: ({ company, position }) => {
+    const params = new URLSearchParams();
+    if (company) params.set("company", company);
+    if (position) params.set("position", position);
+    return request(`/applications/check-duplicate?${params}`);
+  },
+  getApplicationLive: (id) => request(`/applications/${id}/live`),
+  listApplicationQuestions: (id) => request(`/applications/${id}/questions`),
+  getApplicationReviewSummary: (id) => request(`/applications/${id}/review-summary`),
+  listApplicationAuditLog: (id) => request(`/applications/${id}/audit-log`),
+  reviewQuestion: (applicationId, questionId, body) =>
+    request(`/applications/${applicationId}/questions/${questionId}/review`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+    }),
+  approveApplication: (id) => request(`/applications/${id}/approve`, { method: "POST" }),
+  rejectApplication: (id, reason) =>
+    request(`/applications/${id}/reject${reason ? `?reason=${encodeURIComponent(reason)}` : ""}`, { method: "POST" }),
 };

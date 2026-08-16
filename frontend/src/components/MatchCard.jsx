@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { MapPin, Building2, ExternalLink, Bookmark, XCircle, ChevronDown } from "lucide-react";
+import { MapPin, Building2, ExternalLink, Bookmark, XCircle, ChevronDown, Rocket } from "lucide-react";
 import ScoreRing from "./ScoreRing";
 
 function Bar({ label, value, color }) {
@@ -17,7 +17,7 @@ function Bar({ label, value, color }) {
   );
 }
 
-export default function MatchCard({ match, onStatus }) {
+export default function MatchCard({ match, onStatus, onApply, applying }) {
   const [open, setOpen] = useState(false);
   const isSaved = match.status === "saved";
   const isDismissed = match.status === "dismissed";
@@ -93,9 +93,15 @@ export default function MatchCard({ match, onStatus }) {
           </button>
         )}
         {match.apply_url && (
-          <a href={match.apply_url} target="_blank" rel="noreferrer" className="btn-primary !px-3 !py-1.5 text-xs">
-            Apply <ExternalLink size={13} />
-          </a>
+          <>
+            <a href={match.apply_url} target="_blank" rel="noreferrer"
+              className="btn-ghost !px-3 !py-1.5 text-xs" title="View the original posting">
+              <ExternalLink size={13} />
+            </a>
+            <button className="btn-primary !px-3 !py-1.5 text-xs" disabled={applying} onClick={() => onApply?.(match)}>
+              <Rocket size={13} /> {applying ? "Starting..." : "Start Application"}
+            </button>
+          </>
         )}
       </div>
     </div>

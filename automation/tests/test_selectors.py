@@ -10,8 +10,10 @@ code bug. The `browser`/`page` fixtures live in `conftest.py` (shared with
 """
 
 from automation.browser.selectors import (
+    find_apply_entry_button,
     find_file_upload_input,
     find_human_gate,
+    find_job_posting_title_and_company,
     find_next_button,
     find_submission_confirmation,
     find_submit_button,
@@ -415,3 +417,97 @@ def test_still_detects_a_genuinely_visible_captcha_alongside_a_dormant_one(page)
         """,
     )
     assert page_has_captcha(page) is True
+
+
+# ---------- find_apply_entry_button ("Apply from Job Link") ----------
+
+def test_finds_an_apply_now_button_on_a_job_listing_page(page):
+    _render(page, '<h1>Software Engineer</h1><p>We are hiring...</p><button>Apply Now</button>')
+    found = find_apply_entry_button(page)
+    assert found is not None
+    assert "Apply Now" in found.inner_text()
+
+
+def test_finds_start_application_as_an_apply_entry_control(page):
+    _render(page, '<a href="/apply" class="cta">Start Application</a>')
+    found = find_apply_entry_button(page)
+    assert found is not None
+    assert found.evaluate("el => el.tagName.toLowerCase()") == "a"
+
+
+def test_prefers_the_more_specific_apply_phrase_over_a_bare_apply_elsewhere(page):
+    # A bare "Apply" (e.g. a filters/search widget's own button) must not
+    # outrank the posting's actual entry control when both are present.
+    _render(page, '<button class="filter">Apply</button><button id="real-apply">Apply Now</button>')
+    found = find_apply_entry_button(page)
+    assert found is not None
+    assert found.get_attribute("id") == "real-apply"
+
+
+def test_returns_none_when_no_apply_control_is_present(page):
+    _render(page, "<p>Just some unrelated page text.</p>")
+    assert find_apply_entry_button(page) is None
+
+
+def test_never_matches_apply_with_linkedin_as_an_entry_control(page):
+    # Same third-party-autofill exclusion every other button lookup in this
+    # module respects — see _THIRD_PARTY_AUTOFILL_TEXT.
+    _render(page, '<button>Apply with LinkedIn</button>')
+    assert find_apply_entry_button(page) is None
+
+
+# ---------- find_job_posting_title_and_company ("Apply from Job Link") ----------
+
+def test_reads_title_and_company_from_jobposting_json_ld(page):
+    _render(
+        page,
+        """
+        <script type="application/ld+json">
+        {"@context": "https://schema.org/", "@type": "JobPosting",
+         "title": "Senior Backend Engineer",
+         "hiringOrganization": {"@type": "Organization", "name": "Acme Corp"}}
+        </script>
+        <h1>Senior Backend Engineer</h1>
+        """,
+    )
+    title, company = find_job_posting_title_and_company(page)
+    assert title == "Senior Backend Engineer"
+    assert company == "Acme Corp"
+
+
+def test_reads_from_a_json_ld_array(page):
+    _render(
+        page,
+        """
+        <script type="application/ld+json">
+        [{"@type": "WebPage", "name": "Careers"},
+         {"@type": "JobPosting", "title": "Data Scientist", "hiringOrganization": {"name": "Beta Inc"}}]
+        </script>
+        """,
+    )
+    title, company = find_job_posting_title_and_company(page)
+    assert title == "Data Scientist"
+    assert company == "Beta Inc"
+
+
+def test_falls_back_to_open_graph_tags_when_no_json_ld_is_present(page):
+    _render(
+        page,
+        """
+        <meta property="og:title" content="Product Manager">
+        <meta property="og:site_name" content="Gamma LLC">
+        """,
+    )
+    title, company = find_job_posting_title_and_company(page)
+    assert title == "Product Manager"
+    assert company == "Gamma LLC"
+
+
+def test_returns_none_none_when_nothing_is_readable(page):
+    _render(page, "<p>A page with no structured job metadata at all.</p>")
+    assert find_job_posting_title_and_company(page) == (None, None)
+
+
+def test_ignores_malformed_json_ld_rather_than_raising(page):
+    _render(page, '<script type="application/ld+json">{not valid json</script>')
+    assert find_job_posting_title_and_company(page) == (None, None)

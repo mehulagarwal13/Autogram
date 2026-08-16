@@ -1,10 +1,25 @@
 import { useEffect, useState, useCallback } from "react";
-import { BrainCircuit, CheckCircle2, AlertCircle, Info, X, LogOut, Loader2 } from "lucide-react";
+import { NavLink, Route, Routes } from "react-router-dom";
+import {
+  BrainCircuit, CheckCircle2, AlertCircle, Info, X, LogOut, Loader2,
+  Search, LayoutDashboard, UserCircle2, FileText, Settings as SettingsIcon,
+} from "lucide-react";
 import { api, auth, setUnauthorizedHandler } from "./api";
 import AuthPage from "./components/AuthPage";
-import UploadPanel from "./components/UploadPanel";
-import JobsPanel from "./components/JobsPanel";
-import MatchesPanel from "./components/MatchesPanel";
+import JobsAndMatches from "./pages/JobsAndMatches";
+import Dashboard from "./pages/Dashboard";
+import ApplicationDetail from "./pages/ApplicationDetail";
+import Profile from "./pages/Profile";
+import ResumeManagement from "./pages/ResumeManagement";
+import Settings from "./pages/Settings";
+
+const NAV_LINKS = [
+  { to: "/", label: "Jobs & Matches", icon: Search, end: true },
+  { to: "/dashboard", label: "Dashboard", icon: LayoutDashboard },
+  { to: "/profile", label: "Profile", icon: UserCircle2 },
+  { to: "/resumes", label: "Resumes", icon: FileText },
+  { to: "/settings", label: "Settings", icon: SettingsIcon },
+];
 
 let toastId = 0;
 
@@ -111,14 +126,29 @@ export default function App() {
         </div>
       </header>
 
-      {/* Layout: left rail (resume + jobs) / right (matches) */}
-      <main className="grid gap-5 lg:grid-cols-[400px_1fr]">
-        <div className="space-y-5">
-          <UploadPanel resume={resume} setResume={setResume} toast={toast} />
-          <JobsPanel toast={toast} />
-        </div>
-        <MatchesPanel resume={resume} toast={toast} />
-      </main>
+      {/* Nav */}
+      <nav className="mb-6 flex flex-wrap gap-1.5 rounded-2xl border border-white/10 bg-white/[0.03] p-1.5">
+        {NAV_LINKS.map(({ to, label, icon: Icon, end }) => (
+          <NavLink key={to} to={to} end={end}
+            className={({ isActive }) =>
+              `flex items-center gap-1.5 rounded-xl px-3.5 py-2 text-sm font-medium transition ${
+                isActive ? "bg-indigo-500/20 text-indigo-200" : "text-slate-400 hover:bg-white/[0.05] hover:text-slate-200"
+              }`
+            }
+          >
+            <Icon size={15} /> {label}
+          </NavLink>
+        ))}
+      </nav>
+
+      <Routes>
+        <Route path="/" element={<JobsAndMatches resume={resume} setResume={setResume} toast={toast} />} />
+        <Route path="/dashboard" element={<Dashboard toast={toast} />} />
+        <Route path="/applications/:id" element={<ApplicationDetail toast={toast} />} />
+        <Route path="/profile" element={<Profile toast={toast} />} />
+        <Route path="/resumes" element={<ResumeManagement toast={toast} />} />
+        <Route path="/settings" element={<Settings toast={toast} />} />
+      </Routes>
 
       {/* Toasts */}
       <div className="fixed bottom-5 right-5 z-[60] flex w-80 flex-col gap-2">

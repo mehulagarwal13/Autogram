@@ -285,6 +285,16 @@ class BrowserManager:
         self._pages.append(page)
         return page
 
+    def adopt_page(self, page: Page) -> None:
+        """Registers a page this run didn't open via `new_page()` itself —
+        e.g. a new tab a job posting's own "Apply" link opened
+        (`target="_blank"`), which `ApplicationFlowManager` picks up via
+        `context.expect_page()` rather than calling `new_page()` — so `close()`
+        cleans it up exactly like any tab we opened directly. A no-op for
+        cleanup purposes if `page` is somehow already tracked."""
+        if page not in self._pages:
+            self._pages.append(page)
+
     def has_saved_session(self) -> bool:
         return self._session_store.has_session(self.user_id, self.ats_platform)
 

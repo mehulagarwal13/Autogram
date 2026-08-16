@@ -145,8 +145,25 @@ class ProfileResponse(BaseModel):
     willing_drug_test: bool | None = None
     has_drivers_license: bool | None = None
     skills: dict | None = None
+    # HITL platform — read-only here; only `PUT /profile/automation-settings`
+    # (a dedicated endpoint, deliberately NOT part of the generic PATCH
+    # /profile payload) may change this, so a routine profile edit can never
+    # accidentally flip the account-level autopilot kill switch.
+    autopilot_globally_disabled: bool = False
     created_at: datetime | None = None
     updated_at: datetime | None = None
+
+
+# ---------- automation settings (HITL platform) ----------
+
+class AutomationSettingsRequest(BaseModel):
+    autopilot_globally_disabled: bool
+
+
+class AutomationSettingsResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    autopilot_globally_disabled: bool
 
 
 # ---------- education ----------

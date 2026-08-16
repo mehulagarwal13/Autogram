@@ -9,7 +9,9 @@ approach `tests/test_application_repository.py` uses.
 from unittest.mock import MagicMock
 
 from app.services.answer_cache_repository import (
+    SEMANTIC_SIMILARITY_THRESHOLD,
     compute_question_hash,
+    find_similar_answer,
     get_cached_answer,
     normalize_question,
     save_answer,
@@ -98,3 +100,80 @@ def test_save_answer_overwrites_an_existing_cached_row_instead_of_duplicating():
     assert existing.source == "deterministic"
     assert existing.confidence == 0.9
     db.commit.assert_called_once()
+
+
+def test_save_answer_computes_and_stores_an_embedding():
+    """HITL platform: every save also embeds the question text, so a later,
+    differently-worded question can find it via `find_similar_answer` — the
+    real (local, free) embedding model, not mocked, same as the rest of the
+    codebase's embedding calls."""
+    db = MagicMock()
+    db.query.return_value.filter.return_value.first.return_value = None
+
+    save_answer(db, "user-1", "What is your notice period?", answer="30 days", source="deterministic", confidence=0.9)
+
+    added = db.add.call_args[0][0]
+    assert added.embedding_vector is not None
+    assert len(added.embedding_vector) == 384
+
+
+def test_save_answer_degrades_to_no_embedding_when_embedding_generation_fails(monkeypatch):
+    import app.services.answer_cache_repository as repo
+
+    monkeypatch.setattr(repo, "generate_embedding", lambda text: (_ for _ in ()).throw(RuntimeError("model unavailable")))
+    db = MagicMock()
+    db.query.return_value.filter.return_value.first.return_value = None
+
+    # Must not raise — a broken embedding call degrades to exact-match-only
+    # for this row rather than blocking the (otherwise good) answer save.
+    save_answer(db, "user-1", "What is your notice period?", answer="30 days", source="deterministic", confidence=0.9)
+
+    added = db.add.call_args[0][0]
+    assert added.embedding_vector is None
+    db.commit.assert_called_once()
+
+
+# ---------- find_similar_answer ----------
+
+def test_find_similar_answer_returns_none_when_nothing_clears_the_threshold():
+    db = MagicMock()
+    db.query.return_value.filter.return_value.order_by.return_value.first.return_value = (
+        MagicMock(answer="30 days"), SEMANTIC_SIMILARITY_THRESHOLD - 0.1,
+    )
+
+    result = find_similar_answer(db, "user-1", "How soon could you start a new role?")
+
+    assert result is None
+
+
+def test_find_similar_answer_returns_the_match_above_the_threshold():
+    db = MagicMock()
+    fake_entry = MagicMock(answer="30 days")
+    db.query.return_value.filter.return_value.order_by.return_value.first.return_value = (
+        fake_entry, SEMANTIC_SIMILARITY_THRESHOLD + 0.05,
+    )
+
+    result = find_similar_answer(db, "user-1", "How soon could you start a new role?")
+
+    assert result is fake_entry
+
+
+def test_find_similar_answer_returns_none_when_the_user_has_nothing_cached():
+    db = MagicMock()
+    db.query.return_value.filter.return_value.order_by.return_value.first.return_value = None
+
+    result = find_similar_answer(db, "user-1", "How soon could you start a new role?")
+
+    assert result is None
+
+
+def test_find_similar_answer_degrades_to_none_on_a_broken_query(monkeypatch):
+    db = MagicMock()
+    db.query.side_effect = RuntimeError("vector index unavailable")
+
+    # A broken semantic lookup must never block answering — it just means
+    # this particular attempt falls through to the LLM path, same as any
+    # other cache miss.
+    result = find_similar_answer(db, "user-1", "How soon could you start a new role?")
+
+    assert result is None

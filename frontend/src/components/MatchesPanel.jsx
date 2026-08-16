@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { useNavigate } from "react-router-dom";
 import { Target, Loader2, Sparkles } from "lucide-react";
 import { api } from "../api";
 import MatchCard from "./MatchCard";
@@ -16,6 +17,8 @@ export default function MatchesPanel({ resume, toast }) {
   const [phaseIdx, setPhaseIdx] = useState(0);
   const [filter, setFilter] = useState("");
   const [locationFilter, setLocationFilter] = useState("");
+  const [applyingId, setApplyingId] = useState(null);
+  const navigate = useNavigate();
 
   // Restore previously generated matches when a resume appears (e.g. after login)
   useEffect(() => {
@@ -57,6 +60,29 @@ export default function MatchesPanel({ resume, toast }) {
       setMatches((ms) => ms.map((m) => (m.match_id === match.match_id ? { ...m, status } : m)));
     } catch (e) {
       toast(e.message, "error");
+    }
+  }
+
+  async function startApplication(match) {
+    if (!match.apply_url) return;
+    setApplyingId(match.match_id);
+    try {
+      const dup = await api.checkDuplicateApplication({ company: match.company, position: match.title }).catch(() => null);
+      if (dup?.possible_duplicate) {
+        const proceed = window.confirm(
+          `You may have already applied to a similar role at ${match.company} (status: ${dup.existing_status}). Start a new application anyway?`
+        );
+        if (!proceed) { setApplyingId(null); return; }
+      }
+      const application = await api.startApplication({
+        job_url: match.apply_url, company: match.company, position: match.title,
+      });
+      toast(`Application started for ${match.title} at ${match.company || "this company"}.`, "success");
+      navigate(`/applications/${application.application_id}`);
+    } catch (e) {
+      toast(e.message, "error");
+    } finally {
+      setApplyingId(null);
     }
   }
 
@@ -103,7 +129,7 @@ export default function MatchesPanel({ resume, toast }) {
 
       {matches.map((m, i) => (
         <div key={m.match_id} style={{ animationDelay: `${Math.min(i * 70, 500)}ms` }} className="animate-fade-up">
-          <MatchCard match={m} onStatus={setStatus} />
+          <MatchCard match={m} onStatus={setStatus} onApply={startApplication} applying={applyingId === m.match_id} />
         </div>
       ))}
     </div>

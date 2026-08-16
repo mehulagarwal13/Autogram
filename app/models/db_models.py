@@ -34,11 +34,41 @@ FLUENT_LANGUAGE_PROFICIENCIES = {"native", "fluent", "professional"}
 VALID_APPLICATION_STATUSES = {
     "pending", "processing", "applied", "failed",
     "manual_required", "needs_review", "copilot_review",
+    # HITL platform: a human explicitly declined to continue (reject / go-back
+    # before submission) — distinct from "failed" (nothing malfunctioned) and
+    # from the RETRYABLE set (a cancelled application is not auto-retried).
+    "cancelled",
 }
+# Browser-extension delivery — see Application.source.
+VALID_APPLICATION_SOURCES = {"server_automation", "browser_extension"}
 # Where a cached screening-question answer originally came from (Phase 6,
 # app/services/answer_cache_repository.py) — "cache" isn't a stored value
 # here, it's what a lookup hit is *reported as* by the caller.
 VALID_ANSWER_SOURCES = {"deterministic", "llm"}
+
+# HITL platform — per-question ledger (see ApplicationQuestion below).
+# "needs_user_input" is distinct from "human": it means "nothing answered
+# this yet" (surfaced for review), where "human" means an answer a person
+# actually typed via the review UI (`ApplicationQuestion.human_answer`).
+VALID_QUESTION_SOURCES = {"profile", "answer_memory", "llm", "vision", "needs_user_input", "human"}
+VALID_CONFIDENCE_LEVELS = {"HIGH", "MEDIUM", "LOW"}
+VALID_QUESTION_REVIEW_STATUSES = {"auto_filled", "pending_review", "approved", "edited", "rejected"}
+
+HIGH_CONFIDENCE_THRESHOLD = 0.85   # mirrors ApplicationFlowManager.AUTO_SUBMIT_CONFIDENCE_THRESHOLD
+LOW_CONFIDENCE_THRESHOLD = 0.6     # mirrors ApplicationFlowManager.NEEDS_REVIEW_CONFIDENCE_THRESHOLD
+
+
+def confidence_level_for(source: str, confidence: float) -> str:
+    """The HIGH/MEDIUM/LOW bucket a question-answer review UI shows, derived
+    from the same two thresholds `ApplicationFlowManager.decide_action` already
+    gates auto-submit/review on — so a question this labels HIGH is exactly one
+    the flow manager itself would trust, not a second, independently-tuned
+    notion of confidence."""
+    if source in ("profile", "answer_memory") or confidence >= HIGH_CONFIDENCE_THRESHOLD:
+        return "HIGH"
+    if confidence < LOW_CONFIDENCE_THRESHOLD:
+        return "LOW"
+    return "MEDIUM"
 
 
 class User(Base):
@@ -308,6 +338,15 @@ class CandidateProfile(Base):
     #         technical_skills, soft_skills} — each a list[str].
     skills = Column(JSONB, nullable=True)
 
+    # HITL platform — account-level kill switch (PHASE2_ARCHITECTURE.md
+    # Initiative 3): a belt-and-suspenders backstop that hard-stops every
+    # autopilot run for this user regardless of any per-application
+    # `autopilot_enabled` flag. Checked fresh from the DB at the top of every
+    # page in ApplicationFlowManager's loop, not just at dispatch time, and
+    # fails CLOSED (DB unreachable == treated as engaged) — see
+    # `app/api/applications.py::_is_kill_switch_engaged`.
+    autopilot_globally_disabled = Column(Boolean, nullable=False, default=False)
+
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
 
@@ -442,6 +481,21 @@ class Application(Base):
     resume_used = Column(String, ForeignKey("profile_documents.document_id", ondelete="SET NULL"), nullable=True)
     confidence_score = Column(Float, nullable=True)
     failure_reason = Column(Text, nullable=True)
+    # HITL platform — how many pages of a multi-page application were
+    # actually processed by the last run, straight from
+    # `ApplicationRunResult.pages_completed`. Powers the pre-submission
+    # review summary (§7) without re-deriving it from automation_runs/logs.
+    pages_completed = Column(Integer, nullable=True)
+    # Browser-extension delivery — which "engine" is driving this application:
+    # the server-side Playwright automation (`automation/`, the default) or
+    # the MV3 browser extension (`extension/`), which runs inside the user's
+    # own already-logged-in Chrome tab instead. See VALID_APPLICATION_SOURCES.
+    # Determines whether `POST /applications/start` dispatches a server-side
+    # Playwright run at all (see `app/api/applications.py::start_application`)
+    # and which endpoints ever write to this row afterward —
+    # `POST /applications/{id}/approve` (server automation's copilot replay)
+    # vs `POST /applications/{id}/report-status` (the extension self-reporting).
+    source = Column(String, nullable=False, default="server_automation")
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
 
@@ -463,6 +517,13 @@ class AutomationRun(Base):
     trace_path = Column(String, nullable=True)
     error_log = Column(Text, nullable=True)
     retry_count = Column(Integer, nullable=False, default=0)
+    # HITL platform (§18 Observability) — this run's structured progress log,
+    # list[{"timestamp": iso8601 str, "message": str}], captured by a
+    # per-run logging handler scoped to this application_id (see
+    # `automation/applications/application_flow_manager.py`). Surfaced
+    # verbatim by `GET /applications/{id}/runs` for the dashboard's activity
+    # log — a human-readable trail distinct from the Playwright trace/screenshots.
+    log_lines = Column(JSONB, nullable=True)
 
 
 # --- Screening-question answer cache (Phase 6) ------------------------------
@@ -492,5 +553,74 @@ class AnswerCacheEntry(Base):
     answer = Column(Text, nullable=False)
     source = Column(String, nullable=False)  # see VALID_ANSWER_SOURCES
     confidence = Column(Float, nullable=False)
+    # HITL platform — enables semantic (near-duplicate) answer-memory lookup:
+    # a normalized-text miss falls back to cosine similarity over this vector
+    # (via the same local sentence-transformers model job/resume matching
+    # already uses — no extra API cost) before ever reaching the LLM. See
+    # `app/services/answer_cache_repository.py::find_similar_answer`. This was
+    # the exact pgvector follow-up this module's docstring already called out
+    # as "a natural follow-up once this exact-match version has real usage
+    # data" — nullable so existing rows keep working until they're re-saved.
+    embedding_vector = Column(Vector(EMBEDDING_DIM), nullable=True)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+
+
+# --- HITL platform: per-question ledger + audit log -------------------------
+
+class ApplicationQuestion(Base):
+    """One row per screening question ASKED on one application run — the
+    ledger the Answer Review UI, the Application Detail page, and the
+    pre-submission review summary (§7) all read from.
+
+    Distinct from `AnswerCacheEntry`: the cache is a per-user, cross-application
+    memory of "what did we answer this question with last time"; this table is
+    a per-APPLICATION record of "what was asked on THIS application, from
+    where, at what confidence, and what a human did about it" — the two serve
+    different questions and neither can stand in for the other. Written by
+    `automation/forms/answer_engine.py::ApplicationAnswerEngine.answer_batch()`
+    as it answers each question (see that module for the `source`/confidence
+    semantics), and updated by a human via
+    `POST /applications/{id}/questions/{question_id}/review`.
+    """
+
+    __tablename__ = "application_questions"
+
+    question_id = Column(String, primary_key=True)
+    application_id = Column(String, ForeignKey("applications.application_id", ondelete="CASCADE"), nullable=False, index=True)
+    page_number = Column(Integer, nullable=True)
+    question_text = Column(Text, nullable=False)
+    field_type = Column(String, nullable=True)  # text/textarea/select/radio/checkbox/date/number/file
+    available_options = Column(JSONB, nullable=True)  # list[str] — echoed verbatim from the DOM, see answer_engine.Question
+    answer = Column(Text, nullable=True)
+    source = Column(String, nullable=False)  # see VALID_QUESTION_SOURCES
+    confidence = Column(Float, nullable=False)
+    confidence_level = Column(String, nullable=False)  # see VALID_CONFIDENCE_LEVELS / confidence_level_for()
+    review_status = Column(String, nullable=False, default="auto_filled")  # see VALID_QUESTION_REVIEW_STATUSES
+    human_answer = Column(Text, nullable=True)
+    reviewed_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+
+class ApplicationAuditLog(Base):
+    """Append-only record of decisions/approvals for one application — DISTINCT
+    from `AutomationRun` (which tracks execution mechanics: screenshots, trace,
+    error log) and from `ApplicationQuestion` (which tracks individual answers).
+    This is the compliance-facing trail of "who decided what, and when":
+    autopilot run started, human approved/rejected, kill switch triggered.
+
+    HARD RULE: no route ever updates or deletes a row here (see
+    `app/services/audit_log_repository.py` — it exposes only `record_event`,
+    never an update/delete). It is the record of "did the system submit
+    something without explicit permission," and a mutable audit log defeats
+    the entire point of keeping one."""
+
+    __tablename__ = "application_audit_log"
+
+    log_id = Column(String, primary_key=True)
+    application_id = Column(String, ForeignKey("applications.application_id", ondelete="CASCADE"), nullable=False, index=True)
+    user_id = Column(String, ForeignKey("users.user_id", ondelete="CASCADE"), nullable=False, index=True)
+    event_type = Column(String, nullable=False)  # e.g. autopilot_run_started, human_approved, human_rejected, kill_switch_triggered
+    actor = Column(String, nullable=False)  # "system" or a user_id
+    event_metadata = Column(JSONB, nullable=True)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))

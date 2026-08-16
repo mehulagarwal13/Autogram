@@ -64,10 +64,14 @@ someone closes it by hand.
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass, field as _dc_field
+from datetime import datetime, timezone
+from typing import Callable
 
-from playwright.sync_api import BrowserContext, Locator, Page
+from playwright.sync_api import BrowserContext, Error as PlaywrightError, Locator, Page
 
+from app.core.config import AUTOMATION_HUMAN_WAIT_TIMEOUT_S
 from automation.applications.page_navigator import (
     NavigationOutcome,
     PageSignature,
@@ -77,9 +81,13 @@ from automation.applications.page_navigator import (
     wait_for_page_settled,
 )
 from automation.ats.base import ATSAdapter, FieldFillResult
+from automation.ats.detector import ATSDetector, FALLBACK_ATS
+from automation.ats.registry import get_adapter_class
 from automation.browser.browser_manager import BrowserManager
 from automation.browser.selectors import (
+    find_apply_entry_button,
     find_human_gate,
+    find_job_posting_title_and_company,
     find_unfilled_required_fields,
     find_validation_errors,
     page_has_captcha,
@@ -91,6 +99,53 @@ from automation.forms.vision_fallback import VisionFormAnswerer
 from automation.interfaces import ApplicationRunResult, CandidateProfile, ProfileDocument
 
 logger = logging.getLogger(__name__)
+
+# How often the human-verification wait re-checks whether a CAPTCHA/human
+# gate has cleared. Cheap (one more selector read), so a short interval costs
+# nothing and keeps the reported wait responsive.
+HUMAN_WAIT_POLL_INTERVAL_S = 5.0
+
+# HITL platform (§10 Live Automation View) — in-memory "what is this run doing
+# RIGHT NOW", keyed by application_id, read by `GET /applications/{id}/live`.
+# Same "module-level dict, strong-referenced, cleared on completion" pattern as
+# `_OPEN_REVIEW_SESSIONS` below — this is a single-process, best-effort view
+# (matches today's single-process `BackgroundTasks` deployment; see
+# PHASE2_ARCHITECTURE.md Initiative 4 for the real-queue follow-up), not a
+# durable record. Durable, replay-after-restart progress lives in
+# `automation_runs`/`application_questions` instead.
+LIVE_RUN_STATE: dict[str, dict] = {}
+
+
+def clear_live_state(application_id: str) -> None:
+    LIVE_RUN_STATE.pop(application_id, None)
+
+
+def get_live_state(application_id: str) -> dict | None:
+    return LIVE_RUN_STATE.get(application_id)
+
+
+class _RunLogCapture(logging.Handler):
+    """Captures this run's own log lines as structured `{timestamp, message}`
+    entries for `AutomationRun.log_lines` (§18 Observability) — a
+    human-readable activity trail distinct from the Playwright trace/
+    screenshots. Filters by a simple substring match on `application_id`,
+    which every log line in this module already includes by convention
+    ("application %s: ...") — good enough for a debugging/activity view
+    without threading a logging `extra=` field through every call site."""
+
+    def __init__(self, application_id: str):
+        super().__init__(level=logging.INFO)
+        self.application_id = application_id
+        self.lines: list[dict] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            message = record.getMessage()
+        except Exception:  # noqa: BLE001 - a broken log record must never break the run
+            return
+        if self.application_id not in message:
+            return
+        self.lines.append({"timestamp": datetime.now(timezone.utc).isoformat(), "message": message})
 
 # ATS platforms that are public (no login) and therefore eligible for
 # autopilot at all — mirrors the decision table in ARCHITECTURE.md exactly.
@@ -116,7 +171,13 @@ def should_keep_browser_open(headless: bool, status: str) -> bool:
     return (not headless) and status in REVIEW_STATUSES
 
 
-# Browsers deliberately left open for manual review, keyed by application_id.
+# Browsers deliberately left open for manual review, keyed by application_id
+# -> (BrowserManager, ATSAdapter, Page) — the adapter/page are what let
+# `POST /applications/{id}/approve` replay a submit click against the SAME
+# already-filled page a copilot_review run left open (see
+# `submit_open_review_session` below), rather than only ever supporting
+# "a human clicks submit themselves in the visible window".
+#
 # Holding a strong reference here is REQUIRED, not just a nicety: `run()`
 # executes inside a FastAPI `BackgroundTasks` call, and once it returns,
 # nothing else in the process references this run's `ApplicationFlowManager`,
@@ -128,16 +189,17 @@ def should_keep_browser_open(headless: bool, status: str) -> bool:
 # could end up closing (or its controlling connection dying) anyway. This
 # dict is that reference. See `close_review_session()` to explicitly close
 # one later (e.g. from a future "I'm done reviewing" API action).
-_OPEN_REVIEW_SESSIONS: dict[str, BrowserManager] = {}
+_OPEN_REVIEW_SESSIONS: dict[str, tuple[BrowserManager, ATSAdapter | None, Page | None]] = {}
 
 
 def close_review_session(application_id: str) -> bool:
     """Closes and forgets a browser that was left open for manual review.
     Returns `False` if there wasn't one (already closed, or this
     application never resulted in one being left open)."""
-    browser_manager = _OPEN_REVIEW_SESSIONS.pop(application_id, None)
-    if browser_manager is None:
+    session = _OPEN_REVIEW_SESSIONS.pop(application_id, None)
+    if session is None:
         return False
+    browser_manager, _adapter, _page = session
     try:
         browser_manager.close()
     except Exception:  # noqa: BLE001 - best-effort cleanup, never raise from here
@@ -149,6 +211,64 @@ def list_open_review_sessions() -> list[str]:
     """application_ids with a browser currently left open for review —
     useful for a debug endpoint or just introspecting from a shell."""
     return list(_OPEN_REVIEW_SESSIONS.keys())
+
+
+def submit_open_review_session(application_id: str) -> tuple[str, str | None] | None:
+    """`POST /applications/{id}/approve`'s mechanism: replays a submit click
+    against the exact browser/page a `copilot_review` run left open, via the
+    SAME `submit_and_confirm` the `AUTO_SUBMIT` decision path uses, so the two
+    can never disagree about what counts as a confirmed submission.
+
+    Returns `(status, error_message_or_None)` — `status` is `"applied"`,
+    `"needs_review"`, or `"failed"`, matching `ApplicationRunResult.status`.
+    Returns `None` if there is no open review session for this application at
+    all (already closed, timed out and cleaned up, or the run never left one
+    open) — callers should treat that as "nothing to approve here"."""
+    session = _OPEN_REVIEW_SESSIONS.get(application_id)
+    if session is None:
+        return None
+    _browser_manager, adapter, page = session
+    if adapter is None or page is None:
+        # A session was left open (e.g. the run crashed before an adapter was
+        # ever constructed) but there's nothing to click submit on.
+        close_review_session(application_id)
+        return "failed", "No fillable page is open for this application anymore."
+    result = submit_and_confirm(adapter, page, application_id)
+    close_review_session(application_id)
+    return result
+
+
+def submit_and_confirm(adapter: ATSAdapter, page: Page, application_id: str) -> tuple[str, str | None]:
+    """Clicks submit and verifies confirmation — the ONE place this happens,
+    shared by `_run_on_page`'s `AUTO_SUBMIT` branch and
+    `submit_open_review_session` above, so autopilot and a human-approved
+    copilot submission can never disagree about what counts as "confirmed".
+    Never claims `"applied"` without positive confirmation (see
+    `wait_for_submission_confirmation`) — retrying a submission that actually
+    succeeded would double-apply, so an unconfirmed click is reported as
+    `needs_review`, never silently retried.
+
+    Returns `(status, error_message_or_None)`."""
+    logger.info("application %s: clicking submit.", application_id)
+    if not adapter.submit_application():
+        return "failed", "The submit control could not be clicked."
+
+    confirmation = wait_for_submission_confirmation(page)
+    if confirmation:
+        logger.info("application %s: submission CONFIRMED via %s.", application_id, confirmation)
+        return "applied", None
+
+    rejection = find_validation_errors(page)
+    reason = (
+        "Submit was clicked but no confirmation could be detected "
+        "(no confirmation page, success message, or application reference). "
+        "The application may or may not have been received — verify on the ATS "
+        "before retrying, since retrying a submission that did succeed would double-apply."
+    )
+    if rejection:
+        reason += f" The page reported: {'; '.join(rejection)}."
+    logger.warning("application %s: %s", application_id, reason)
+    return "needs_review", reason
 
 
 @dataclass
@@ -224,7 +344,7 @@ class ApplicationFlowManager:
         user_id: str,
         job_url: str,
         ats_platform: str,
-        adapter_cls: type[ATSAdapter],
+        adapter_cls: type[ATSAdapter] | None,
         profile: CandidateProfile,
         resume_document: ProfileDocument,
         autopilot_enabled: bool = False,
@@ -232,6 +352,9 @@ class ApplicationFlowManager:
         headless: bool | None = None,
         answer_engine: ApplicationAnswerEngine | None = None,
         vision_answerer: VisionFormAnswerer | None = None,
+        on_waiting_for_human: Callable[[str], None] | None = None,
+        is_kill_switch_engaged: Callable[[], bool] | None = None,
+        human_wait_timeout_s: float = AUTOMATION_HUMAN_WAIT_TIMEOUT_S,
     ) -> None:
         self.application_id = application_id
         self.user_id = user_id
@@ -262,21 +385,58 @@ class ApplicationFlowManager:
         self.browser_manager = browser_manager or BrowserManager(
             user_id=user_id, ats_platform=ats_platform, headless=headless,
         )
+        # HITL platform: `on_waiting_for_human` fires (with a human-readable
+        # reason) the moment a CAPTCHA/human-gate is detected, so `app/` can
+        # reflect WAITING_FOR_HUMAN immediately rather than only after this
+        # run eventually returns — see `_wait_for_human`.
+        # `is_kill_switch_engaged` is checked fresh at the top of every page;
+        # see `_kill_switch_engaged` for the fail-closed contract.
+        self.on_waiting_for_human = on_waiting_for_human
+        self.is_kill_switch_engaged = is_kill_switch_engaged
+        # Overridable per instance (defaults to the configured production
+        # value) so tests exercising a gate that never clears — the common
+        # case — don't have to burn real wall-clock time; pass a small value
+        # (e.g. 0) to get the same code path with an effectively immediate
+        # timeout.
+        self.human_wait_timeout_s = human_wait_timeout_s
         self._steps_completed: list[str] = []
+        # Set once `_run_on_page` constructs an adapter for this run — see
+        # `_finish_browser_session`, which reads these to populate
+        # `_OPEN_REVIEW_SESSIONS` so `POST /applications/{id}/approve` can
+        # replay a submit click later.
+        self._last_adapter: ATSAdapter | None = None
+        self._last_page: Page | None = None
+        # "Apply from Job Link": best-effort (title, company) read off the
+        # job posting page — see `_safe_detect_job_posting_metadata`. Set
+        # once, early in `_run_on_page`, and attached to the final
+        # `ApplicationRunResult` in `_run_captured` regardless of how the
+        # run ends.
+        self._detected_company: str | None = None
+        self._detected_position: str | None = None
 
     @property
     def steps_completed(self) -> list[str]:
         return list(self._steps_completed)
 
-    def checkpoint(self, step_name: str) -> None:
+    def checkpoint(self, step_name: str, *, page_number: int | None = None) -> None:
         """Records progress. Until the Phase 4 `applications`/`automation_runs`
         tables + a repository exist (see `automation/interfaces.py`), this is
         in-memory + logged only — `app/` persists the final
         `ApplicationRunResult` by hand for now. Once that repository exists,
         this becomes a real per-step DB write, same pattern as everything
-        else in `automation/interfaces.py`."""
+        else in `automation/interfaces.py`.
+
+        Also updates `LIVE_RUN_STATE` (§10 Live Automation View) — every
+        checkpoint is a point-in-time snapshot of "what is this run doing
+        right now", which is exactly what `GET /applications/{id}/live`
+        polls."""
         self._steps_completed.append(step_name)
         logger.info("application %s: step '%s' complete", self.application_id, step_name)
+        state = LIVE_RUN_STATE.setdefault(self.application_id, {})
+        state["last_step"] = step_name
+        if page_number is not None:
+            state["page_number"] = page_number
+        state["updated_at"] = datetime.now(timezone.utc).isoformat()
 
     # `detect_next_step()` used to live here and is deliberately gone: which
     # control advances the form is now `ATSAdapter.find_next_control()`, so a
@@ -290,6 +450,23 @@ class ApplicationFlowManager:
     # ------------------------------------------------------------------
 
     def run(self) -> ApplicationRunResult:
+        """Entry point. Wraps the actual run in a per-run log capture (§18 —
+        see `_RunLogCapture`) and guarantees `LIVE_RUN_STATE` is cleared when
+        this run is done, one way or another — a run that ends in a review
+        status is no longer "in progress" for the live view even though its
+        browser may stay open (see `_finish_browser_session`)."""
+        log_capture = _RunLogCapture(self.application_id)
+        automation_logger = logging.getLogger("automation")
+        automation_logger.addHandler(log_capture)
+        try:
+            result = self._run_captured()
+            result.log_lines = log_capture.lines
+            return result
+        finally:
+            automation_logger.removeHandler(log_capture)
+            clear_live_state(self.application_id)
+
+    def _run_captured(self) -> ApplicationRunResult:
         try:
             context = self.browser_manager.launch_context()
             # `browser_manager.new_page()`, not `context.new_page()`: under the
@@ -318,6 +495,11 @@ class ApplicationFlowManager:
             logger.exception("application %s: run failed", self.application_id)
             result = self._build_failure_result(page, e)
         result.trace_path = self._safe_stop_trace(context)
+        # "Apply from Job Link": attached here, once, regardless of how the
+        # run ended — every ApplicationRunResult return point inside
+        # _run_on_page would otherwise need this repeated on it individually.
+        result.detected_company = self._detected_company
+        result.detected_position = self._detected_position
 
         self._finish_browser_session(context, result.status)
         return result
@@ -348,8 +530,10 @@ class ApplicationFlowManager:
             # See _OPEN_REVIEW_SESSIONS's docstring: this reference is load-
             # bearing, not decorative — without it, nothing else in the
             # process keeps this BrowserManager (or its Playwright driver
-            # connection) alive once `run()` returns.
-            _OPEN_REVIEW_SESSIONS[self.application_id] = self.browser_manager
+            # connection) alive once `run()` returns. The adapter/page are
+            # included so `POST /applications/{id}/approve` can later replay a
+            # submit click against this exact page (`submit_open_review_session`).
+            _OPEN_REVIEW_SESSIONS[self.application_id] = (self.browser_manager, self._last_adapter, self._last_page)
             return
 
         logger.info(
@@ -375,10 +559,40 @@ class ApplicationFlowManager:
             "application %s: reached the job application page (%s, headless=%s)",
             self.application_id, self.job_url, self.browser_manager.headless,
         )
+        # "Apply from Job Link": best-effort, never fabricated — see
+        # `_safe_detect_job_posting_metadata`.
+        self._detected_company, self._detected_position = self._safe_detect_job_posting_metadata(page)
 
-        adapter = self.adapter_cls(
+        adapter_cls = self.adapter_cls
+        if adapter_cls is None:
+            # Pre-flight detection (`app/api/applications.py::_run_application`)
+            # came back as `FALLBACK_ATS` — this page might be a job LISTING
+            # page sitting in front of a supported ATS, not itself
+            # unsupported. See `_resolve_adapter_from_listing_page`.
+            resolution = self._resolve_adapter_from_listing_page(page)
+            if resolution is None:
+                reason = (
+                    "Could not detect a supported application form on this page, and no "
+                    "Apply/Apply Now/Start Application control was found to reach one."
+                )
+                logger.info("application %s: %s", self.application_id, reason)
+                self.checkpoint("unsupported_ats")
+                return ApplicationRunResult(
+                    application_id=self.application_id,
+                    status="needs_review",
+                    ats_platform=self.ats_platform,
+                    confidence=0.0,
+                    screenshot_paths=self._safe_screenshot(page),
+                    error_log=self._safe_write_error_log(reason),
+                    pages_completed=0,
+                )
+            adapter_cls, page = resolution
+
+        adapter = adapter_cls(
             page=page, profile=self.profile, resume_document=self.resume_document, answer_engine=self.answer_engine,
         )
+        self._last_adapter = adapter
+        self._last_page = page
 
         all_results: list[FieldFillResult] = []
         vision_confirmed_filled: set[str] = set()
@@ -387,8 +601,25 @@ class ApplicationFlowManager:
         # The page cycle. Every iteration is one PAGE of the application, and
         # the loop leaves only for a reason it can name: the adapter reported
         # the final page, a human-only gate appeared, navigation could not be
-        # proven, or the safety backstop tripped.
+        # proven, the safety backstop tripped, or the kill switch engaged.
         for page_index in range(self.MAX_PAGES):
+            if self._kill_switch_engaged():
+                reason = (
+                    "The account-level autopilot kill switch is engaged — stopping before "
+                    f"page {page_index + 1}. Re-enable it in Settings, then retry this application."
+                )
+                logger.warning("application %s: %s", self.application_id, reason)
+                self.checkpoint("kill_switch_engaged", page_number=page_index + 1)
+                return ApplicationRunResult(
+                    application_id=self.application_id,
+                    status="manual_required",
+                    ats_platform=self.ats_platform,
+                    confidence=self._aggregate_confidence(all_results),
+                    screenshot_paths=self._safe_screenshot(page),
+                    error_log=self._safe_write_error_log(reason),
+                    pages_completed=page_index,
+                )
+
             pages_processed = page_index + 1
             progress = self._process_page(adapter, page, page_index, all_results)
             vision_confirmed_filled |= progress.vision_confirmed
@@ -401,6 +632,7 @@ class ApplicationFlowManager:
                     confidence=0.0,
                     screenshot_paths=self._safe_screenshot(page),
                     error_log=self._safe_write_error_log(progress.blocked_reason),
+                    pages_completed=pages_processed,
                 )
 
             if progress.is_final:
@@ -458,6 +690,7 @@ class ApplicationFlowManager:
                 confidence=confidence,
                 screenshot_paths=self._safe_screenshot(page),
                 error_log=self._safe_write_error_log(reason),
+                pages_completed=pages_processed,
             )
 
         # Both specs gate auto-submit on "zero visible validation errors".
@@ -478,6 +711,7 @@ class ApplicationFlowManager:
                 confidence=confidence,
                 screenshot_paths=self._safe_screenshot(page),
                 error_log=self._safe_write_error_log(reason),
+                pages_completed=pages_processed,
             )
 
         action = decide_action(confidence, self.ats_platform, self.autopilot_enabled)
@@ -490,41 +724,21 @@ class ApplicationFlowManager:
         error_log: str | None = None
 
         if action == "AUTO_SUBMIT":
-            logger.info("application %s: clicking submit (autopilot).", self.application_id)
-            if not adapter.submit_application():
-                status = "failed"
-            else:
-                # A landed click is NOT an accepted application — see
-                # `find_submission_confirmation`. Only positive confirmation
-                # is allowed to produce "applied".
+            # Deliberately not "applied" until POSITIVELY confirmed (see
+            # `submit_and_confirm`) and not "failed" just because a click
+            # landed — those two are NOT the same claim about the world, and
+            # ApplicationRunResult must never conflate them.
+            status, submit_error = submit_and_confirm(adapter, page, self.application_id)
+            if status != "failed":
                 self.checkpoint("submit_clicked")
-                confirmation = wait_for_submission_confirmation(page)
-                if confirmation:
-                    status = "applied"
-                    self.checkpoint("submission_confirmed")
-                    logger.info(
-                        "application %s: submission CONFIRMED via %s.", self.application_id, confirmation,
-                    )
-                else:
-                    # Deliberately not "applied" (we cannot claim the
-                    # candidate applied) and not "failed" (the submission may
-                    # well have gone through — we just can't prove it). A
-                    # human has to confirm on the ATS side, and must do that
-                    # BEFORE any retry, since a retry of a submission that
-                    # actually succeeded would double-apply.
-                    status = "needs_review"
-                    rejection = find_validation_errors(page)
-                    reason = (
-                        "Submit was clicked but no confirmation could be detected "
-                        "(no confirmation page, success message, or application reference). "
-                        "The application may or may not have been received — verify on the ATS "
-                        "before retrying, since retrying a submission that did succeed would double-apply."
-                    )
-                    if rejection:
-                        reason += f" The page reported: {'; '.join(rejection)}."
-                    logger.warning("application %s: %s", self.application_id, reason)
-                    self.checkpoint("submission_unconfirmed")
-                    error_log = self._safe_write_error_log(reason)
+            if status == "applied":
+                self.checkpoint("submission_confirmed")
+            elif status == "needs_review":
+                # A human has to confirm on the ATS side before any retry,
+                # since retrying a submission that actually succeeded would
+                # double-apply.
+                self.checkpoint("submission_unconfirmed")
+            error_log = self._safe_write_error_log(submit_error) if submit_error else None
         elif action == "NEEDS_REVIEW":
             status = "needs_review"
         else:  # COPILOT_REVIEW — form is filled; a human clicks submit themselves
@@ -545,6 +759,7 @@ class ApplicationFlowManager:
             confidence=confidence,
             screenshot_paths=screenshot_paths,
             error_log=error_log,
+            pages_completed=pages_processed,
         )
 
     # ------------------------------------------------------------------
@@ -562,12 +777,18 @@ class ApplicationFlowManager:
         answered", and reports whether it's the last one.
 
         Order matters throughout: settle before reading anything (a
-        half-rendered page looks like a short one), check human-only gates
-        before filling anything, upload before filling (a résumé upload on a
-        modern ATS often auto-populates the fields below it), fill in rounds
-        so conditional follow-ups get their turn, and run vision LAST because a
-        field is only genuinely "left over" once every cheaper pass has had a
-        go at it."""
+        half-rendered page looks like a short one), check for a hard human
+        gate before filling anything (a login wall or OTP challenge means
+        there is no real FORM behind it yet — nothing to fill), upload before
+        filling (a résumé upload on a modern ATS often auto-populates the
+        fields below it), fill in rounds so conditional follow-ups get their
+        turn, run vision near the end because a field is only genuinely
+        "left over" once every cheaper pass has had a go at it, and check for
+        a CAPTCHA LAST, after everything fillable has been attempted — a
+        CAPTCHA widget on a real ATS form (Greenhouse included) typically
+        gates SUBMISSION, not the fields themselves, so a human is asked to
+        solve it only once there is nothing left for automation to usefully
+        do on this page, not before a single field has been typed."""
         wait_for_page_settled(page)
 
         dismissed = adapter.dismiss_distractions()
@@ -577,31 +798,23 @@ class ApplicationFlowManager:
                 self.application_id, page_index + 1, len(dismissed), ", ".join(dismissed),
             )
 
-        # Checked on EVERY page, not just the first. A login wall or an OTP
-        # challenge appearing at step 3 of a Workday application is exactly as
-        # much of a hard stop as one on the landing page, and before multi-page
-        # support these checks could only ever see page 1.
-        if page_has_captcha(page):
-            self.checkpoint("captcha_detected")
-            logger.info(
-                "application %s: CAPTCHA detected on page %d — stopping before filling anything.",
-                self.application_id, page_index + 1,
-            )
-            return _PageProgress(
-                signature=capture_page_signature(page),
-                blocked_reason="CAPTCHA present — a human must solve it; automation never will.",
-            )
-
-        # Everything else that only a human may transact with: an account
-        # wall, OTP/MFA, email/SMS verification, identity documents, payment.
-        # Same hard stop as CAPTCHA, and for the same reason — these are
-        # never worked around, only handed over.
+        # Checked on EVERY page, not just the first. A login wall, OTP
+        # challenge, identity/payment gate means there is no application FORM
+        # behind it at all yet — genuinely nothing fillable — so this alone
+        # stays an early hard stop, unlike CAPTCHA below.
+        #
+        # NEVER bypassed/solved/circumvented — see `_wait_for_human`. The run
+        # pauses, waits for a HUMAN to clear it in this same visible browser,
+        # and resumes automatically if they do within the timeout; only a
+        # timeout falls back to today's hard stop (`manual_required`).
         human_gate = find_human_gate(page)
         if human_gate is not None:
             reason = f"Human intervention required before this form can be filled: {human_gate}."
-            self.checkpoint("human_gate_detected")
+            self.checkpoint("human_gate_detected", page_number=page_index + 1)
             logger.info("application %s: %s", self.application_id, reason)
-            return _PageProgress(signature=capture_page_signature(page), blocked_reason=reason)
+            if not self._wait_for_human(page_index, reason, lambda: find_human_gate(page) is None):
+                return _PageProgress(signature=capture_page_signature(page), blocked_reason=reason)
+            wait_for_page_settled(page)
 
         arrival = capture_page_signature(page)
         logger.info(
@@ -628,6 +841,21 @@ class ApplicationFlowManager:
         # the system was structurally unable to rescue most of the form.
         vision_confirmed = self._run_vision_pass(adapter, all_results)
         if vision_confirmed:
+            signature = capture_page_signature(page)
+
+        # CAPTCHA is checked LAST, after everything fillable on this page has
+        # been attempted — see this method's docstring for why. NEVER
+        # bypassed/solved/circumvented: the run pauses, waits for a HUMAN to
+        # clear it in this same visible browser (`_wait_for_human`), and
+        # resumes automatically if they do within the timeout; only a
+        # timeout falls back to `manual_required`.
+        if page_has_captcha(page):
+            self.checkpoint("captcha_detected", page_number=page_index + 1)
+            reason = "CAPTCHA present — a human must solve it; automation never will."
+            logger.info("application %s: CAPTCHA detected on page %d.", self.application_id, page_index + 1)
+            if not self._wait_for_human(page_index, reason, lambda: not page_has_captcha(page)):
+                return _PageProgress(signature=signature, blocked_reason=reason)
+            wait_for_page_settled(page)
             signature = capture_page_signature(page)
 
         is_final = self._safe_is_final_page(adapter)
@@ -657,6 +885,12 @@ class ApplicationFlowManager:
         `answer_questions()` already covers any profile-mapped field among
         them. Re-running the personal-info pass would re-fill (and re-count)
         fields that are already done."""
+        # HITL platform: tells the (possibly reused across pages)
+        # answer_engine which page it's on right now, so every question it
+        # persists to the per-application ledger carries the right
+        # `page_number` — see `ApplicationAnswerEngine.current_page_number`.
+        if self.answer_engine is not None:
+            self.answer_engine.current_page_number = page_index + 1
         signature = capture_page_signature(page)
 
         for round_index in range(self.MAX_FILL_ROUNDS):
@@ -867,6 +1101,7 @@ class ApplicationFlowManager:
             confidence=self._aggregate_confidence(all_results),
             screenshot_paths=self._safe_screenshot(page),
             error_log=self._safe_write_error_log(reason),
+            pages_completed=page_index + 1,
         )
 
     # ------------------------------------------------------------------
@@ -875,6 +1110,199 @@ class ApplicationFlowManager:
     # Every one of these is overridable per ATS (see `ATSAdapter`'s "Multi-page
     # navigation" section), so a platform-specific override raising must degrade
     # to the generic answer rather than crash a run that is otherwise fine.
+
+    def _wait_for_human(self, page_index: int, reason: str, cleared: Callable[[], bool]) -> bool:
+        """Pauses this run for a human to resolve `reason` (a CAPTCHA or
+        other human-only gate) in this run's own visible browser, polling
+        `cleared()` every `HUMAN_WAIT_POLL_INTERVAL_S` up to
+        `AUTOMATION_HUMAN_WAIT_TIMEOUT_S`. Returns `True` the moment `cleared()`
+        reports the gate is gone — the caller then continues filling THIS SAME
+        run, no restart, no new browser. Returns `False` on timeout, at which
+        point the caller falls back to exactly today's behavior
+        (`manual_required`, browser left open per `should_keep_browser_open`).
+
+        Never attempts to solve, bypass, or circumvent anything itself — the
+        only actions here are reporting the wait and re-checking `cleared()`."""
+        self.checkpoint("waiting_for_human", page_number=page_index + 1)
+        state = LIVE_RUN_STATE.setdefault(self.application_id, {})
+        state["status"] = "WAITING_FOR_HUMAN"
+        state["reason"] = reason
+        if self.on_waiting_for_human is not None:
+            try:
+                self.on_waiting_for_human(reason)
+            except Exception:  # noqa: BLE001 - a broken status callback must never break the wait
+                logger.exception("application %s: on_waiting_for_human callback failed — continuing to wait.", self.application_id)
+
+        logger.info(
+            "application %s: waiting up to %.0fs for a human to resolve this on page %d: %s",
+            self.application_id, self.human_wait_timeout_s, page_index + 1, reason,
+        )
+        deadline = time.monotonic() + self.human_wait_timeout_s
+        while time.monotonic() < deadline:
+            time.sleep(HUMAN_WAIT_POLL_INTERVAL_S)
+            try:
+                if cleared():
+                    logger.info(
+                        "application %s: human verification completed on page %d — resuming automatically.",
+                        self.application_id, page_index + 1,
+                    )
+                    self.checkpoint("human_verification_completed", page_number=page_index + 1)
+                    state["status"] = "IN_PROGRESS"
+                    state.pop("reason", None)
+                    return True
+            except Exception:  # noqa: BLE001 - a broken poll check must never crash the wait loop
+                logger.exception(
+                    "application %s: error while checking whether the human gate cleared — still waiting.",
+                    self.application_id,
+                )
+
+        logger.warning(
+            "application %s: human verification wait timed out after %.0fs on page %d.",
+            self.application_id, self.human_wait_timeout_s, page_index + 1,
+        )
+        return False
+
+    def _safe_detect_job_posting_metadata(self, page: Page) -> tuple[str | None, str | None]:
+        try:
+            return find_job_posting_title_and_company(page)
+        except Exception:  # noqa: BLE001 - best-effort metadata read must never break a run
+            logger.debug("application %s: could not read job posting metadata from the page.", self.application_id)
+            return None, None
+
+    def _resolve_adapter_from_listing_page(self, page: Page) -> tuple[type[ATSAdapter], Page] | None:
+        """"Apply from Job Link": called only when pre-flight detection came
+        back as `FALLBACK_ATS` — this page might be a job LISTING/description
+        page sitting in front of a supported ATS, reached by clicking its own
+        Apply/Apply Now/Start Application control, rather than itself being
+        unsupported. Returns `None` (never bypassing anything) when a
+        human-only gate's wait times out, or when no supported ATS can be
+        resolved even after trying the click — the caller then reports
+        `needs_review`, exactly as `mark_unsupported_ats` would have for a
+        confidently-detected-but-unimplemented platform.
+
+        CAPTCHA/human-gate checks happen here FIRST, before ever looking for
+        an Apply button — a listing page can be gated exactly like a form can
+        (§9/§5: never bypassed, only waited out)."""
+        if page_has_captcha(page):
+            self.checkpoint("captcha_detected", page_number=1)
+            reason = "CAPTCHA present on the job listing page — a human must solve it; automation never will."
+            if not self._wait_for_human(0, reason, lambda: not page_has_captcha(page)):
+                return None
+
+        human_gate = find_human_gate(page)
+        if human_gate is not None:
+            reason = f"Human intervention required before this job page can be opened: {human_gate}."
+            self.checkpoint("human_gate_detected", page_number=1)
+            if not self._wait_for_human(0, reason, lambda: find_human_gate(page) is None):
+                return None
+
+        resolved = self._detect_supported_ats(page)
+        if resolved is not None:
+            self.checkpoint("ats_detected_on_live_page")
+            return resolved[0], page
+
+        apply_button = find_apply_entry_button(page)
+        if apply_button is None:
+            logger.info(
+                "application %s: no supported ATS detected and no Apply/Apply Now/Start Application "
+                "control found on %s.", self.application_id, page.url,
+            )
+            return None
+
+        self.checkpoint("apply_entry_button_clicked")
+        target_page = self._click_apply_and_follow(page, apply_button)
+        if target_page is None:
+            return None
+
+        wait_for_form_ready(target_page)
+        resolved = self._detect_supported_ats(target_page)
+        if resolved is None:
+            logger.info(
+                "application %s: clicked Apply but the resulting page (%s) still isn't a "
+                "recognized/supported ATS.", self.application_id, target_page.url,
+            )
+            return None
+        self.checkpoint("ats_detected_after_apply_click")
+        return resolved[0], target_page
+
+    def _detect_supported_ats(self, page: Page) -> tuple[type[ATSAdapter], str] | None:
+        """Re-runs full (tier-1 + tier-2) `ATSDetector` detection against the
+        CURRENT live page — tier 2's DOM-fingerprint check needs a real page
+        anyway (see `ATSDetector.detect_from_page`), so this costs nothing
+        extra over the pre-flight, page-less check the caller already ran.
+        Updates `self.ats_platform` and returns `(adapter_cls, ats_platform)`
+        on a confident, supported match; `None` otherwise (still `FALLBACK_ATS`,
+        or a real platform this deployment has no adapter for yet)."""
+        detection = ATSDetector.detect(page.url, page)
+        if detection["ats"] == FALLBACK_ATS:
+            return None
+        adapter_cls = get_adapter_class(detection["ats"])
+        if adapter_cls is None:
+            return None
+        self.ats_platform = detection["ats"]
+        return adapter_cls, detection["ats"]
+
+    def _click_apply_and_follow(self, page: Page, apply_button: Locator) -> Page | None:
+        """Clicks the Apply control and returns whichever page ends up hosting
+        the real form — a NEW TAB if the click opened one (common: many job
+        postings' Apply links use `target="_blank"`), or the SAME page if it
+        navigated/re-rendered in place. `None` if the click didn't land or
+        nothing changed at all.
+
+        Reuses `advance_to_next_page` (the same click-and-PROVE-it-moved
+        logic multi-page navigation uses) for the same-page case, rather than
+        a bare `.click()` — an Apply button is exactly as likely to be
+        covered by a cookie banner or momentarily unclickable as a form's own
+        Next button."""
+        before = capture_page_signature(page)
+        context = page.context
+        new_page: Page | None = None
+        outcome: NavigationOutcome | None = None
+        try:
+            with context.expect_page(timeout=6_000) as new_page_info:
+                outcome = advance_to_next_page(page, apply_button, before=before)
+            new_page = new_page_info.value
+        except PlaywrightError:
+            pass  # no new tab opened within the timeout — same-page navigation, if any, is in `outcome`
+
+        if new_page is not None:
+            try:
+                new_page.wait_for_load_state("domcontentloaded", timeout=15_000)
+            except PlaywrightError:
+                pass
+            self.browser_manager.adopt_page(new_page)
+            logger.info(
+                "application %s: Apply control opened a new tab (%s).", self.application_id, new_page.url,
+            )
+            return new_page
+
+        if outcome is not None and outcome.advanced:
+            logger.info(
+                "application %s: Apply control navigated in place — %s", self.application_id, outcome.reason,
+            )
+            return page
+
+        logger.info("application %s: clicked the Apply control but nothing navigated.", self.application_id)
+        return None
+
+    def _kill_switch_engaged(self) -> bool:
+        """Fail CLOSED: if there's no callback at all, the kill switch simply
+        isn't wired up for this caller (tests, or a caller that doesn't need
+        it) and autopilot proceeds as before. If a callback WAS given but it
+        raises (DB unreachable, etc.), that is treated as "engaged" — per
+        PHASE2_ARCHITECTURE.md Initiative 3, the explicit product requirement
+        is "never auto-submit without permission," so an unknown kill-switch
+        state must never be read as permission."""
+        if self.is_kill_switch_engaged is None:
+            return False
+        try:
+            return bool(self.is_kill_switch_engaged())
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "application %s: kill switch check failed — failing closed (treating as engaged).",
+                self.application_id,
+            )
+            return True
 
     def _safe_find_next_control(self, adapter: ATSAdapter) -> Locator | None:
         try:
