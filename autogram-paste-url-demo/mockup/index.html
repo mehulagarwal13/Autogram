@@ -1,0 +1,503 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Autogram — Paste a Job URL (Concept)</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --indigo:#6366f1; --fuchsia:#d946ef; --cyan:#06b6d4;
+    --emerald:#10b981; --amber:#f59e0b; --rose:#f43f5e; --sky:#0ea5e9;
+    --slate-950:#020617; --slate-200:#e2e8f0; --slate-400:#94a3b8; --slate-500:#64748b;
+  }
+  *{box-sizing:border-box;}
+  html,body{margin:0;padding:0;width:1920px;min-height:1080px;}
+  body{
+    font-family:'Inter',system-ui,sans-serif; color:var(--slate-200); background:var(--slate-950);
+    background-image:
+      radial-gradient(ellipse 60% 40% at 15% -10%, rgba(99,102,241,0.20), transparent),
+      radial-gradient(ellipse 50% 35% at 90% 0%, rgba(217,70,239,0.14), transparent),
+      radial-gradient(ellipse 45% 35% at 50% 110%, rgba(14,165,233,0.09), transparent);
+    background-attachment:fixed; -webkit-font-smoothing:antialiased;
+  }
+  a{color:inherit;text-decoration:none;}
+  .glass{
+    border-radius:22px;border:1px solid rgba(255,255,255,0.09);background:rgba(255,255,255,0.045);
+    backdrop-filter:blur(24px);
+    box-shadow:0 24px 60px -12px rgba(0,0,0,0.55), 0 2px 8px rgba(0,0,0,0.25), inset 0 1px 0 rgba(255,255,255,0.06);
+  }
+  .grad-text{background:linear-gradient(90deg,#818cf8,#e879f9,#38bdf8);-webkit-background-clip:text;background-clip:text;color:transparent;}
+  .btn-primary{display:inline-flex;align-items:center;gap:8px;border-radius:12px;border:none;cursor:pointer;
+    background:linear-gradient(135deg,var(--indigo),var(--fuchsia)); padding:14px 24px;font-size:14.5px;font-weight:600;color:#fff;
+    box-shadow:0 12px 28px -6px rgba(99,102,241,0.45), inset 0 1px 0 rgba(255,255,255,0.25); transition:filter .15s, transform .15s;}
+  .btn-primary:hover{filter:brightness(1.08);}
+  .btn-primary:active{transform:scale(0.98);}
+  .btn-primary:disabled{opacity:0.35;pointer-events:none;}
+  .input-dark{width:100%;border-radius:12px;border:1px solid rgba(255,255,255,0.11);background:rgba(15,23,42,0.65);
+    padding:15px 17px;font-size:14.5px;color:var(--slate-200);outline:none;font-family:inherit;
+    box-shadow:inset 0 1px 3px rgba(0,0,0,0.3);}
+  .input-dark:focus{border-color:rgba(129,140,248,0.65);box-shadow:0 0 0 3px rgba(99,102,241,0.22);}
+  .chip{display:inline-flex;align-items:center;gap:6px;border-radius:999px;padding:4px 12px;font-size:12px;font-weight:600;}
+  .chip-indigo{background:rgba(99,102,241,0.16);color:#a5b4fc;}
+  .chip-emerald{background:rgba(16,185,129,0.16);color:#6ee7b7;}
+  .chip-amber{background:rgba(245,158,11,0.16);color:#fcd34d;}
+  .icon{width:16px;height:16px;stroke:currentColor;fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round;flex:none;}
+
+  .app-header{display:flex;align-items:center;gap:10px;padding:28px 44px;}
+  .brand-badge{width:32px;height:32px;border-radius:9px;background:linear-gradient(135deg,var(--indigo),var(--fuchsia));
+    display:flex;align-items:center;justify-content:center;box-shadow:0 8px 18px -4px rgba(99,102,241,0.5);flex:none;}
+  .brand-name{font-size:18px;font-weight:800;letter-spacing:-0.02em;}
+
+  .view{display:none;}
+  .view.active{display:block;animation:viewIn .48s cubic-bezier(.22,.9,.32,1) both;}
+  @keyframes viewIn{from{opacity:0;transform:translateY(14px) scale(.985);}to{opacity:1;transform:translateY(0) scale(1);}}
+
+  /* ---------- realistic Chrome-style browser chrome ---------- */
+  .chrome-window{border-radius:12px;overflow:hidden;
+    box-shadow:0 32px 70px -14px rgba(0,0,0,0.55), 0 6px 18px rgba(0,0,0,0.3);
+    animation:chromeIn .5s cubic-bezier(.22,.9,.32,1) both;}
+  @keyframes chromeIn{from{opacity:0;transform:scale(.965) translateY(8px);}to{opacity:1;transform:scale(1) translateY(0);}}
+  .chrome-tabbar{background:#dfe1e6;padding:9px 10px 0;display:flex;align-items:flex-end;gap:0;}
+  .chrome-tab{background:#fff;border-radius:9px 9px 0 0;padding:9px 16px 9px 12px;display:flex;align-items:center;gap:8px;
+    font-size:12px;color:#3c4043;font-weight:500;max-width:260px;box-shadow:0 -1px 0 rgba(0,0,0,0.04) inset;}
+  .chrome-tab .favicon{width:14px;height:14px;border-radius:4px;background:linear-gradient(135deg,var(--indigo),var(--fuchsia));flex:none;}
+  .chrome-tab span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+  .chrome-toolbar{background:#fff;padding:10px 14px;display:flex;align-items:center;gap:10px;}
+  .chrome-nav{display:flex;align-items:center;gap:4px;flex:none;color:#80868b;}
+  .chrome-nav svg{width:17px;height:17px;stroke-width:2.2;}
+  .chrome-omnibox{flex:1;background:#f1f3f4;border-radius:18px;padding:8px 16px;display:flex;align-items:center;gap:9px;
+    font-size:13px;color:#3c4043;}
+  .chrome-omnibox svg{color:#188038;width:14px;height:14px;flex:none;}
+  .chrome-dots{display:flex;flex-direction:column;gap:3px;flex:none;padding:0 4px;}
+  .chrome-dots span{width:3.5px;height:3.5px;border-radius:50%;background:#5f6368;}
+  .browser-page{background:#fff;color:#111827;min-height:660px;padding:0;}
+
+  .site-nav{display:flex;align-items:center;justify-content:space-between;padding:22px 52px;border-bottom:1px solid #eef0f3;}
+  .site-wordmark{font-weight:800;font-size:17px;color:#0f172a;letter-spacing:-0.01em;}
+  .site-wordmark span{color:#4338ca;}
+  .site-navlinks{display:flex;gap:28px;font-size:13px;color:#64748b;font-weight:500;}
+  .site-content{padding:40px 52px 0;}
+  .site-eyebrow{color:#4338ca;font-weight:700;font-size:12px;letter-spacing:.06em;text-transform:uppercase;}
+  .site-title{font-size:26px;font-weight:800;color:#0f172a;letter-spacing:-0.01em;margin-top:8px;}
+  .site-meta-row{display:flex;align-items:center;gap:10px;margin-top:12px;flex-wrap:wrap;}
+  .site-meta-pill{font-size:12px;font-weight:600;color:#475569;background:#f1f5f9;padding:5px 12px;border-radius:999px;}
+  .site-body{margin-top:20px;font-size:14px;line-height:1.8;color:#334155;max-width:620px;}
+  .site-apply-btn{margin-top:26px;background:#0f172a;color:#fff;border:none;padding:13px 26px;border-radius:10px;
+    font-weight:700;font-size:13.5px;cursor:pointer;box-shadow:0 8px 20px -6px rgba(15,23,42,0.4);}
+  .site-perks{display:flex;gap:16px;margin-top:44px;padding-top:32px;border-top:1px solid #eef0f3;max-width:760px;}
+  .site-perk{flex:1;}
+  .site-perk .pk-icon{width:32px;height:32px;border-radius:9px;background:#eef2ff;color:#4338ca;display:flex;align-items:center;
+    justify-content:center;margin-bottom:10px;}
+  .site-perk .pk-icon svg{width:16px;height:16px;}
+  .site-perk h4{font-size:13px;font-weight:700;color:#0f172a;margin:0 0 4px;}
+  .site-perk p{font-size:12px;color:#64748b;margin:0;line-height:1.5;}
+
+  .copy-link-btn{display:inline-flex;align-items:center;gap:7px;border:1px solid #dbe0e6;background:#fff;
+    color:#3c4043;border-radius:8px;padding:9px 16px;font-size:12.5px;font-weight:600;cursor:pointer;flex:none;position:relative;
+    box-shadow:0 1px 2px rgba(0,0,0,0.04);}
+  .copy-toast{position:absolute;top:-36px;right:0;background:var(--emerald);color:#052e1f;font-size:11.5px;font-weight:700;
+    padding:6px 11px;border-radius:7px;opacity:0;transform:translateY(4px);transition:all .25s;white-space:nowrap;}
+  .copy-toast.show{opacity:1;transform:translateY(0);}
+
+  /* ---------- Autogram portal ---------- */
+  .portal-wrap{max-width:780px;margin:80px auto 0;padding:0 40px;}
+  .portal-card{padding:48px 52px;}
+  .portal-h1{font-size:25px;font-weight:800;letter-spacing:-0.02em;margin:0;}
+  .portal-sub{color:var(--slate-400);font-size:14px;margin-top:10px;line-height:1.65;}
+  .paste-row{display:flex;gap:10px;margin-top:28px;}
+  .paste-row .input-dark{font-size:13.5px;}
+
+  .proc-context{font-size:12.5px;color:var(--slate-500);margin-top:28px;padding-top:24px;border-top:1px solid rgba(255,255,255,0.08);}
+  .proc-context b{color:var(--slate-200);font-weight:600;}
+  .proc-list{margin-top:20px;}
+  .proc-step{display:flex;align-items:center;gap:13px;padding:11px 0;font-size:14px;color:var(--slate-500);
+    transition:color .2s;}
+  .proc-step .dot{width:21px;height:21px;border-radius:50%;border:2px solid rgba(255,255,255,0.16);flex:none;
+    display:flex;align-items:center;justify-content:center;transition:all .25s;}
+  .proc-step.active{color:var(--slate-200);}
+  .proc-step.active .dot{border-color:var(--indigo);box-shadow:0 0 0 4px rgba(99,102,241,0.15);}
+  .proc-step.done{color:var(--slate-200);}
+  .proc-step.done .dot{border-color:var(--emerald);background:var(--emerald);}
+  .proc-step.done .dot svg{display:block;}
+  .proc-step .dot svg{display:none;width:11px;height:11px;stroke:#052e1f;stroke-width:3;}
+  .spinner{width:10px;height:10px;border-radius:50%;border:2px solid rgba(99,102,241,0.3);border-top-color:var(--indigo);
+    animation:spin .7s linear infinite;display:none;}
+  .proc-step.active .spinner{display:block;}
+  @keyframes spin{to{transform:rotate(360deg);}}
+
+  #btn-apply-agent{margin-top:28px;opacity:0;transform:translateY(6px);transition:all .4s;pointer-events:none;width:100%;justify-content:center;}
+  #btn-apply-agent.show{opacity:1;transform:translateY(0);pointer-events:auto;}
+
+  /* ---------- Automation view ---------- */
+  .automation-wrap{max-width:1440px;margin:0 auto;padding:8px 40px 40px;}
+  .automation-top{display:flex;align-items:center;justify-content:space-between;margin-bottom:20px;}
+  .automation-title{font-size:20px;font-weight:800;}
+
+  .form-grid{display:grid;grid-template-columns:1fr 1fr;gap:18px;max-width:740px;margin-top:24px;}
+  .form-field label{display:block;font-size:12px;font-weight:600;color:#475569;margin-bottom:7px;}
+  .form-field input, .form-field select, .form-field textarea{width:100%;padding:11px 13px;border:1px solid #d5dbe3;
+    border-radius:9px;font-size:13px;font-family:inherit;color:#0f172a;transition:border-color .15s;}
+  .form-field input:focus, .form-field select:focus{border-color:#818cf8;outline:none;}
+  .form-field.full{grid-column:1 / -1;}
+  .resume-chip{display:inline-flex;align-items:center;gap:8px;background:#eef2ff;color:#3730a3;padding:9px 13px;
+    border-radius:9px;font-size:12.5px;font-weight:600;opacity:0.35;transition:opacity .35s;}
+  .form-submit{margin-top:24px;background:linear-gradient(135deg,#6366f1,#d946ef);color:#fff;border:none;padding:13px 28px;
+    border-radius:11px;font-weight:700;font-size:14px;cursor:pointer;box-shadow:0 10px 24px -6px rgba(99,102,241,0.4);}
+
+  .success-wrap{padding:90px 40px;text-align:center;}
+  .success-badge{width:62px;height:62px;border-radius:50%;background:#ecfdf5;color:#059669;display:flex;align-items:center;
+    justify-content:center;margin:0 auto 18px;box-shadow:0 0 0 8px rgba(16,185,129,0.08);}
+  .success-title{font-size:19px;font-weight:800;color:#0f172a;}
+  .success-sub{color:#64748b;font-size:13.5px;margin-top:8px;}
+
+  .captcha-overlay{position:absolute;inset:0;background:rgba(2,6,23,0.6);display:none;align-items:center;justify-content:center;z-index:20;
+    backdrop-filter:blur(2px);}
+  .captcha-overlay.show{display:flex;animation:viewIn .3s ease both;}
+  .captcha-card{background:#fff;color:#111827;border-radius:18px;padding:34px 38px;width:430px;text-align:center;
+    box-shadow:0 30px 70px -10px rgba(0,0,0,0.4);}
+  .captcha-lock{width:50px;height:50px;border-radius:50%;background:#fef3c7;color:#b45309;display:flex;align-items:center;
+    justify-content:center;margin:0 auto 16px;}
+  .captcha-title{font-size:17px;font-weight:800;}
+  .captcha-sub{font-size:13px;color:#64748b;margin-top:7px;line-height:1.6;}
+  .captcha-box{margin-top:22px;border:1px solid #e2e8f0;border-radius:11px;padding:15px 17px;display:flex;align-items:center;
+    gap:12px;text-align:left;background:#f8fafc;}
+  .captcha-check{width:23px;height:23px;border-radius:5px;border:2px solid #94a3b8;flex:none;cursor:pointer;display:flex;
+    align-items:center;justify-content:center;background:#fff;transition:all .2s;}
+  .captcha-check.checked{background:#10b981;border-color:#10b981;}
+  .captcha-check .icon{width:14px;height:14px;stroke:#fff;display:none;}
+  .captcha-check.checked .icon{display:block;}
+  .captcha-box-label{font-size:13px;font-weight:600;color:#334155;}
+
+  .agent-pill{display:inline-flex;align-items:center;gap:8px;font-size:12.5px;font-weight:700;padding:7px 15px;border-radius:999px;}
+
+  .stage{display:none;}
+  .stage.active{display:block;animation:viewIn .35s ease both;}
+
+  /* ---------- Summary view ---------- */
+  .summary-wrap{max-width:660px;margin:90px auto 0;padding:0 40px;}
+  .summary-card{padding:42px 46px;}
+  .summary-head{display:flex;align-items:center;gap:15px;}
+  .summary-check{width:46px;height:46px;border-radius:50%;background:rgba(16,185,129,0.16);color:var(--emerald);
+    display:flex;align-items:center;justify-content:center;flex:none;box-shadow:0 0 0 6px rgba(16,185,129,0.07);}
+  .summary-title{font-size:20px;font-weight:800;}
+  .summary-rows{margin-top:28px;border-top:1px solid rgba(255,255,255,0.09);}
+  .summary-row{display:flex;justify-content:space-between;padding:15px 0;border-bottom:1px solid rgba(255,255,255,0.07);font-size:13.5px;}
+  .summary-row .k{color:var(--slate-400);}
+  .summary-row .v{font-weight:600;color:var(--slate-200);}
+</style>
+</head>
+<body>
+
+<div class="app-header">
+  <div class="brand-badge">
+    <svg class="icon" style="stroke:#fff;width:17px;height:17px" viewBox="0 0 24 24"><path d="M12 2a4 4 0 0 1 4 4 4 4 0 0 1-1.2 2.86A4 4 0 0 1 16 12a4 4 0 0 1-1.2 2.86A4 4 0 0 1 16 18a4 4 0 1 1-8 0 4 4 0 0 1 1.2-3.14A4 4 0 0 1 8 12a4 4 0 0 1 1.2-2.86A4 4 0 0 1 8 6a4 4 0 0 1 4-4z"/></svg>
+  </div>
+  <div class="brand-name">Auto<span class="grad-text">gram</span></div>
+</div>
+
+<!-- ============ VIEW 1: the open web ============ -->
+<section class="view active" id="view-web">
+  <div style="max-width:1240px;margin:16px auto 0;padding:0 40px;">
+    <div class="chrome-window">
+      <div class="chrome-tabbar">
+        <div class="chrome-tab"><span class="favicon"></span><span>Senior Product Manager — Careers</span></div>
+      </div>
+      <div class="chrome-toolbar">
+        <div class="chrome-nav">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M15 18l-6-6 6-6"/></svg>
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M9 18l6-6-6-6"/></svg>
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M3 12a9 9 0 1 0 2.6-6.3M3 5v5h5"/></svg>
+        </div>
+        <div class="chrome-omnibox">
+          <svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 1a5 5 0 0 0-5 5v3H6a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-9a2 2 0 0 0-2-2h-1V6a5 5 0 0 0-5-5zm-3 8V6a3 3 0 1 1 6 0v3z"/></svg>
+          <span id="web-addr">northbridgefinancial.com/jobs/1847-product-manager</span>
+        </div>
+        <button class="copy-link-btn" id="copy-link-btn" data-testid="copy-link-btn">
+          <svg class="icon" style="width:13px;height:13px" viewBox="0 0 24 24"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+          Copy link
+          <span class="copy-toast" id="copy-toast">Copied</span>
+        </button>
+        <div class="chrome-dots"><span></span><span></span><span></span></div>
+      </div>
+      <div class="browser-page">
+        <div class="site-nav">
+          <div class="site-wordmark">North<span>bridge</span> Financial</div>
+          <div class="site-navlinks"><span>About</span><span>Products</span><span>Careers</span></div>
+        </div>
+        <div class="site-content">
+          <div class="site-eyebrow">Careers · Product</div>
+          <div class="site-title">Senior Product Manager, Digital Banking</div>
+          <div class="site-meta-row">
+            <span class="site-meta-pill">Remote (US)</span>
+            <span class="site-meta-pill">$145K – $170K</span>
+            <span class="site-meta-pill">Posted 3 days ago</span>
+          </div>
+          <div class="site-body">
+            Own the roadmap for our digital banking platform, used by 2M+ customers. Partner with engineering, design, and compliance to ship features that matter. 6+ years of product experience required, fintech background a plus.
+          </div>
+          <button class="site-apply-btn" disabled style="opacity:.5;cursor:default;">Apply for this job</button>
+          <div class="site-perks">
+            <div class="site-perk">
+              <div class="pk-icon"><svg class="icon" viewBox="0 0 24 24"><path d="M12 2v20M2 12h20"/></svg></div>
+              <h4>Remote-first</h4><p>Work from anywhere in the US, with quarterly team offsites.</p>
+            </div>
+            <div class="site-perk">
+              <div class="pk-icon"><svg class="icon" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 3"/></svg></div>
+              <h4>Flexible hours</h4><p>Own your schedule around a lightweight core-hours overlap.</p>
+            </div>
+            <div class="site-perk">
+              <div class="pk-icon"><svg class="icon" viewBox="0 0 24 24"><path d="M12 2l3 7h7l-5.5 4.5L18 21l-6-4-6 4 1.5-7.5L2 9h7z"/></svg></div>
+              <h4>Equity + bonus</h4><p>Meaningful equity plus an annual performance bonus.</p>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ VIEW 2: Autogram portal (paste + processing) ============ -->
+<section class="view" id="view-portal">
+  <div class="portal-wrap">
+    <div class="portal-card glass">
+
+      <div id="portal-input-stage">
+        <h1 class="portal-h1">Paste a job link. We'll handle the rest.</h1>
+        <p class="portal-sub">Found a role anywhere on the web — a company's own careers page, a job board, anywhere. Drop the link in and Autogram takes it from there.</p>
+        <div class="paste-row">
+          <input class="input-dark" id="url-input" data-testid="url-input" placeholder="Paste a job URL…" />
+          <button class="btn-primary" id="btn-analyze" data-testid="btn-analyze">Analyze</button>
+        </div>
+      </div>
+
+      <div id="portal-processing-stage" style="display:none;">
+        <h1 class="portal-h1">Analyzing this role</h1>
+        <div class="proc-context">Reading <b>northbridgefinancial.com/jobs/1847-product-manager</b></div>
+        <div class="proc-list">
+          <div class="proc-step" id="step-1"><span class="dot"><span class="spinner"></span><svg class="icon" viewBox="0 0 24 24"><path d="M20 6L9 17l-5-5"/></svg></span>Job link detected</div>
+          <div class="proc-step" id="step-2"><span class="dot"><span class="spinner"></span><svg class="icon" viewBox="0 0 24 24"><path d="M20 6L9 17l-5-5"/></svg></span>Reading job description</div>
+          <div class="proc-step" id="step-3"><span class="dot"><span class="spinner"></span><svg class="icon" viewBox="0 0 24 24"><path d="M20 6L9 17l-5-5"/></svg></span>Matching with candidate profile</div>
+          <div class="proc-step" id="step-4"><span class="dot"><span class="spinner"></span><svg class="icon" viewBox="0 0 24 24"><path d="M20 6L9 17l-5-5"/></svg></span>Preparing application details</div>
+          <div class="proc-step" id="step-5"><span class="dot"><span class="spinner"></span><svg class="icon" viewBox="0 0 24 24"><path d="M20 6L9 17l-5-5"/></svg></span>Resume ready</div>
+        </div>
+        <button class="btn-primary" id="btn-apply-agent" data-testid="btn-apply-agent">
+          <svg class="icon" viewBox="0 0 24 24"><path d="M12 2a4 4 0 0 1 4 4 4 4 0 0 1-1.2 2.86A4 4 0 0 1 16 12a4 4 0 0 1-1.2 2.86A4 4 0 0 1 16 18a4 4 0 1 1-8 0 4 4 0 0 1 1.2-3.14A4 4 0 0 1 8 12a4 4 0 0 1 1.2-2.86A4 4 0 0 1 8 6a4 4 0 0 1 4-4z"/></svg>
+          Apply with AI Agent
+        </button>
+        <div id="launch-status" style="display:none;align-items:center;gap:10px;margin-top:16px;font-size:13px;color:#a5b4fc;font-weight:600;">
+          <span style="width:8px;height:8px;border-radius:50%;background:var(--indigo);position:relative;flex:none;"></span>
+          Launching automation browser…
+        </div>
+      </div>
+
+    </div>
+  </div>
+</section>
+
+<!-- ============ VIEW 3: automation (real browser mock) ============ -->
+<section class="view" id="view-automation">
+  <div class="automation-wrap">
+    <div class="automation-top">
+      <div class="automation-title">Autogram Agent</div>
+      <span class="agent-pill chip-indigo" id="agent-pill">Running</span>
+    </div>
+
+    <div class="chrome-window" style="position:relative;">
+      <div class="chrome-tabbar">
+        <div class="chrome-tab"><span class="favicon"></span><span>Autogram Agent — Applying</span></div>
+      </div>
+      <div class="chrome-toolbar">
+        <div class="chrome-nav">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M15 18l-6-6 6-6"/></svg>
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M9 18l6-6-6-6"/></svg>
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M3 12a9 9 0 1 0 2.6-6.3M3 5v5h5"/></svg>
+        </div>
+        <div class="chrome-omnibox">
+          <svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 1a5 5 0 0 0-5 5v3H6a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-9a2 2 0 0 0-2-2h-1V6a5 5 0 0 0-5-5zm-3 8V6a3 3 0 1 1 6 0v3z"/></svg>
+          <span id="auto-addr">northbridgefinancial.com/jobs/1847-product-manager</span>
+        </div>
+        <div class="chrome-dots"><span></span><span></span><span></span></div>
+      </div>
+      <div class="browser-page" style="position:relative;">
+
+        <div class="stage active" id="stage-job">
+          <div class="site-nav">
+            <div class="site-wordmark">North<span>bridge</span> Financial</div>
+            <div class="site-navlinks"><span>About</span><span>Products</span><span>Careers</span></div>
+          </div>
+          <div class="site-content">
+            <div class="site-eyebrow">Careers · Product</div>
+            <div class="site-title">Senior Product Manager, Digital Banking</div>
+            <div class="site-meta-row">
+              <span class="site-meta-pill">Remote (US)</span>
+              <span class="site-meta-pill">$145K – $170K</span>
+              <span class="site-meta-pill">Posted 3 days ago</span>
+            </div>
+            <div class="site-body">
+              Own the roadmap for our digital banking platform, used by 2M+ customers. Partner with engineering, design, and compliance to ship features that matter. 6+ years of product experience required, fintech background a plus.
+            </div>
+            <button class="site-apply-btn" id="btn-site-apply" data-testid="btn-site-apply">Apply for this job</button>
+          </div>
+        </div>
+
+        <div class="stage" id="stage-form">
+          <div class="site-content" style="padding-top:36px;">
+            <div class="site-title" style="font-size:20px;">Apply — Senior Product Manager, Digital Banking</div>
+            <div class="site-eyebrow" style="margin-top:6px;">Northbridge Financial</div>
+            <div class="form-grid">
+              <div class="form-field"><label>First name</label><input id="f-first" data-testid="f-first" /></div>
+              <div class="form-field"><label>Last name</label><input id="f-last" data-testid="f-last" /></div>
+              <div class="form-field"><label>Email</label><input id="f-email" data-testid="f-email" /></div>
+              <div class="form-field"><label>Phone</label><input id="f-phone" data-testid="f-phone" /></div>
+              <div class="form-field"><label>Current title</label><input id="f-title" data-testid="f-title" /></div>
+              <div class="form-field">
+                <label>Work authorization</label>
+                <select id="f-auth" data-testid="f-auth">
+                  <option value="">Select…</option>
+                  <option value="citizen">U.S. Citizen</option>
+                  <option value="visa">Requires sponsorship</option>
+                </select>
+              </div>
+              <div class="form-field full">
+                <label>Resume</label>
+                <span class="resume-chip" id="resume-chip">
+                  <svg class="icon" style="width:14px;height:14px" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></svg>
+                  jordan_lee_resume.pdf
+                  <span id="resume-check" style="display:none;color:#059669;">✓ attached</span>
+                </span>
+              </div>
+            </div>
+            <button class="form-submit" id="btn-submit" data-testid="btn-submit">Submit Application</button>
+          </div>
+        </div>
+
+        <div class="stage" id="stage-success">
+          <div class="success-wrap">
+            <div class="success-badge"><svg class="icon" style="width:28px;height:28px;stroke:#059669" viewBox="0 0 24 24"><path d="M20 6L9 17l-5-5"/></svg></div>
+            <div class="success-title">Application submitted</div>
+            <div class="success-sub">Thanks for applying to Northbridge Financial.</div>
+          </div>
+        </div>
+
+        <div class="captcha-overlay" id="captcha-overlay">
+          <div class="captcha-card">
+            <div class="captcha-lock"><svg class="icon" style="width:22px;height:22px" viewBox="0 0 24 24"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg></div>
+            <div class="captcha-title">Human action required</div>
+            <div class="captcha-sub">Please complete the verification to continue.</div>
+            <div class="captcha-box">
+              <div class="captcha-check" id="captcha-check" data-testid="captcha-check">
+                <svg class="icon" viewBox="0 0 24 24"><path d="M20 6L9 17l-5-5"/></svg>
+              </div>
+              <span class="captcha-box-label">I'm not a robot</span>
+            </div>
+          </div>
+        </div>
+
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ VIEW 4: Autogram summary ============ -->
+<section class="view" id="view-summary">
+  <div class="summary-wrap">
+    <div class="summary-card glass">
+      <div class="summary-head">
+        <div class="summary-check"><svg class="icon" style="width:22px;height:22px" viewBox="0 0 24 24"><path d="M20 6L9 17l-5-5"/></svg></div>
+        <div class="summary-title">Application submitted successfully</div>
+      </div>
+      <div class="summary-rows">
+        <div class="summary-row"><span class="k">Company</span><span class="v">Northbridge Financial</span></div>
+        <div class="summary-row"><span class="k">Job title</span><span class="v">Senior Product Manager, Digital Banking</span></div>
+        <div class="summary-row"><span class="k">Application status</span><span class="v"><span class="chip chip-emerald">Submitted</span></span></div>
+        <div class="summary-row"><span class="k">AI match score</span><span class="v" style="color:#6ee7b7">92%</span></div>
+        <div class="summary-row"><span class="k">Resume used</span><span class="v">jordan_lee_resume.pdf</span></div>
+        <div class="summary-row"><span class="k">Submission time</span><span class="v">Just now</span></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<script>
+  const $ = (id) => document.getElementById(id);
+  function showView(id){
+    document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
+    $(id).classList.add('active');
+  }
+  function showStage(id){
+    document.querySelectorAll('.stage').forEach(s => s.classList.remove('active'));
+    $(id).classList.add('active');
+  }
+
+  // View 1 -> copy link -> View 2 (portal)
+  $('copy-link-btn').addEventListener('click', () => {
+    $('copy-toast').classList.add('show');
+    setTimeout(() => showView('view-portal'), 550);
+  });
+
+  // Portal: Analyze -> processing steps -> reveal "Apply with AI Agent"
+  $('btn-analyze').addEventListener('click', () => {
+    $('portal-input-stage').style.display = 'none';
+    $('portal-processing-stage').style.display = 'block';
+    const steps = ['step-1', 'step-2', 'step-3', 'step-4', 'step-5'];
+    steps.forEach((id, i) => {
+      setTimeout(() => {
+        if (i > 0) $(steps[i - 1]).classList.remove('active');
+        $(id).classList.add('active');
+        setTimeout(() => {
+          $(id).classList.remove('active');
+          $(id).classList.add('done');
+        }, 380);
+      }, i * 420);
+    });
+    setTimeout(() => $('btn-apply-agent').classList.add('show'), steps.length * 420 + 200);
+  });
+
+  // Apply with AI Agent -> a beat of "launching", then the automation browser opens
+  $('btn-apply-agent').addEventListener('click', () => {
+    $('btn-apply-agent').disabled = true;
+    $('launch-status').style.display = 'flex';
+    setTimeout(() => showView('view-automation'), 750);
+  });
+
+  // Site "Apply for this job" -> form
+  $('btn-site-apply').addEventListener('click', () => {
+    $('auto-addr').textContent = 'northbridgefinancial.com/jobs/1847-product-manager/apply';
+    showStage('stage-form');
+    setTimeout(() => {
+      $('resume-chip').style.opacity = 1;
+      $('resume-check').style.display = 'inline';
+    }, 600);
+  });
+
+  // Submit -> captcha
+  $('btn-submit').addEventListener('click', () => {
+    $('captcha-overlay').classList.add('show');
+    $('agent-pill').textContent = 'Paused — needs you';
+    $('agent-pill').className = 'agent-pill chip-amber';
+  });
+
+  // Captcha check -> resume -> success
+  $('captcha-check').addEventListener('click', () => {
+    const box = $('captcha-check');
+    if (box.classList.contains('checked')) return;
+    box.classList.add('checked');
+    setTimeout(() => {
+      $('captcha-overlay').classList.remove('show');
+      $('agent-pill').textContent = 'Resumed';
+      $('agent-pill').className = 'agent-pill chip-indigo';
+      $('auto-addr').textContent = 'northbridgefinancial.com/jobs/1847-product-manager/confirmation';
+      showStage('stage-success');
+      setTimeout(() => {
+        $('agent-pill').textContent = 'Completed';
+        $('agent-pill').className = 'agent-pill chip-emerald';
+      }, 500);
+    }, 550);
+  });
+
+  window.showView = showView;
+</script>
+</body>
+</html>

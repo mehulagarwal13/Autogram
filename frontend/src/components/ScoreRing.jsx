@@ -1,48 +1,34 @@
-// Animated circular score indicator (0..1 -> percentage ring)
-export default function ScoreRing({ value, size = 72, label }) {
+// Circular score indicator (0..1 -> percentage ring)
+export default function ScoreRing({ value, size = 56, label }) {
   const pct = Math.round((value || 0) * 100);
-  const r = (size - 10) / 2;
+  const r = (size - 8) / 2;
   const c = 2 * Math.PI * r;
   const offset = c - (pct / 100) * c;
-  const hue = pct >= 70 ? "url(#gradGood)" : pct >= 45 ? "url(#gradMid)" : "url(#gradLow)";
+  const color = pct >= 70 ? "#059669" : pct >= 45 ? "#4f46e5" : "#dc2626";
 
   return (
     <div className="flex flex-col items-center gap-1">
       <div className="relative" style={{ width: size, height: size }}>
         <svg width={size} height={size} className="-rotate-90">
-          <defs>
-            <linearGradient id="gradGood" x1="0" y1="0" x2="1" y2="1">
-              <stop offset="0%" stopColor="#34d399" />
-              <stop offset="100%" stopColor="#22d3ee" />
-            </linearGradient>
-            <linearGradient id="gradMid" x1="0" y1="0" x2="1" y2="1">
-              <stop offset="0%" stopColor="#818cf8" />
-              <stop offset="100%" stopColor="#e879f9" />
-            </linearGradient>
-            <linearGradient id="gradLow" x1="0" y1="0" x2="1" y2="1">
-              <stop offset="0%" stopColor="#fb7185" />
-              <stop offset="100%" stopColor="#f59e0b" />
-            </linearGradient>
-          </defs>
-          <circle cx={size / 2} cy={size / 2} r={r} fill="none" stroke="rgba(148,163,184,0.25)" strokeWidth="6" />
+          <circle cx={size / 2} cy={size / 2} r={r} fill="none" stroke="#e2e8f0" strokeWidth="5" />
           <circle
             cx={size / 2}
             cy={size / 2}
             r={r}
             fill="none"
-            stroke={hue}
-            strokeWidth="6"
+            stroke={color}
+            strokeWidth="5"
             strokeLinecap="round"
             strokeDasharray={c}
             strokeDashoffset={offset}
-            style={{ transition: "stroke-dashoffset 0.9s cubic-bezier(0.22, 1, 0.36, 1)" }}
+            style={{ transition: "stroke-dashoffset 0.6s ease" }}
           />
         </svg>
-        <span className="absolute inset-0 flex items-center justify-center text-sm font-bold text-white">
+        <span className="absolute inset-0 flex items-center justify-center text-sm font-semibold text-slate-900">
           {pct}
         </span>
       </div>
-      {label && <span className="text-[10px] uppercase tracking-wider text-slate-400">{label}</span>}
+      {label && <span className="eyebrow">{label}</span>}
     </div>
   );
 }

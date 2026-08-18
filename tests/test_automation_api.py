@@ -11,8 +11,8 @@ from unittest.mock import MagicMock
 import pytest
 from fastapi import HTTPException
 
-from app.api.automation import map_fields
-from app.models.application import FieldMapRequest, FieldQuery
+from app.api.automation import decide, get_automation_config, map_fields
+from app.models.application import DecideRequest, FieldMapRequest, FieldQuery
 
 
 def _fake_answer_result(question, answer, source, confidence):
@@ -85,7 +85,8 @@ def test_map_fields_returns_one_result_per_field_in_order(monkeypatch):
         ],
     )
 
-    results = map_fields(body, user=MagicMock(user_id="user-1"), db=MagicMock())
+    response = map_fields(body, user=MagicMock(user_id="user-1"), db=MagicMock())
+    results = response.fields
 
     assert [r.question_text for r in results] == ["What's your notice period?", "Why do you want this role?"]
     assert results[0].answer == "2 weeks"
@@ -95,3 +96,95 @@ def test_map_fields_returns_one_result_per_field_in_order(monkeypatch):
     assert results[1].confidence_level == "LOW"
     assert captured["kwargs"]["job_description"] == "Backend role"
     assert captured["kwargs"]["application_id"] == "app-1"
+    # One field HIGH (usable), one LOW (not) -> overall_confidence is the
+    # usable fraction, same definition ApplicationFlowManager._aggregate_confidence
+    # uses — and `action` comes straight from decide_action(), not reimplemented.
+    assert response.overall_confidence == 0.5
+    assert response.action in ("AUTO_SUBMIT", "NEEDS_REVIEW", "COPILOT_REVIEW")
+
+
+def test_decide_404s_when_the_application_does_not_belong_to_this_user(monkeypatch):
+    import app.api.automation as automation_module
+
+    monkeypatch.setattr(
+        automation_module.application_repository, "get_by_id",
+        lambda db, aid: MagicMock(application_id="app-1", user_id="someone-else"),
+    )
+    body = DecideRequest(application_id="app-1", overall_confidence=0.9)
+
+    with pytest.raises(HTTPException) as exc_info:
+        decide(body, user=MagicMock(user_id="user-1"), db=MagicMock())
+
+    assert exc_info.value.status_code == 404
+
+
+def test_decide_calls_the_real_decide_action_with_this_applications_platform_and_autopilot_flag(monkeypatch):
+    import app.api.automation as automation_module
+
+    application = MagicMock(application_id="app-1", user_id="user-1", ats_platform="greenhouse", autopilot_enabled=True)
+    monkeypatch.setattr(automation_module.application_repository, "get_by_id", lambda db, aid: application)
+
+    body = DecideRequest(application_id="app-1", overall_confidence=0.95)
+    response = decide(body, user=MagicMock(user_id="user-1"), db=MagicMock())
+
+    # confidence 0.95 + public ATS (greenhouse) + autopilot on -> AUTO_SUBMIT,
+    # straight from the real decide_action(), never reimplemented here.
+    assert response.action == "AUTO_SUBMIT"
+    assert response.overall_confidence == 0.95
+
+
+def test_decide_never_auto_submits_without_autopilot_opted_in(monkeypatch):
+    import app.api.automation as automation_module
+
+    application = MagicMock(application_id="app-1", user_id="user-1", ats_platform="greenhouse", autopilot_enabled=False)
+    monkeypatch.setattr(automation_module.application_repository, "get_by_id", lambda db, aid: application)
+
+    body = DecideRequest(application_id="app-1", overall_confidence=0.95)
+    response = decide(body, user=MagicMock(user_id="user-1"), db=MagicMock())
+
+    assert response.action != "AUTO_SUBMIT"
+
+
+def test_get_config_reports_kill_switch_disengaged_and_real_pacing_values(monkeypatch):
+    import app.api.automation as automation_module
+    from automation.browser.session import DEFAULT_PACING
+
+    monkeypatch.setattr(
+        automation_module.profile_repository, "get_by_user_id",
+        lambda db, uid: MagicMock(autopilot_globally_disabled=False),
+    )
+
+    config = get_automation_config(user=MagicMock(user_id="user-1"), db=MagicMock())
+
+    assert config.kill_switch_engaged is False
+    assert config.pacing.daily_application_cap == DEFAULT_PACING.daily_application_cap
+    assert config.pacing.per_char_delay_ms_min == DEFAULT_PACING.per_char_delay_ms_min
+    assert config.auto_submit_confidence_threshold == 0.85
+    assert config.needs_review_confidence_threshold == 0.6
+    assert "greenhouse" in config.public_ats_platforms
+
+
+def test_get_config_reports_kill_switch_engaged(monkeypatch):
+    import app.api.automation as automation_module
+
+    monkeypatch.setattr(
+        automation_module.profile_repository, "get_by_user_id",
+        lambda db, uid: MagicMock(autopilot_globally_disabled=True),
+    )
+
+    config = get_automation_config(user=MagicMock(user_id="user-1"), db=MagicMock())
+
+    assert config.kill_switch_engaged is True
+
+
+def test_get_config_fails_closed_when_the_kill_switch_check_itself_errors(monkeypatch):
+    import app.api.automation as automation_module
+
+    def _broken(db, uid):
+        raise RuntimeError("db unreachable")
+
+    monkeypatch.setattr(automation_module.profile_repository, "get_by_user_id", _broken)
+
+    config = get_automation_config(user=MagicMock(user_id="user-1"), db=MagicMock())
+
+    assert config.kill_switch_engaged is True

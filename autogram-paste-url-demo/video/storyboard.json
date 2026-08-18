@@ -1,0 +1,395 @@
+{
+  "title": "Autogram — Paste a Job URL (Concept)",
+  "template": "sizzle",
+  "project": "autogram-paste-url-demo-2026-08-18-2335",
+  "brand": "#6366f1",
+  "caption": {
+    "theme": "pill",
+    "size": "md",
+    "position": "bottom"
+  },
+  "intro": {
+    "screenshot": "captures/s1-find-job.png",
+    "title": "Autogram",
+    "subtitle": "Paste a link. Get an application.",
+    "script": "Found a job anywhere on the web? Paste that link into Autogram, and let an AI agent turn it into a submitted application.",
+    "audio": "audio/intro-slide.mp3",
+    "audioDuration": 6.617687
+  },
+  "outro": {
+    "title": "Find the job anywhere.",
+    "subtitle": "Paste the link into Autogram. Let your AI Agent handle the application.",
+    "script": "Find the job anywhere. Paste the link into Autogram. Let your AI Agent handle the application.",
+    "audio": "audio/outro-slide.mp3",
+    "audioDuration": 6.582857
+  },
+  "scenes": [
+    {
+      "id": "s1-find-job",
+      "media": "still",
+      "screenshot": "captures/s1-find-job.png",
+      "script": "Say Jordan finds this \"Senior Product Manager\" role on Meridian Financial's own careers page. Just \"Copy link\".",
+      "focus": {
+        "x": 1448,
+        "y": 135,
+        "zoom": 1.15
+      },
+      "action": {
+        "type": "click",
+        "x": 1448,
+        "y": 135
+      },
+      "durationHint": 4,
+      "audio": "audio/s1-find-job.mp3",
+      "audioDuration": 6.350658
+    },
+    {
+      "id": "s2-paste-analyze",
+      "media": "clip",
+      "clip": "captures/s2-paste-analyze.mp4",
+      "clipDuration": 7.185,
+      "screenshot": "captures/s2-paste-analyze.png",
+      "script": "Paste it into Autogram, hit \"Analyze\" — link detected, description read, matched to Jordan's profile, resume ready. One click on \"Apply with AI Agent\", and a real browser opens automatically, straight to that exact job page.",
+      "events": [
+        {
+          "t": 0,
+          "type": "move",
+          "x": 1448,
+          "y": 135
+        },
+        {
+          "t": 0.875,
+          "type": "move",
+          "x": 1448,
+          "y": 135
+        },
+        {
+          "t": 1.5,
+          "type": "move",
+          "x": 906,
+          "y": 320
+        },
+        {
+          "t": 1.689,
+          "type": "click",
+          "x": 906,
+          "y": 320
+        },
+        {
+          "t": 1.849,
+          "type": "click",
+          "x": 906,
+          "y": 320
+        },
+        {
+          "t": 4.119,
+          "type": "move",
+          "x": 906,
+          "y": 320
+        },
+        {
+          "t": 4.717,
+          "type": "move",
+          "x": 1202,
+          "y": 320
+        },
+        {
+          "t": 4.906,
+          "type": "click",
+          "x": 1202,
+          "y": 320
+        },
+        {
+          "t": 5.242,
+          "type": "move",
+          "x": 1202,
+          "y": 320
+        },
+        {
+          "t": 5.78,
+          "type": "move",
+          "x": 960,
+          "y": 547
+        },
+        {
+          "t": 5.965,
+          "type": "click",
+          "x": 960,
+          "y": 547
+        }
+      ],
+      "durationHint": 4,
+      "audio": "audio/s2-paste-analyze.mp3",
+      "audioDuration": 6.478367
+    },
+    {
+      "id": "s3-apply-click",
+      "media": "still",
+      "screenshot": "captures/s3-apply-click.png",
+      "script": "It lands on the company's own page, and clicks \"Apply for this job\" itself.",
+      "focus": {
+        "x": 429,
+        "y": 476,
+        "zoom": 1.2
+      },
+      "action": {
+        "type": "click",
+        "x": 429,
+        "y": 476
+      },
+      "durationHint": 4,
+      "audio": "audio/s3-apply-click.mp3",
+      "audioDuration": 6.536417
+    },
+    {
+      "id": "s4-form-fill",
+      "media": "clip",
+      "clip": "captures/s4-form-fill.mp4",
+      "clipDuration": 12.572,
+      "screenshot": "captures/s4-form-fill.png",
+      "script": "It fills the form from Jordan's profile — name, contact info, title, work authorization — resume attached automatically. Then, \"Submit Application\".",
+      "events": [
+        {
+          "t": 0,
+          "type": "move",
+          "x": 429,
+          "y": 476
+        },
+        {
+          "t": 0.865,
+          "type": "move",
+          "x": 429,
+          "y": 476
+        },
+        {
+          "t": 1.449,
+          "type": "move",
+          "x": 525,
+          "y": 336
+        },
+        {
+          "t": 1.635,
+          "type": "click",
+          "x": 525,
+          "y": 336
+        },
+        {
+          "t": 1.81,
+          "type": "click",
+          "x": 525,
+          "y": 336
+        },
+        {
+          "t": 2.42,
+          "type": "move",
+          "x": 525,
+          "y": 336
+        },
+        {
+          "t": 2.975,
+          "type": "move",
+          "x": 893,
+          "y": 336
+        },
+        {
+          "t": 3.157,
+          "type": "click",
+          "x": 893,
+          "y": 336
+        },
+        {
+          "t": 3.321,
+          "type": "click",
+          "x": 893,
+          "y": 336
+        },
+        {
+          "t": 3.844,
+          "type": "move",
+          "x": 893,
+          "y": 336
+        },
+        {
+          "t": 4.399,
+          "type": "move",
+          "x": 525,
+          "y": 411
+        },
+        {
+          "t": 4.586,
+          "type": "click",
+          "x": 525,
+          "y": 411
+        },
+        {
+          "t": 4.758,
+          "type": "click",
+          "x": 525,
+          "y": 411
+        },
+        {
+          "t": 5.786,
+          "type": "move",
+          "x": 525,
+          "y": 411
+        },
+        {
+          "t": 6.373,
+          "type": "move",
+          "x": 893,
+          "y": 411
+        },
+        {
+          "t": 6.56,
+          "type": "click",
+          "x": 893,
+          "y": 411
+        },
+        {
+          "t": 6.735,
+          "type": "click",
+          "x": 893,
+          "y": 411
+        },
+        {
+          "t": 7.544,
+          "type": "move",
+          "x": 893,
+          "y": 411
+        },
+        {
+          "t": 8.087,
+          "type": "move",
+          "x": 525,
+          "y": 486
+        },
+        {
+          "t": 8.268,
+          "type": "click",
+          "x": 525,
+          "y": 486
+        },
+        {
+          "t": 8.439,
+          "type": "click",
+          "x": 525,
+          "y": 486
+        },
+        {
+          "t": 9.474,
+          "type": "move",
+          "x": 525,
+          "y": 486
+        },
+        {
+          "t": 10.044,
+          "type": "move",
+          "x": 893,
+          "y": 487
+        },
+        {
+          "t": 10.044,
+          "type": "click",
+          "x": 893,
+          "y": 487
+        },
+        {
+          "t": 10.718,
+          "type": "move",
+          "x": 893,
+          "y": 487
+        },
+        {
+          "t": 11.325,
+          "type": "move",
+          "x": 439,
+          "y": 618
+        },
+        {
+          "t": 11.51,
+          "type": "click",
+          "x": 439,
+          "y": 618
+        }
+      ],
+      "durationHint": 4,
+      "audio": "audio/s4-form-fill.mp3",
+      "audioDuration": 6.513197
+    },
+    {
+      "id": "s5-captcha-pause",
+      "media": "still",
+      "screenshot": "captures/s5-captcha-pause.png",
+      "script": "But a verification check stops it cold — Autogram never clicks through: \"Human action required. Please complete the verification to continue.\"",
+      "focus": {
+        "x": 960,
+        "y": 510,
+        "zoom": 1.15
+      },
+      "action": {
+        "type": "none",
+        "x": 960,
+        "y": 510
+      },
+      "durationHint": 4,
+      "audio": "audio/s5-captcha-pause.mp3",
+      "audioDuration": 6.431927
+    },
+    {
+      "id": "s6-resume",
+      "media": "clip",
+      "clip": "captures/s6-resume.mp4",
+      "clipDuration": 3.77,
+      "screenshot": "captures/s6-resume.png",
+      "script": "One click from Jordan, and it's verified, resumed, and submitted.",
+      "events": [
+        {
+          "t": 0,
+          "type": "move",
+          "x": 960,
+          "y": 510
+        },
+        {
+          "t": 0.858,
+          "type": "move",
+          "x": 960,
+          "y": 510
+        },
+        {
+          "t": 1.376,
+          "type": "move",
+          "x": 814,
+          "y": 574
+        },
+        {
+          "t": 1.957,
+          "type": "click",
+          "x": 814,
+          "y": 574
+        }
+      ],
+      "durationHint": 4,
+      "audio": "audio/s6-resume.mp3",
+      "audioDuration": 6.501587
+    },
+    {
+      "id": "s7-summary",
+      "media": "still",
+      "screenshot": "captures/s7-summary.png",
+      "script": "Back in Autogram: Meridian Financial, the role, a \"92%\" match, submitted just now.",
+      "focus": {
+        "x": 960,
+        "y": 369,
+        "zoom": 1.12
+      },
+      "action": {
+        "type": "none",
+        "x": 960,
+        "y": 369
+      },
+      "durationHint": 4,
+      "audio": "audio/s7-summary.mp3",
+      "audioDuration": 6.501587
+    }
+  ]
+}

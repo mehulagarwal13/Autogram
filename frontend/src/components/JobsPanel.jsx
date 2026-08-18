@@ -39,40 +39,40 @@ export default function JobsPanel({ toast }) {
   }
 
   return (
-    <div className={`glass animate-fade-up p-6 ${busy ? "glass-active" : ""}`}>
-      <h2 className="mb-1 text-lg font-bold text-white">Job Sourcing</h2>
-      <p className="mb-5 text-sm text-slate-400">
+    <div className={`card animate-fade-up p-6 ${busy ? "card-active" : ""}`}>
+      <h2 className="text-base font-semibold text-slate-900">Job Sourcing</h2>
+      <p className="mt-0.5 mb-5 text-sm text-slate-500">
         Live listings from Adzuna, cleaned and indexed for matching.
       </p>
 
       <div className="grid gap-3 sm:grid-cols-2">
-        <input className="input-dark sm:col-span-2" placeholder="Search query — e.g. backend engineer"
+        <input className="input sm:col-span-2" placeholder="Search query — e.g. backend engineer"
           value={query} onChange={(e) => setQuery(e.target.value)}
           onKeyDown={(e) => e.key === "Enter" && fetchAndIndex()} />
-        <select className="input-dark" value={country} onChange={(e) => setCountry(e.target.value)}>
+        <select className="input" value={country} onChange={(e) => setCountry(e.target.value)}>
           {COUNTRIES.map((c) => <option key={c.code} value={c.code}>{c.label}</option>)}
         </select>
-        <input className="input-dark" placeholder="City filter (optional)"
+        <input className="input" placeholder="City filter (optional)"
           value={location} onChange={(e) => setLocation(e.target.value)} />
       </div>
 
-      <button className="btn-primary mt-4 w-full justify-center" onClick={fetchAndIndex} disabled={busy}>
+      <button className="btn-primary mt-4 w-full" onClick={fetchAndIndex} disabled={busy}>
         {busy ? <Loader2 size={16} className="animate-spin" /> : <Briefcase size={16} />}
         {busy ? "Working..." : "Fetch & Index Jobs"}
       </button>
 
       {busy && (
         <div className="mt-4 animate-fade-up">
-          <div className="shimmer h-1.5 rounded-full" />
-          <p className="mt-2 text-center text-xs font-medium text-indigo-300">{phase}</p>
+          <div className="progress-track"><div className="progress-indeterminate" /></div>
+          <p className="mt-2 text-center text-xs font-medium text-brand-600">{phase}</p>
         </div>
       )}
 
       {result && (
-        <div className="mt-4 flex animate-fade-up items-center gap-5 rounded-xl border border-emerald-400/25 bg-emerald-500/10 px-4 py-3 text-sm">
-          <CheckCircle2 size={16} className="text-emerald-400" />
-          <span className="text-emerald-300"><b>{result.ingested}</b> fetched</span>
-          <span className="text-emerald-300"><b>{result.indexed}</b> indexed</span>
+        <div className="mt-4 flex animate-fade-up items-center gap-5 rounded-lg border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm">
+          <CheckCircle2 size={16} className="text-emerald-600" />
+          <span className="text-emerald-800"><b>{result.ingested}</b> fetched</span>
+          <span className="text-emerald-800"><b>{result.indexed}</b> indexed</span>
         </div>
       )}
     </div>

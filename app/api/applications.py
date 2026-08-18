@@ -228,10 +228,31 @@ def start_application(
         background_tasks.add_task(
             _run_application, application.application_id, resume_document_id, body.job_description,
         )
-    # source == "browser_extension": there is no server-side Playwright run
-    # to dispatch — the extension itself fills the form in the user's own
-    # tab and reports progress via POST /applications/{id}/report-status.
-    # The row stays "pending" until it does.
+    else:
+        # source == "browser_extension": there is no server-side Playwright
+        # run to dispatch — the extension itself fills the form in the
+        # user's own tab and reports progress via
+        # POST /applications/{id}/report-status.
+        #
+        # ats_platform matters here specifically because decide_action()
+        # gates AUTO_SUBMIT on the platform being in PUBLIC_ATS_PLATFORMS —
+        # and the backend's own page-less `detect_ats_for_url` only ever
+        # sees `job_url` as pasted, never the live DOM after the content
+        # script clicks an Apply/Apply Now button (see
+        # extension/content-script.js::detectAtsPlatformHint). A hint from
+        # that live page is only ever TRUSTED after being validated against
+        # the real adapter registry — never taken on faith — so a bogus or
+        # malicious hint can do no more than a wrong URL-detection guess
+        # already could.
+        try:
+            if body.ats_platform_hint and get_adapter_class(body.ats_platform_hint) is not None:
+                application.ats_platform = body.ats_platform_hint
+            else:
+                detection = detect_ats_for_url(job_url)
+                application.ats_platform = detection["ats"]
+            db.commit()
+        except Exception:
+            logger.exception("Application %s: pre-flight ATS detection failed — leaving ats_platform unset.", application.application_id)
 
     return application
 

@@ -19,15 +19,31 @@ vice versa.
 from __future__ import annotations
 
 import logging
+from dataclasses import asdict
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from app.core.auth import get_current_user
 from app.core.database import get_db
-from app.models.application import FieldMapRequest, FieldMapResult
+from app.models.application import (
+    AutomationConfigResponse,
+    DecideRequest,
+    DecideResponse,
+    FieldMapRequest,
+    FieldMapResponse,
+    FieldMapResult,
+    PacingConfig,
+)
 from app.models.db_models import User, confidence_level_for
 from app.services import application_repository, profile_repository
+from automation.applications.application_flow_manager import (
+    AUTO_SUBMIT_CONFIDENCE_THRESHOLD,
+    NEEDS_REVIEW_CONFIDENCE_THRESHOLD,
+    PUBLIC_ATS_PLATFORMS,
+    decide_action,
+)
+from automation.browser.session import DEFAULT_PACING
 from automation.forms.answer_engine import ApplicationAnswerEngine, Question, QUESTION_SOURCE_MAP
 
 logger = logging.getLogger(__name__)
@@ -35,7 +51,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/automation", tags=["automation"])
 
 
-@router.post("/map-fields", response_model=list[FieldMapResult])
+@router.post("/map-fields", response_model=FieldMapResponse)
 def map_fields(
     body: FieldMapRequest,
     user: User = Depends(get_current_user),
@@ -47,7 +63,12 @@ def map_fields(
     this answers each one exactly the way the server-side flow does:
     profile match -> answer memory (exact or semantic) -> one batched LLM
     call for whatever's left. Ownership of `application_id` is enforced the
-    same way every other per-application endpoint enforces it."""
+    same way every other per-application endpoint enforces it.
+
+    `action` comes from `decide_action()` — the SAME function the
+    server-side Playwright engine's `_run_on_page` calls — never a
+    reimplementation, so the two actuators can never disagree about whether
+    a given form should auto-submit."""
     application = application_repository.get_by_id(db, body.application_id)
     if application is None or application.user_id != user.user_id:
         raise HTTPException(status_code=404, detail="Application not found.")
@@ -66,7 +87,7 @@ def map_fields(
     questions = [Question(f.question_text, tuple(f.options or ())) for f in body.fields]
     results = engine.answer_batch(questions)
 
-    return [
+    mapped = [
         FieldMapResult(
             question_text=result.question,
             answer=result.answer,
@@ -76,3 +97,60 @@ def map_fields(
         )
         for result in results
     ]
+
+    # Same definition `ApplicationFlowManager._aggregate_confidence` uses:
+    # the fraction of fields that actually came back USABLE (HIGH/MEDIUM —
+    # i.e. something a form would actually get filled with), not a raw
+    # average of confidence scores. An empty batch is trivially "nothing to
+    # decide on" — 0.0, same as the Playwright engine's own empty case.
+    usable = sum(1 for f in mapped if f.confidence_level in ("HIGH", "MEDIUM"))
+    overall_confidence = round(usable / len(mapped), 4) if mapped else 0.0
+    action = decide_action(overall_confidence, application.ats_platform or "custom", application.autopilot_enabled)
+
+    return FieldMapResponse(fields=mapped, overall_confidence=overall_confidence, action=action)
+
+
+@router.post("/decide", response_model=DecideResponse)
+def decide(
+    body: DecideRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Wraps `decide_action()` directly for a caller that has ALREADY
+    computed `overall_confidence` itself — e.g. the extension, after
+    combining client-side deterministic profile matches (no LLM involved)
+    with `POST /automation/map-fields`' results for whatever was left. The
+    combining is plain arithmetic (a fraction of usable fields); the actual
+    submission decision is not — that always comes from this one function,
+    never reimplemented client-side."""
+    application = application_repository.get_by_id(db, body.application_id)
+    if application is None or application.user_id != user.user_id:
+        raise HTTPException(status_code=404, detail="Application not found.")
+
+    action = decide_action(body.overall_confidence, application.ats_platform or "custom", application.autopilot_enabled)
+    return DecideResponse(action=action, overall_confidence=body.overall_confidence)
+
+
+@router.get("/config", response_model=AutomationConfigResponse)
+def get_automation_config(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """The extension's "policy brain" surface — polled before every fill AND
+    again before any auto-submit click (never cached for a session): the
+    account-level kill switch (fail closed on a DB error, same contract the
+    Playwright engine's own check uses — see
+    `app/api/applications.py::_is_kill_switch_engaged`) plus the shared
+    pacing/confidence-threshold numbers, so the extension never invents its
+    own throttle limits or auto-submit bar."""
+    try:
+        profile = profile_repository.get_by_user_id(db, user.user_id)
+        kill_switch_engaged = bool(profile and profile.autopilot_globally_disabled)
+    except Exception:
+        logger.exception("User %s: kill switch check failed — failing closed (treating as engaged).", user.user_id)
+        kill_switch_engaged = True
+
+    return AutomationConfigResponse(
+        kill_switch_engaged=kill_switch_engaged,
+        pacing=PacingConfig(**asdict(DEFAULT_PACING)),
+        auto_submit_confidence_threshold=AUTO_SUBMIT_CONFIDENCE_THRESHOLD,
+        needs_review_confidence_threshold=NEEDS_REVIEW_CONFIDENCE_THRESHOLD,
+        public_ats_platforms=sorted(PUBLIC_ATS_PLATFORMS),
+    )

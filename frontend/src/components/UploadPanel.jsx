@@ -10,10 +10,10 @@ const STEPS = [
 ];
 
 function StepDot({ state, Icon }) {
-  if (state === "done") return <CheckCircle2 size={22} className="animate-bounce-in text-emerald-400" />;
-  if (state === "running") return <Loader2 size={22} className="animate-spin text-indigo-400" />;
-  if (state === "error") return <AlertCircle size={22} className="text-rose-400" />;
-  return <Icon size={22} className="text-slate-600" />;
+  if (state === "done") return <CheckCircle2 size={20} className="animate-bounce-in text-emerald-600" />;
+  if (state === "running") return <Loader2 size={20} className="animate-spin text-brand-600" />;
+  if (state === "error") return <AlertCircle size={20} className="text-red-600" />;
+  return <Icon size={20} className="text-slate-300" />;
 }
 
 export default function UploadPanel({ resume, setResume, toast }) {
@@ -72,9 +72,9 @@ export default function UploadPanel({ resume, setResume, toast }) {
   const p = parsedPreview?.parsed_resume;
 
   return (
-    <div className={`glass animate-fade-up p-6 ${busy ? "glass-active" : ""}`}>
-      <h2 className="mb-1 text-lg font-bold text-white">Your Resume</h2>
-      <p className="mb-5 text-sm text-slate-400">
+    <div className={`card animate-fade-up p-6 ${busy ? "card-active" : ""}`}>
+      <h2 className="text-base font-semibold text-slate-900">Your Resume</h2>
+      <p className="mt-0.5 mb-5 text-sm text-slate-500">
         Drop a resume and the agent extracts, parses, and embeds it automatically.
       </p>
 
@@ -84,15 +84,13 @@ export default function UploadPanel({ resume, setResume, toast }) {
         onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
         onDragLeave={() => setDragOver(false)}
         onDrop={(e) => { e.preventDefault(); setDragOver(false); onFile(e.dataTransfer.files[0]); }}
-        className={`flex cursor-pointer flex-col items-center justify-center rounded-2xl border-2 border-dashed px-6 py-10 text-center transition-all duration-300
-          ${dragOver
-            ? "border-fuchsia-400/70 bg-fuchsia-500/10 scale-[1.01]"
-            : "border-white/15 bg-white/[0.02] hover:border-indigo-400/50 hover:bg-indigo-500/5"}`}
+        className={`flex cursor-pointer flex-col items-center justify-center rounded-xl border-2 border-dashed px-6 py-10 text-center transition-colors
+          ${dragOver ? "border-brand-400 bg-brand-50" : "border-slate-200 bg-slate-50 hover:border-brand-300 hover:bg-brand-50/40"}`}
       >
-        <div className="mb-3 rounded-2xl bg-gradient-to-br from-indigo-500/20 to-fuchsia-500/20 p-4">
-          <CloudUpload size={30} className="text-indigo-300" />
+        <div className="mb-3 flex h-12 w-12 items-center justify-center rounded-full bg-brand-50">
+          <CloudUpload size={22} className="text-brand-600" />
         </div>
-        <p className="text-sm font-semibold text-slate-200">
+        <p className="text-sm font-medium text-slate-800">
           {resume ? resume.filename : "Drag & drop your resume"}
         </p>
         <p className="mt-1 text-xs text-slate-500">PDF or DOCX · max 5 MB</p>
@@ -106,12 +104,12 @@ export default function UploadPanel({ resume, setResume, toast }) {
           <div key={s.key} className="flex flex-1 items-center">
             <div className="flex flex-col items-center gap-1.5">
               <StepDot state={steps[s.key]} Icon={s.icon} />
-              <span className={`text-[11px] font-medium ${steps[s.key] === "done" ? "text-emerald-400" : steps[s.key] ? "text-slate-300" : "text-slate-600"}`}>
+              <span className={`text-[11px] font-medium ${steps[s.key] === "done" ? "text-emerald-600" : steps[s.key] ? "text-slate-700" : "text-slate-400"}`}>
                 {s.label}
               </span>
             </div>
             {i < STEPS.length - 1 && (
-              <div className={`mx-2 h-px flex-1 ${steps[STEPS[i + 1].key] ? "bg-gradient-to-r from-indigo-400/60 to-fuchsia-400/60" : "bg-white/10"}`} />
+              <div className={`mx-2 h-px flex-1 ${steps[STEPS[i + 1].key] ? "bg-brand-300" : "bg-slate-200"}`} />
             )}
           </div>
         ))}
@@ -119,10 +117,10 @@ export default function UploadPanel({ resume, setResume, toast }) {
 
       {/* Parsed preview */}
       {p && (
-        <div className="mt-6 animate-fade-up rounded-xl border border-white/10 bg-slate-900/40 p-4">
+        <div className="mt-6 animate-fade-up rounded-lg border border-slate-200 bg-slate-50 p-4">
           <div className="flex items-center justify-between">
-            <p className="font-semibold text-white">{p.full_name || "Unnamed candidate"}</p>
-            <span className="chip bg-indigo-500/15 text-indigo-300">
+            <p className="font-medium text-slate-900">{p.full_name || "Unnamed candidate"}</p>
+            <span className="badge badge-brand">
               confidence {Math.round((parsedPreview.confidence_score || 0) * 100)}%
             </span>
           </div>
@@ -132,10 +130,10 @@ export default function UploadPanel({ resume, setResume, toast }) {
           </p>
           <div className="mt-3 flex flex-wrap gap-1.5">
             {(p.skills || []).slice(0, 12).map((s) => (
-              <span key={s} className="chip bg-white/[0.06] text-slate-300">{s}</span>
+              <span key={s} className="badge badge-neutral">{s}</span>
             ))}
             {(p.skills || []).length > 12 && (
-              <span className="chip bg-white/[0.06] text-slate-500">+{p.skills.length - 12} more</span>
+              <span className="badge badge-neutral">+{p.skills.length - 12} more</span>
             )}
           </div>
         </div>

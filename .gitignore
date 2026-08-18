@@ -1,6 +1,11 @@
 # Environment variables
 .env
 
+# Extension dev signing key (controls the stable chrome-extension:// ID) + build output/deps
+extension/dev-key.pem
+extension/dist/
+extension/node_modules/
+
 # Python virtual environment
 venv/
 

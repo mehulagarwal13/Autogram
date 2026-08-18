@@ -1,16 +1,18 @@
 {
   "manifest_version": 3,
   "name": "Autogram — Apply from Job Link",
-  "version": "0.1.0",
-  "description": "Fills job applications in your own logged-in Chrome tab using your Autogram profile. CAPTCHA and final submission always stay in your hands — this never runs in Incognito.",
-  "permissions": ["storage", "activeTab", "scripting"],
+  "version": "0.2.0",
+  "description": "Fills job applications in your own logged-in Chrome tab using your Autogram profile. Auto-submit only fires when the server's own decide_action() approves it; CAPTCHA and low-confidence review always stay in your hands. Never runs in Incognito.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEArYt6dTm2FxTCKoBqSPq57j4umm1vx8LoCEb9M56d/EYMzrJUYo/TVzKhsvFFvFdZIBoNG/A9e0QG4sNyiTPzNCKjPJLxLaPtQ3FTMq1JjiWvHtI4831aldL7Wo9onABQLe3HnkoIG6D1TXj/oWvrWbSNpOgcuezgg7l6MYnrk1Zq5mBJgPSR+TLFQ08ZeJ5N158BAwYHAchTzVoxNN8vOOCtWkxNzeeQaz8dbxP75mUN8Ho9DVd3PZg0qaoj+CvkeYuJOFbbg9VDPRuQvGxcVSL9u+nxVxv1g6gNtlBEAL9jM2Q5Xyin19XSRTKAS96hIWkwTgAU1Zi07yAnBBdx+QIDAQAB",
+  "permissions": ["storage", "activeTab", "scripting", "sidePanel"],
   "host_permissions": ["<all_urls>"],
   "background": {
     "service_worker": "background.js"
   },
   "action": {
-    "default_popup": "popup/popup.html",
-    "default_title": "Autogram — Fill This Application"
+    "default_title": "Autogram — open the side panel"
   },
-  "options_page": "options.html"
+  "side_panel": {
+    "default_path": "dist/sidepanel/index.html"
+  }
 }

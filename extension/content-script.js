@@ -7,18 +7,24 @@
 // tab isn't navigated/reloaded, which is exactly the lifetime one apply-flow
 // message exchange needs.
 //
-// Mirrors (in plain JS, since a content script cannot call Python) two
+// Mirrors (in plain JS, since a content script cannot call Python) several
 // server-side heuristics from automation/browser/selectors.py — kept as
 // close as practical so a future change to the Python lists is easy to
 // notice needs mirroring here too:
-//   - CAPTCHA_HINTS / _HUMAN_GATES  -> CAPTCHA_HINTS / HUMAN_GATE_HINTS below
-//   - find_apply_entry_button        -> findApplyEntryButton below
-//   - find_job_posting_title_and_company -> scanJobPostingMetadata below
+//   - CAPTCHA_HINTS / _HUMAN_GATES        -> CAPTCHA_HINTS / HUMAN_GATE_HINTS below
+//   - find_apply_entry_button              -> findApplyEntryButton below
+//   - find_job_posting_title_and_company    -> scanJobPostingMetadata below
+//   - find_submit_button                     -> findSubmitButton below
+//   - find_submission_confirmation             -> findSubmissionConfirmation below
 //
 // Fill order matches this session's server-side fix: fields are filled
 // FIRST, CAPTCHA is checked LAST, right before reporting the page done — a
 // CAPTCHA widget on a real ATS form typically gates submission, not the
 // fields themselves.
+//
+// CLICK_SUBMIT is only ever sent by background.js after the server's OWN
+// decide_action() (via POST /automation/map-fields) returned AUTO_SUBMIT —
+// this file never decides on its own whether a form should be submitted.
 
 const _scannedFields = []; // [{ el, questionText, fieldType, options }]
 
@@ -106,6 +112,70 @@ function findApplyEntryButton() {
   return null;
 }
 
+// --- Submit button + confirmation (mirrors find_submit_button /
+// find_submission_confirmation in automation/browser/selectors.py) --------
+// Only ever called when background.js has already confirmed the server's
+// decide_action() returned AUTO_SUBMIT for this application — this file
+// never decides on its own whether to submit.
+
+const SUBMIT_TEXT_CANDIDATES = ["submit application", "submit", "apply", "send application", "send"];
+
+function findSubmitButton() {
+  const clickable = document.querySelectorAll("button, a, input[type='submit'], input[type='button']");
+  for (const candidate of SUBMIT_TEXT_CANDIDATES) {
+    for (const el of clickable) {
+      const text = (el.innerText || el.value || "").trim().toLowerCase();
+      if (!text || THIRD_PARTY_AUTOFILL_RE.test(text)) continue;
+      if (text === candidate && isVisible(el) && !el.disabled) return el;
+    }
+  }
+  return null;
+}
+
+const SUBMISSION_CONFIRMATION_URL_HINTS = ["thank", "confirmation", "confirmed", "/success", "submitted"];
+const SUBMISSION_CONFIRMATION_TEXT_PATTERNS = [
+  "thank you for applying", "thanks for applying", "thank you for your application",
+  "thank you for your interest", "application received", "we have received your application",
+  "we've received your application", "your application has been received",
+  "application submitted", "your application has been submitted", "successfully submitted",
+  "application complete",
+];
+const APPLICATION_REFERENCE_RE = /(application|reference|confirmation)\s*(id|number|no\.?|#)\s*[:\-#]?\s*[a-z0-9][a-z0-9-]{2,}/i;
+
+function findSubmissionConfirmation() {
+  const url = (window.location.href || "").toLowerCase();
+  for (const hint of SUBMISSION_CONFIRMATION_URL_HINTS) {
+    if (url.includes(hint)) return `confirmation URL (matched "${hint}")`;
+  }
+  const text = (document.body.innerText || "").toLowerCase();
+  for (const pattern of SUBMISSION_CONFIRMATION_TEXT_PATTERNS) {
+    if (text.includes(pattern)) return `success message ("${pattern}")`;
+  }
+  const reference = text.match(APPLICATION_REFERENCE_RE);
+  if (reference) return `application reference ("${reference[0]}")`;
+  return null;
+}
+
+async function handleClickSubmit() {
+  const button = findSubmitButton();
+  if (!button) return { clicked: false, confirmed: false, detail: "No submit control could be found on this page." };
+
+  button.click();
+  // Poll for confirmation the same way wait_for_submission_confirmation
+  // does server-side — a landed click is NEVER itself reported as
+  // confirmed; only positive evidence (URL/text/reference) counts.
+  const deadline = Date.now() + 15000;
+  while (Date.now() < deadline) {
+    const confirmation = findSubmissionConfirmation();
+    if (confirmation) return { clicked: true, confirmed: true, detail: confirmation };
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+  return {
+    clicked: true, confirmed: false,
+    detail: "Submit was clicked but no confirmation could be detected — verify on the site before retrying (retrying a submission that did succeed would double-apply).",
+  };
+}
+
 // --- Field scanning ----------------------------------------------------
 
 function labelFor(el) {
@@ -171,6 +241,24 @@ function hasFileInput() {
   return document.querySelectorAll("input[type='file']").length > 0;
 }
 
+// --- Light-touch ATS platform hint ---------------------------------------
+// The backend's own pre-flight `detect_ats_for_url` (app/api/applications.py)
+// only ever sees the URL the user pasted — for "Apply from Job Link" flows
+// where clicking Apply reveals the real ATS in place (see
+// findApplyEntryButton above), it never gets a chance to see what THIS
+// content script already sees post-click. A small, honest hint — not a full
+// reimplementation of automation/ats/detector.py's tiered detection — lets
+// the backend's decide_action() see the real platform instead of "custom"
+// (which decide_action always refuses to auto-submit on, since it isn't in
+// PUBLIC_ATS_PLATFORMS). Only ever a HINT: the backend still owns the actual
+// adapter-registry/public-ATS-allowlist decision.
+function detectAtsPlatformHint() {
+  const url = window.location.href.toLowerCase();
+  if (document.getElementById("grnhse_app") || url.includes("greenhouse.io") || url.includes("job-boards.greenhouse")) return "greenhouse";
+  if (document.querySelector("[data-qa='btn-apply']") || url.includes("lever.co")) return "lever";
+  return null;
+}
+
 // --- Message handlers -------------------------------------------------
 
 async function handleScanPage() {
@@ -199,7 +287,10 @@ async function handleScanPage() {
     };
   }
 
-  return { jobUrl: window.location.href, company: metadata.company, title: metadata.title, fields };
+  return {
+    jobUrl: window.location.href, company: metadata.company, title: metadata.title, fields,
+    atsPlatformHint: detectAtsPlatformHint(),
+  };
 }
 
 function dispatchInputEvents(el) {
@@ -288,6 +379,9 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         break;
       case "WAIT_FOR_CAPTCHA_CLEAR":
         sendResponse(await handleWaitForCaptchaClear());
+        break;
+      case "CLICK_SUBMIT":
+        sendResponse(await handleClickSubmit());
         break;
       default:
         sendResponse({ error: `Unknown message type: ${message.type}` });
