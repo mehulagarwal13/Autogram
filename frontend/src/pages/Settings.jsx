@@ -27,27 +27,27 @@ export default function Settings({ toast }) {
     }
   }
 
-  if (loading) return <div className="flex justify-center py-20"><Loader2 size={28} className="animate-spin text-indigo-400" /></div>;
+  if (loading) return <div className="flex justify-center py-20"><Loader2 size={26} className="animate-spin text-brand-600" /></div>;
 
   const disabled = !!profile?.autopilot_globally_disabled;
 
   return (
     <div className="animate-fade-up space-y-5">
       <div>
-        <h1 className="text-xl font-bold text-white">Settings</h1>
-        <p className="text-sm text-slate-500">Safety controls for the automation platform.</p>
+        <h1 className="page-title">Settings</h1>
+        <p className="page-subtitle">Safety controls for the automation platform.</p>
       </div>
 
       {!profile ? (
-        <div className="glass p-6 text-sm text-slate-500">Create a profile first (see the Profile page) before configuring automation settings.</div>
+        <div className="card p-6 text-sm text-slate-500">Create a profile first (see the Profile page) before configuring automation settings.</div>
       ) : (
-        <div className="glass p-6">
-          <div className="flex items-start justify-between gap-4">
+        <div className="card p-6">
+          <div className="flex flex-wrap items-start justify-between gap-4">
             <div className="flex items-start gap-3">
-              {disabled ? <ShieldOff size={22} className="mt-0.5 text-rose-400" /> : <ShieldCheck size={22} className="mt-0.5 text-emerald-400" />}
+              {disabled ? <ShieldOff size={20} className="mt-0.5 text-red-600" /> : <ShieldCheck size={20} className="mt-0.5 text-emerald-600" />}
               <div>
-                <p className="font-semibold text-white">Autopilot Kill Switch</p>
-                <p className="mt-1 max-w-lg text-sm text-slate-400">
+                <p className="font-semibold text-slate-900">Autopilot Kill Switch</p>
+                <p className="mt-1 max-w-lg text-sm text-slate-500">
                   Hard-stops every autopilot run for your account, checked fresh on every page of every
                   application — even one already in progress. Nothing gets auto-submitted while this is on,
                   regardless of any per-application autopilot setting.
@@ -55,7 +55,7 @@ export default function Settings({ toast }) {
               </div>
             </div>
             <button
-              className={disabled ? "btn-primary !from-rose-500 !to-rose-600 shrink-0" : "btn-ghost shrink-0"}
+              className={disabled ? "btn-danger shrink-0" : "btn-ghost shrink-0"}
               disabled={saving}
               onClick={toggleKillSwitch}
             >

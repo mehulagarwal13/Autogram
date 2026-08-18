@@ -9,7 +9,7 @@ const STYLES = {
   CANCELLED: "badge-neutral",
 };
 
-const LABELS = {
+export const STATUS_LABELS = {
   READY: "Ready",
   IN_PROGRESS: "In Progress",
   WAITING_FOR_HUMAN: "Waiting for You",
@@ -22,5 +22,5 @@ const LABELS = {
 
 export default function StatusBadge({ status }) {
   const style = STYLES[status] || "badge-neutral";
-  return <span className={`badge ${style}`}>{LABELS[status] || status}</span>;
+  return <span className={`badge ${style}`}>{STATUS_LABELS[status] || status}</span>;
 }

@@ -129,25 +129,25 @@ export default function Profile({ toast }) {
     }
   }
 
-  if (loading) return <div className="flex justify-center py-20"><Loader2 size={28} className="animate-spin text-indigo-400" /></div>;
+  if (loading) return <div className="flex justify-center py-20"><Loader2 size={26} className="animate-spin text-brand-600" /></div>;
 
   return (
     <div className="animate-fade-up space-y-5">
       <div>
-        <h1 className="text-xl font-bold text-white">Profile</h1>
-        <p className="text-sm text-slate-500">
+        <h1 className="page-title">Profile</h1>
+        <p className="page-subtitle">
           The source of truth automation fills applications from. Nothing here is ever guessed — only what you enter or upload.
         </p>
       </div>
 
       {FIELD_GROUPS.map((group) => (
-        <div key={group.title} className="glass p-6">
-          <h2 className="mb-4 flex items-center gap-2 font-semibold text-white"><UserCircle2 size={16} className="text-indigo-300" />{group.title}</h2>
+        <div key={group.title} className="card p-6">
+          <h2 className="mb-4 flex items-center gap-2 font-semibold text-slate-900"><UserCircle2 size={16} className="text-brand-600" />{group.title}</h2>
           <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
             {group.fields.map(([key, label, type]) => (
               <label key={key} className="block">
-                <span className="mb-1 block text-[11px] text-slate-500">{label}</span>
-                <input className="input-dark" type={type || "text"} value={profile[key] ?? ""}
+                <span className="field-label">{label}</span>
+                <input className="input" type={type || "text"} value={profile[key] ?? ""}
                   onChange={(e) => setField(key, type === "number" ? (e.target.value === "" ? null : Number(e.target.value)) : e.target.value)} />
               </label>
             ))}
@@ -155,14 +155,14 @@ export default function Profile({ toast }) {
         </div>
       ))}
 
-      <div className="glass p-6">
-        <h2 className="mb-4 font-semibold text-white">Yes/No Screening Facts</h2>
+      <div className="card p-6">
+        <h2 className="mb-1 font-semibold text-slate-900">Yes/No Screening Facts</h2>
         <p className="mb-3 text-xs text-slate-500">Left blank ("never asked") until you set it — automation never guesses these.</p>
         <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
           {BOOL_FIELDS.map(([key, label]) => (
-            <label key={key} className="flex items-center justify-between rounded-xl border border-white/10 bg-slate-900/40 px-3 py-2.5">
-              <span className="text-xs text-slate-300">{label}</span>
-              <select className="input-dark !w-28 !py-1 text-xs" value={profile[key] === null || profile[key] === undefined ? "" : String(profile[key])}
+            <label key={key} className="flex items-center justify-between rounded-lg border border-slate-200 bg-slate-50 px-3 py-2.5">
+              <span className="text-xs text-slate-700">{label}</span>
+              <select className="input !w-28 !py-1 text-xs" value={profile[key] === null || profile[key] === undefined ? "" : String(profile[key])}
                 onChange={(e) => setField(key, e.target.value === "" ? null : e.target.value === "true")}>
                 <option value="">Never asked</option>
                 <option value="true">Yes</option>
@@ -178,62 +178,62 @@ export default function Profile({ toast }) {
       </button>
 
       {/* Education */}
-      <div className="glass p-6">
-        <h2 className="mb-4 flex items-center gap-2 font-semibold text-white"><GraduationCap size={16} className="text-indigo-300" />Education</h2>
+      <div className="card p-6">
+        <h2 className="mb-4 flex items-center gap-2 font-semibold text-slate-900"><GraduationCap size={16} className="text-brand-600" />Education</h2>
         <div className="mb-4 grid gap-2 sm:grid-cols-5">
-          <input className="input-dark" placeholder="Degree" value={newEdu.degree} onChange={(e) => setNewEdu({ ...newEdu, degree: e.target.value })} />
-          <input className="input-dark" placeholder="University" value={newEdu.university} onChange={(e) => setNewEdu({ ...newEdu, university: e.target.value })} />
-          <input className="input-dark" placeholder="Field of study" value={newEdu.field_of_study} onChange={(e) => setNewEdu({ ...newEdu, field_of_study: e.target.value })} />
-          <input className="input-dark" placeholder="Start (e.g. 2018)" value={newEdu.start_date} onChange={(e) => setNewEdu({ ...newEdu, start_date: e.target.value })} />
+          <input className="input" placeholder="Degree" value={newEdu.degree} onChange={(e) => setNewEdu({ ...newEdu, degree: e.target.value })} />
+          <input className="input" placeholder="University" value={newEdu.university} onChange={(e) => setNewEdu({ ...newEdu, university: e.target.value })} />
+          <input className="input" placeholder="Field of study" value={newEdu.field_of_study} onChange={(e) => setNewEdu({ ...newEdu, field_of_study: e.target.value })} />
+          <input className="input" placeholder="Start (e.g. 2018)" value={newEdu.start_date} onChange={(e) => setNewEdu({ ...newEdu, start_date: e.target.value })} />
           <div className="flex gap-2">
-            <input className="input-dark" placeholder="End (e.g. 2022)" value={newEdu.end_date} onChange={(e) => setNewEdu({ ...newEdu, end_date: e.target.value })} />
+            <input className="input" placeholder="End (e.g. 2022)" value={newEdu.end_date} onChange={(e) => setNewEdu({ ...newEdu, end_date: e.target.value })} />
             <button className="btn-primary !px-3" onClick={addEducation}><Plus size={16} /></button>
           </div>
         </div>
         <div className="space-y-2">
           {education.map((e) => (
-            <div key={e.education_id} className="flex items-center justify-between rounded-xl border border-white/[0.06] bg-white/[0.02] px-4 py-2.5 text-sm">
-              <span className="text-slate-300">{e.degree}{e.field_of_study ? `, ${e.field_of_study}` : ""} — {e.university} ({e.start_date}–{e.end_date || "present"})</span>
-              <button className="text-slate-500 hover:text-rose-400" onClick={async () => { await api.deleteEducation(e.education_id); setEducation((xs) => xs.filter((x) => x.education_id !== e.education_id)); }}>
+            <div key={e.education_id} className="flex items-center justify-between rounded-lg border border-slate-200 bg-white px-4 py-2.5 text-sm">
+              <span className="text-slate-700">{e.degree}{e.field_of_study ? `, ${e.field_of_study}` : ""} — {e.university} ({e.start_date}–{e.end_date || "present"})</span>
+              <button className="text-slate-400 hover:text-red-600" onClick={async () => { await api.deleteEducation(e.education_id); setEducation((xs) => xs.filter((x) => x.education_id !== e.education_id)); }}>
                 <Trash2 size={14} />
               </button>
             </div>
           ))}
-          {education.length === 0 && <p className="text-xs text-slate-600">No education entries yet.</p>}
+          {education.length === 0 && <p className="text-xs text-slate-400">No education entries yet.</p>}
         </div>
       </div>
 
       {/* Experience */}
-      <div className="glass p-6">
-        <h2 className="mb-4 flex items-center gap-2 font-semibold text-white"><Briefcase size={16} className="text-indigo-300" />Work Experience</h2>
+      <div className="card p-6">
+        <h2 className="mb-4 flex items-center gap-2 font-semibold text-slate-900"><Briefcase size={16} className="text-brand-600" />Work Experience</h2>
         <div className="mb-4 grid gap-2 sm:grid-cols-5">
-          <input className="input-dark" placeholder="Company" value={newExp.company_name} onChange={(e) => setNewExp({ ...newExp, company_name: e.target.value })} />
-          <input className="input-dark" placeholder="Job title" value={newExp.job_title} onChange={(e) => setNewExp({ ...newExp, job_title: e.target.value })} />
-          <input className="input-dark" placeholder="Start (e.g. 2021-03)" value={newExp.start_date} onChange={(e) => setNewExp({ ...newExp, start_date: e.target.value })} />
-          <input className="input-dark" placeholder="End (blank = current)" value={newExp.end_date} onChange={(e) => setNewExp({ ...newExp, end_date: e.target.value })} />
+          <input className="input" placeholder="Company" value={newExp.company_name} onChange={(e) => setNewExp({ ...newExp, company_name: e.target.value })} />
+          <input className="input" placeholder="Job title" value={newExp.job_title} onChange={(e) => setNewExp({ ...newExp, job_title: e.target.value })} />
+          <input className="input" placeholder="Start (e.g. 2021-03)" value={newExp.start_date} onChange={(e) => setNewExp({ ...newExp, start_date: e.target.value })} />
+          <input className="input" placeholder="End (blank = current)" value={newExp.end_date} onChange={(e) => setNewExp({ ...newExp, end_date: e.target.value })} />
           <button className="btn-primary" onClick={addExperience}><Plus size={16} /> Add</button>
         </div>
         <div className="space-y-2">
           {experience.map((e) => (
-            <div key={e.experience_id} className="flex items-center justify-between rounded-xl border border-white/[0.06] bg-white/[0.02] px-4 py-2.5 text-sm">
-              <span className="text-slate-300">{e.job_title} at {e.company_name} ({e.start_date}–{e.end_date || "present"})</span>
-              <button className="text-slate-500 hover:text-rose-400" onClick={async () => { await api.deleteExperience(e.experience_id); setExperience((xs) => xs.filter((x) => x.experience_id !== e.experience_id)); }}>
+            <div key={e.experience_id} className="flex items-center justify-between rounded-lg border border-slate-200 bg-white px-4 py-2.5 text-sm">
+              <span className="text-slate-700">{e.job_title} at {e.company_name} ({e.start_date}–{e.end_date || "present"})</span>
+              <button className="text-slate-400 hover:text-red-600" onClick={async () => { await api.deleteExperience(e.experience_id); setExperience((xs) => xs.filter((x) => x.experience_id !== e.experience_id)); }}>
                 <Trash2 size={14} />
               </button>
             </div>
           ))}
-          {experience.length === 0 && <p className="text-xs text-slate-600">No experience entries yet.</p>}
+          {experience.length === 0 && <p className="text-xs text-slate-400">No experience entries yet.</p>}
         </div>
       </div>
 
       {/* Skills */}
-      <div className="glass p-6">
-        <h2 className="mb-4 flex items-center gap-2 font-semibold text-white"><Sparkles size={16} className="text-indigo-300" />Skills</h2>
+      <div className="card p-6">
+        <h2 className="mb-4 flex items-center gap-2 font-semibold text-slate-900"><Sparkles size={16} className="text-brand-600" />Skills</h2>
         <div className="grid gap-3 sm:grid-cols-2">
           {SKILL_KEYS.map((k) => (
             <label key={k} className="block">
-              <span className="mb-1 block text-[11px] capitalize text-slate-500">{k.replaceAll("_", " ")} (comma-separated)</span>
-              <input className="input-dark" value={skillsText[k] || ""} onChange={(e) => setSkillsText({ ...skillsText, [k]: e.target.value })} />
+              <span className="field-label capitalize">{k.replaceAll("_", " ")} (comma-separated)</span>
+              <input className="input" value={skillsText[k] || ""} onChange={(e) => setSkillsText({ ...skillsText, [k]: e.target.value })} />
             </label>
           ))}
         </div>

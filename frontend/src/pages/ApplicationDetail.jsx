@@ -124,7 +124,7 @@ export default function ApplicationDetail({ toast }) {
   }
 
   if (loading || !application) {
-    return <div className="flex justify-center py-20"><Loader2 size={28} className="animate-spin text-indigo-400" /></div>;
+    return <div className="flex justify-center py-20"><Loader2 size={26} className="animate-spin text-brand-600" /></div>;
   }
 
   const status = application.display_status;
@@ -135,38 +135,38 @@ export default function ApplicationDetail({ toast }) {
 
   return (
     <div className="animate-fade-up space-y-5">
-      <button onClick={() => navigate("/dashboard")} className="flex items-center gap-1.5 text-xs text-slate-500 hover:text-slate-300">
-        <ArrowLeft size={14} /> Back to dashboard
+      <button onClick={() => navigate("/applications")} className="flex items-center gap-1.5 text-xs text-slate-500 hover:text-slate-800">
+        <ArrowLeft size={14} /> Back to applications
       </button>
 
       {/* Job info header */}
-      <div className="glass p-6">
+      <div className="card p-6">
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div>
-            <h1 className="text-xl font-bold text-white">{application.position || "Application"}</h1>
-            <p className="mt-1 flex items-center gap-1.5 text-sm text-slate-400">
+            <h1 className="text-xl font-semibold text-slate-900">{application.position || "Application"}</h1>
+            <p className="mt-1 flex items-center gap-1.5 text-sm text-slate-500">
               <Building2 size={14} /> {application.company || "Unknown company"}
-              {application.ats_platform && <span className="chip bg-white/[0.06] text-slate-500">{application.ats_platform}</span>}
+              {application.ats_platform && <span className="badge badge-neutral">{application.ats_platform}</span>}
             </p>
           </div>
           <StatusBadge status={status} />
         </div>
         <a href={application.job_url} target="_blank" rel="noreferrer"
-          className="mt-3 inline-flex items-center gap-1 text-xs text-indigo-300 hover:underline">
+          className="mt-3 inline-flex items-center gap-1 text-xs text-brand-600 hover:underline">
           View original posting <ExternalLink size={12} />
         </a>
       </div>
 
       {/* Human intervention banner */}
       {status === "WAITING_FOR_HUMAN" && (
-        <div className="glass border-amber-400/30 bg-amber-500/[0.06] p-5">
+        <div className="card border-amber-200 bg-amber-50 p-5">
           <div className="flex items-start gap-3">
-            <ShieldAlert size={22} className="mt-0.5 shrink-0 text-amber-400" />
+            <ShieldAlert size={20} className="mt-0.5 shrink-0 text-amber-600" />
             <div className="flex-1">
-              <p className="font-semibold text-amber-200">
+              <p className="font-semibold text-amber-900">
                 {isWaitingLive ? "Human verification required" : "Human verification timed out"}
               </p>
-              <p className="mt-1 text-sm text-amber-300/80">
+              <p className="mt-1 text-sm text-amber-800">
                 {isWaitingLive
                   ? `A human verification challenge (CAPTCHA or similar) was detected. Please complete it in the automation's browser window — automation resumes automatically once it's cleared. ${live?.live?.reason || ""}`
                   : "The wait for human verification timed out and this run stopped. Complete the verification and retry, or start again once the page has settled."}
@@ -183,29 +183,29 @@ export default function ApplicationDetail({ toast }) {
 
       {/* Live automation view */}
       {isActive && (
-        <div className="glass p-6">
-          <h2 className="mb-3 flex items-center gap-2 font-semibold text-white">
-            <Loader2 size={16} className="animate-spin text-indigo-400" /> Live Automation
+        <div className="card p-6">
+          <h2 className="mb-3 flex items-center gap-2 font-semibold text-slate-900">
+            <Loader2 size={16} className="animate-spin text-brand-600" /> Live Automation
           </h2>
-          <div className="shimmer h-2 rounded-full" />
+          <div className="progress-track"><div className="progress-indeterminate" /></div>
           <div className="mt-3 grid grid-cols-2 gap-3 text-sm sm:grid-cols-4">
             <div>
-              <p className="text-[11px] uppercase tracking-wide text-slate-500">Current page</p>
-              <p className="font-medium text-slate-200">{live?.live?.page_number ?? application.pages_completed ?? "—"}</p>
+              <p className="eyebrow">Current page</p>
+              <p className="font-medium text-slate-800">{live?.live?.page_number ?? application.pages_completed ?? "—"}</p>
             </div>
             <div>
-              <p className="text-[11px] uppercase tracking-wide text-slate-500">Current step</p>
-              <p className="font-medium text-slate-200">{(live?.live?.last_step || "starting").replaceAll("_", " ")}</p>
+              <p className="eyebrow">Current step</p>
+              <p className="font-medium text-slate-800">{(live?.live?.last_step || "starting").replaceAll("_", " ")}</p>
             </div>
             <div>
-              <p className="text-[11px] uppercase tracking-wide text-slate-500">Confidence so far</p>
-              <p className="font-medium text-slate-200">
+              <p className="eyebrow">Confidence so far</p>
+              <p className="font-medium text-slate-800">
                 {application.confidence_score != null ? `${Math.round(application.confidence_score * 100)}%` : "—"}
               </p>
             </div>
             <div>
-              <p className="text-[11px] uppercase tracking-wide text-slate-500">Autopilot</p>
-              <p className="font-medium text-slate-200">{application.autopilot_enabled ? "Enabled" : "Copilot (you approve)"}</p>
+              <p className="eyebrow">Autopilot</p>
+              <p className="font-medium text-slate-800">{application.autopilot_enabled ? "Enabled" : "Copilot (you approve)"}</p>
             </div>
           </div>
         </div>
@@ -213,8 +213,8 @@ export default function ApplicationDetail({ toast }) {
 
       {/* Pre-submission review gate */}
       {status === "READY_TO_SUBMIT" && summary && (
-        <div className="glass border-sky-400/25 p-6">
-          <h2 className="mb-3 font-semibold text-white">Review Before Submission</h2>
+        <div className="card border-sky-200 p-6">
+          <h2 className="mb-3 font-semibold text-slate-900">Review Before Submission</h2>
           <div className="grid grid-cols-2 gap-3 text-sm sm:grid-cols-4">
             <SummaryStat label="Pages completed" value={application.pages_completed ?? "—"} />
             <SummaryStat label="Questions answered" value={`${summary.questions_answered}/${summary.questions_total}`} />
@@ -237,9 +237,9 @@ export default function ApplicationDetail({ toast }) {
       )}
 
       {status === "SUBMITTED" && (
-        <div className="glass flex items-center gap-3 border-emerald-400/25 bg-emerald-500/[0.06] p-5">
-          <CheckCircle2 size={22} className="text-emerald-400" />
-          <p className="text-sm text-emerald-300">
+        <div className="card flex items-center gap-3 border-emerald-200 bg-emerald-50 p-5">
+          <CheckCircle2 size={20} className="text-emerald-600" />
+          <p className="text-sm text-emerald-800">
             Submitted{application.applied_date ? ` on ${new Date(application.applied_date).toLocaleString()}` : ""}.
           </p>
         </div>
@@ -251,9 +251,9 @@ export default function ApplicationDetail({ toast }) {
 
       {/* Answer review — needs-your-attention first */}
       {lowConfidenceQuestions.length > 0 && (
-        <div className="glass p-6">
-          <h2 className="mb-1 flex items-center gap-2 font-semibold text-white">
-            <AlertTriangle size={16} className="text-amber-400" /> Needs Your Review
+        <div className="card p-6">
+          <h2 className="mb-1 flex items-center gap-2 font-semibold text-slate-900">
+            <AlertTriangle size={16} className="text-amber-600" /> Needs Your Review
           </h2>
           <p className="mb-3 text-xs text-slate-500">
             Low-confidence answers automation would not submit on your behalf without a look.
@@ -263,40 +263,40 @@ export default function ApplicationDetail({ toast }) {
       )}
 
       {/* Full question ledger */}
-      <div className="glass p-6">
-        <h2 className="mb-3 font-semibold text-white">All Questions ({questions.length})</h2>
+      <div className="card p-6">
+        <h2 className="mb-3 font-semibold text-slate-900">All Questions ({questions.length})</h2>
         <AnswerReviewList questions={questions} onReview={reviewQuestion} />
       </div>
 
       {/* Run history / activity log */}
-      <div className="glass overflow-hidden">
-        <div className="border-b border-white/[0.06] px-6 py-4">
-          <h2 className="font-semibold text-white">Activity Log</h2>
+      <div className="card overflow-hidden">
+        <div className="card-header">
+          <h2 className="font-semibold text-slate-900">Activity Log</h2>
         </div>
         {runs.length === 0 ? (
           <p className="p-6 text-sm text-slate-500">No runs recorded yet.</p>
         ) : (
-          <div className="divide-y divide-white/[0.05]">
+          <div className="divide-y divide-slate-100">
             {runs.map((r) => (
               <div key={r.run_id} className="px-6 py-3">
                 <button className="flex w-full items-center justify-between text-left text-sm"
                   onClick={() => setExpandedRun(expandedRun === r.run_id ? null : r.run_id)}>
-                  <span className="flex items-center gap-2 text-slate-300">
-                    <FileText size={14} className="text-slate-500" />
+                  <span className="flex items-center gap-2 text-slate-700">
+                    <FileText size={14} className="text-slate-400" />
                     {r.started_at ? new Date(r.started_at).toLocaleString() : "—"} — <StatusBadgeInline status={r.status} />
                   </span>
-                  <ChevronDown size={14} className={`text-slate-500 transition-transform ${expandedRun === r.run_id ? "rotate-180" : ""}`} />
+                  <ChevronDown size={14} className={`text-slate-400 transition-transform ${expandedRun === r.run_id ? "rotate-180" : ""}`} />
                 </button>
                 {expandedRun === r.run_id && (
-                  <div className="mt-2 space-y-1 rounded-lg bg-slate-950/40 p-3 font-mono text-[11px] text-slate-400">
+                  <div className="mt-2 space-y-1 rounded-lg bg-slate-50 p-3 font-mono text-[11px] text-slate-600">
                     {(r.log_lines || []).length === 0 && <p>No structured log captured for this run.</p>}
                     {(r.log_lines || []).map((line, i) => (
                       <p key={i}>
-                        <span className="text-slate-600">{new Date(line.timestamp).toLocaleTimeString()}</span>{" "}
+                        <span className="text-slate-400">{new Date(line.timestamp).toLocaleTimeString()}</span>{" "}
                         {line.message}
                       </p>
                     ))}
-                    {r.error_log && <p className="text-rose-400">{r.error_log}</p>}
+                    {r.error_log && <p className="text-red-600">{r.error_log}</p>}
                   </div>
                 )}
               </div>
@@ -311,21 +311,21 @@ export default function ApplicationDetail({ toast }) {
 function SummaryStat({ label, value }) {
   return (
     <div>
-      <p className="text-[11px] uppercase tracking-wide text-slate-500">{label}</p>
-      <p className="text-lg font-bold text-white">{value}</p>
+      <p className="eyebrow">{label}</p>
+      <p className="text-lg font-semibold text-slate-900">{value}</p>
     </div>
   );
 }
 
 function Warning({ title, children }) {
   return (
-    <div className="mt-3 rounded-xl border border-rose-400/25 bg-rose-500/[0.06] px-4 py-3 text-xs text-rose-300">
+    <div className="mt-3 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-xs text-red-700">
       <p className="font-semibold">{title}</p>
-      <p className="mt-0.5 text-rose-300/80">{children}</p>
+      <p className="mt-0.5 text-red-700/80">{children}</p>
     </div>
   );
 }
 
 function StatusBadgeInline({ status }) {
-  return <span className="font-semibold text-slate-400">{status}</span>;
+  return <span className="font-semibold text-slate-500">{status}</span>;
 }

@@ -2,20 +2,22 @@ import { useEffect, useState, useCallback } from "react";
 import { NavLink, Route, Routes } from "react-router-dom";
 import {
   BrainCircuit, CheckCircle2, AlertCircle, Info, X, LogOut, Loader2,
-  Search, LayoutDashboard, UserCircle2, FileText, Settings as SettingsIcon,
+  Home as HomeIcon, Search, LayoutDashboard, UserCircle2, FileText, Settings as SettingsIcon,
 } from "lucide-react";
 import { api, auth, setUnauthorizedHandler } from "./api";
 import AuthPage from "./components/AuthPage";
+import Home from "./pages/Home";
 import JobsAndMatches from "./pages/JobsAndMatches";
-import Dashboard from "./pages/Dashboard";
+import Applications from "./pages/Applications";
 import ApplicationDetail from "./pages/ApplicationDetail";
 import Profile from "./pages/Profile";
 import ResumeManagement from "./pages/ResumeManagement";
 import Settings from "./pages/Settings";
 
 const NAV_LINKS = [
-  { to: "/", label: "Jobs & Matches", icon: Search, end: true },
-  { to: "/dashboard", label: "Dashboard", icon: LayoutDashboard },
+  { to: "/", label: "Home", icon: HomeIcon, end: true },
+  { to: "/search", label: "Job Search", icon: Search },
+  { to: "/applications", label: "Applications", icon: LayoutDashboard },
   { to: "/profile", label: "Profile", icon: UserCircle2 },
   { to: "/resumes", label: "Resumes", icon: FileText },
   { to: "/settings", label: "Settings", icon: SettingsIcon },
@@ -167,8 +169,9 @@ export default function App() {
 
         <main className="mx-auto w-full max-w-6xl flex-1 px-4 py-6 sm:px-8">
           <Routes>
-            <Route path="/" element={<JobsAndMatches resume={resume} setResume={setResume} toast={toast} />} />
-            <Route path="/dashboard" element={<Dashboard toast={toast} />} />
+            <Route path="/" element={<Home resume={resume} toast={toast} />} />
+            <Route path="/search" element={<JobsAndMatches resume={resume} setResume={setResume} toast={toast} />} />
+            <Route path="/applications" element={<Applications toast={toast} />} />
             <Route path="/applications/:id" element={<ApplicationDetail toast={toast} />} />
             <Route path="/profile" element={<Profile toast={toast} />} />
             <Route path="/resumes" element={<ResumeManagement toast={toast} />} />

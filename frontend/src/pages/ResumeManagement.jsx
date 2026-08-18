@@ -62,57 +62,57 @@ export default function ResumeManagement({ toast }) {
   return (
     <div className="animate-fade-up space-y-5">
       <div>
-        <h1 className="text-xl font-bold text-white">Resume Management</h1>
-        <p className="text-sm text-slate-500">
+        <h1 className="page-title">Resume Management</h1>
+        <p className="page-subtitle">
           Upload every résumé variant, cover letter, or certificate you want automation to be able to pick from.
         </p>
       </div>
 
-      <div className={`glass p-6 ${uploading ? "glass-active" : ""}`}>
+      <div className={`card p-6 ${uploading ? "card-active" : ""}`}>
         <div className="mb-4 grid gap-3 sm:grid-cols-3">
           <label className="block">
-            <span className="mb-1 block text-[11px] text-slate-500">Document type</span>
-            <select className="input-dark" value={uploadType} onChange={(e) => setUploadType(e.target.value)}>
+            <span className="field-label">Document type</span>
+            <select className="input" value={uploadType} onChange={(e) => setUploadType(e.target.value)}>
               {TYPES.map(([v, l]) => <option key={v} value={v}>{l}</option>)}
             </select>
           </label>
           <label className="block sm:col-span-2">
-            <span className="mb-1 block text-[11px] text-slate-500">Job type tag (optional — e.g. "backend", "data-science")</span>
-            <input className="input-dark" value={jobTypeTag} onChange={(e) => setJobTypeTag(e.target.value)} />
+            <span className="field-label">Job type tag (optional — e.g. "backend", "data-science")</span>
+            <input className="input" value={jobTypeTag} onChange={(e) => setJobTypeTag(e.target.value)} />
           </label>
         </div>
         <div
           onClick={() => !uploading && inputRef.current?.click()}
-          className="flex cursor-pointer flex-col items-center justify-center rounded-2xl border-2 border-dashed border-white/15 bg-white/[0.02] px-6 py-10 text-center transition hover:border-indigo-400/50 hover:bg-indigo-500/5"
+          className="flex cursor-pointer flex-col items-center justify-center rounded-xl border-2 border-dashed border-slate-200 bg-slate-50 px-6 py-10 text-center transition-colors hover:border-brand-300 hover:bg-brand-50/40"
         >
-          {uploading ? <Loader2 size={28} className="mb-2 animate-spin text-indigo-300" /> : <CloudUpload size={28} className="mb-2 text-indigo-300" />}
-          <p className="text-sm font-semibold text-slate-200">Click to upload a document</p>
+          {uploading ? <Loader2 size={26} className="mb-2 animate-spin text-brand-600" /> : <CloudUpload size={26} className="mb-2 text-brand-600" />}
+          <p className="text-sm font-medium text-slate-800">Click to upload a document</p>
           <p className="mt-1 text-xs text-slate-500">PDF or DOCX</p>
           <input ref={inputRef} type="file" accept=".pdf,.docx" className="hidden" onChange={(e) => onFile(e.target.files[0])} />
         </div>
       </div>
 
-      <div className="glass overflow-hidden">
-        <div className="border-b border-white/[0.06] px-6 py-4"><h2 className="font-semibold text-white">Your Documents</h2></div>
+      <div className="card overflow-hidden">
+        <div className="card-header"><h2 className="font-semibold text-slate-900">Your Documents</h2></div>
         {loading ? (
-          <div className="flex justify-center py-10"><Loader2 size={22} className="animate-spin text-indigo-400" /></div>
+          <div className="flex justify-center py-10"><Loader2 size={20} className="animate-spin text-brand-600" /></div>
         ) : documents.length === 0 ? (
           <p className="p-8 text-center text-sm text-slate-500">No documents uploaded yet.</p>
         ) : (
-          <div className="divide-y divide-white/[0.05]">
+          <div className="divide-y divide-slate-100">
             {documents.map((d) => (
               <div key={d.document_id} className="flex items-center justify-between px-6 py-3.5">
                 <div className="flex items-center gap-3">
-                  <FileText size={18} className="text-slate-500" />
+                  <FileText size={18} className="text-slate-400" />
                   <div>
-                    <p className="text-sm font-medium text-slate-200">{d.original_filename}</p>
+                    <p className="text-sm font-medium text-slate-800">{d.original_filename}</p>
                     <p className="text-xs text-slate-500">
                       {TYPES.find(([v]) => v === d.document_type)?.[1] || d.document_type}
                       {d.job_type_tag ? ` · ${d.job_type_tag}` : ""}
                       {d.uploaded_at ? ` · ${new Date(d.uploaded_at).toLocaleDateString()}` : ""}
                     </p>
                   </div>
-                  {d.is_default && <span className="chip bg-indigo-500/15 text-indigo-300">default</span>}
+                  {d.is_default && <span className="badge badge-brand">default</span>}
                 </div>
                 <div className="flex items-center gap-1.5">
                   {!d.is_default && (
@@ -120,7 +120,7 @@ export default function ResumeManagement({ toast }) {
                       <Star size={13} />
                     </button>
                   )}
-                  <button className="btn-ghost !px-2.5 !py-1 text-xs !text-rose-300/80 hover:!border-rose-400/40" onClick={() => remove(d)}>
+                  <button className="btn-ghost !px-2.5 !py-1 text-xs !text-red-700" onClick={() => remove(d)}>
                     <Trash2 size={13} />
                   </button>
                 </div>

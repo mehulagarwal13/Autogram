@@ -89,18 +89,18 @@ export default function MatchesPanel({ resume, toast }) {
   return (
     <div className="animate-fade-up space-y-4">
       {/* Controls */}
-      <div className={`glass flex flex-wrap items-center gap-3 p-4 ${generating ? "glass-active" : ""}`}>
-        <input className="input-dark !w-48 flex-1" placeholder="Location filter (optional)"
+      <div className={`card flex flex-wrap items-center gap-3 p-4 ${generating ? "card-active" : ""}`}>
+        <input className="input !w-48 flex-1" placeholder="Location filter (optional)"
           value={locationFilter} onChange={(e) => setLocationFilter(e.target.value)} />
         <button className="btn-primary" onClick={generate} disabled={generating || !resume}>
           {generating ? <Loader2 size={16} className="animate-spin" /> : <Target size={16} />}
           {generating ? "Matching..." : "Generate Matches"}
         </button>
-        <div className="ml-auto flex gap-1 rounded-xl border border-white/10 bg-slate-900/50 p-1">
+        <div className="ml-auto flex gap-1 rounded-lg bg-slate-100 p-1">
           {[["", "All"], ["new", "New"], ["saved", "Saved"], ["dismissed", "Dismissed"]].map(([v, l]) => (
             <button key={v} onClick={() => refresh(v)}
-              className={`rounded-lg px-3 py-1.5 text-xs font-medium transition ${
-                filter === v ? "bg-indigo-500/25 text-indigo-200" : "text-slate-500 hover:text-slate-300"}`}>
+              className={`rounded-md px-3 py-1.5 text-xs font-medium transition-colors ${
+                filter === v ? "bg-white text-slate-900 shadow-sm" : "text-slate-500 hover:text-slate-700"}`}>
               {l}
             </button>
           ))}
@@ -108,27 +108,27 @@ export default function MatchesPanel({ resume, toast }) {
       </div>
 
       {generating && (
-        <div className="glass p-6">
-          <div className="shimmer h-2 rounded-full" />
-          <p className="mt-3 flex items-center justify-center gap-2 text-xs text-indigo-300">
-            <Sparkles size={13} className="animate-pulse" />
+        <div className="card p-6">
+          <div className="progress-track"><div className="progress-indeterminate" /></div>
+          <p className="mt-3 flex items-center justify-center gap-2 text-xs text-brand-600">
+            <Sparkles size={13} />
             {PHASES[phaseIdx]}
           </p>
         </div>
       )}
 
       {!generating && matches.length === 0 && (
-        <div className="glass flex flex-col items-center p-12 text-center">
-          <Target size={36} className="mb-3 text-slate-600" />
-          <p className="font-semibold text-slate-400">No matches yet</p>
-          <p className="mt-1 max-w-sm text-xs text-slate-600">
+        <div className="card flex flex-col items-center p-12 text-center">
+          <Target size={32} className="mb-3 text-slate-300" />
+          <p className="font-medium text-slate-700">No matches yet</p>
+          <p className="mt-1 max-w-sm text-xs text-slate-500">
             Upload a resume, fetch some jobs, then hit Generate Matches.
           </p>
         </div>
       )}
 
-      {matches.map((m, i) => (
-        <div key={m.match_id} style={{ animationDelay: `${Math.min(i * 70, 500)}ms` }} className="animate-fade-up">
+      {matches.map((m) => (
+        <div key={m.match_id} className="animate-fade-up">
           <MatchCard match={m} onStatus={setStatus} onApply={startApplication} applying={applyingId === m.match_id} />
         </div>
       ))}

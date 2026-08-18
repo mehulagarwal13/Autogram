@@ -2,9 +2,9 @@ import { useState } from "react";
 import { Check, Pencil, X, ShieldQuestion } from "lucide-react";
 
 const CONFIDENCE_STYLE = {
-  HIGH: "bg-emerald-500/15 text-emerald-300 ring-1 ring-emerald-400/25",
-  MEDIUM: "bg-amber-500/15 text-amber-300 ring-1 ring-amber-400/25",
-  LOW: "bg-rose-500/15 text-rose-300 ring-1 ring-rose-400/25",
+  HIGH: "badge-green",
+  MEDIUM: "badge-amber",
+  LOW: "badge-red",
 };
 
 const SOURCE_LABEL = {
@@ -36,18 +36,18 @@ function QuestionRow({ question, onReview }) {
   }
 
   return (
-    <div className={`rounded-xl border p-4 ${
+    <div className={`rounded-lg border p-4 ${
       question.confidence_level === "LOW" && !reviewed
-        ? "border-rose-400/30 bg-rose-500/[0.04]"
-        : "border-white/[0.06] bg-white/[0.02]"
+        ? "border-red-200 bg-red-50/50"
+        : "border-slate-200 bg-white"
     }`}>
       <div className="flex flex-wrap items-start justify-between gap-2">
-        <p className="max-w-xl text-sm font-medium text-slate-200">{question.question_text}</p>
+        <p className="max-w-xl text-sm font-medium text-slate-800">{question.question_text}</p>
         <div className="flex shrink-0 items-center gap-1.5">
-          <span className={`chip ${CONFIDENCE_STYLE[question.confidence_level] || ""}`}>
+          <span className={`badge ${CONFIDENCE_STYLE[question.confidence_level] || "badge-neutral"}`}>
             {question.confidence_level}
           </span>
-          {reviewed && <span className="chip bg-white/[0.06] text-slate-400">{question.review_status}</span>}
+          {reviewed && <span className="badge badge-neutral">{question.review_status}</span>}
         </div>
       </div>
 
@@ -59,12 +59,12 @@ function QuestionRow({ question, onReview }) {
       {editing ? (
         <div className="mt-2 space-y-2">
           {question.available_options?.length ? (
-            <select className="input-dark" value={draft} onChange={(e) => setDraft(e.target.value)}>
+            <select className="input" value={draft} onChange={(e) => setDraft(e.target.value)}>
               <option value="">Choose an option...</option>
               {question.available_options.map((o) => <option key={o} value={o}>{o}</option>)}
             </select>
           ) : (
-            <textarea className="input-dark" rows={2} value={draft} onChange={(e) => setDraft(e.target.value)} />
+            <textarea className="input" rows={2} value={draft} onChange={(e) => setDraft(e.target.value)} />
           )}
           <div className="flex gap-2">
             <button className="btn-primary !px-3 !py-1.5 text-xs" disabled={busy || !draft.trim()}
@@ -76,13 +76,13 @@ function QuestionRow({ question, onReview }) {
         </div>
       ) : (
         <div className="mt-2 flex flex-wrap items-center justify-between gap-3">
-          <p className={`text-sm ${displayAnswer ? "text-slate-300" : "italic text-slate-600"}`}>
+          <p className={`text-sm ${displayAnswer ? "text-slate-700" : "italic text-slate-400"}`}>
             {displayAnswer || "No answer yet — needs your input."}
           </p>
           {!reviewed && (
             <div className="flex shrink-0 gap-1.5">
               {displayAnswer && (
-                <button className="btn-ghost !px-2.5 !py-1 text-xs !text-emerald-300 hover:!border-emerald-400/40"
+                <button className="btn-ghost !px-2.5 !py-1 text-xs !text-emerald-700"
                   disabled={busy} onClick={() => act("approve")}>
                   <Check size={13} /> Approve
                 </button>
@@ -91,7 +91,7 @@ function QuestionRow({ question, onReview }) {
                 onClick={() => { setDraft(question.answer || ""); setEditing(true); }}>
                 <Pencil size={13} /> Edit
               </button>
-              <button className="btn-ghost !px-2.5 !py-1 text-xs !text-rose-300/80 hover:!border-rose-400/40"
+              <button className="btn-ghost !px-2.5 !py-1 text-xs !text-red-700"
                 disabled={busy} onClick={() => act("reject")}>
                 <X size={13} /> Reject
               </button>
@@ -111,7 +111,7 @@ export default function AnswerReviewList({ questions, onReview, onlyLowConfidenc
   if (filtered.length === 0) {
     return (
       <div className="flex flex-col items-center px-6 py-10 text-center">
-        <ShieldQuestion size={28} className="mb-2 text-slate-600" />
+        <ShieldQuestion size={26} className="mb-2 text-slate-300" />
         <p className="text-sm text-slate-500">
           {onlyLowConfidence ? "Nothing needs your review right now." : "No questions recorded yet for this application."}
         </p>
