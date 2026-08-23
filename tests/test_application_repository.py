@@ -15,7 +15,6 @@ from app.models.db_models import Application
 from app.services.application_repository import (
     apply_run_result,
     compute_job_url_hash,
-    mark_unsupported_ats,
 )
 
 
@@ -65,6 +64,7 @@ class _FakeRunResult:
     screenshot_paths: list = field(default_factory=list)
     trace_path: str | None = None
     error_log: str | None = None
+    detected_ats_platform: str | None = None
 
 
 def test_apply_run_result_marks_applied_and_sets_applied_date():
@@ -137,16 +137,37 @@ def test_apply_run_result_does_not_set_a_failure_reason_for_non_failed_status():
     assert application.applied_date is None
 
 
-# ---------- mark_unsupported_ats ----------
+# ---------- detected_ats_platform vs. ats_platform ----------
 
-def test_mark_unsupported_ats_sets_needs_review_with_a_clear_reason():
-    application = _blank_application()
+def test_apply_run_result_records_the_detected_platform_separately_from_the_resolved_one():
+    """The regression this exists for: a run confidently detected as
+    "smartrecruiters" but actually filled by GenericAdapter reports
+    `ats_platform="custom"` (see ApplicationFlowManager._fall_back_to_generic_adapter)
+    and `detected_ats_platform="smartrecruiters"` — both must land on the
+    `Application` row, distinctly, so nothing ever displays this as though a
+    dedicated SmartRecruiters adapter ran it."""
+    application = _blank_application(status="processing")
     db = MagicMock()
+    result = _FakeRunResult(
+        application_id="app-1", status="copilot_review", ats_platform="custom",
+        confidence=1.0, detected_ats_platform="smartrecruiters",
+    )
 
-    mark_unsupported_ats(db, application, ats_platform="workday", confidence=0.98)
+    apply_run_result(db, application, result)
 
-    assert application.status == "needs_review"
-    assert application.ats_platform == "workday"
-    assert application.confidence_score == 0.98
-    assert "workday" in application.failure_reason
-    db.commit.assert_called_once()
+    assert application.ats_platform == "custom"
+    assert application.detected_ats_platform == "smartrecruiters"
+
+
+def test_apply_run_result_falls_back_to_ats_platform_when_detected_platform_is_unset():
+    """Older/hand-built results (or a run where detection and resolution
+    genuinely agreed) never set `detected_ats_platform` — `apply_run_result`
+    must not leave the column spuriously blank for those; it should read the
+    same as `ats_platform`."""
+    application = _blank_application(status="processing")
+    db = MagicMock()
+    result = _FakeRunResult(application_id="app-1", status="applied", ats_platform="greenhouse", confidence=0.95)
+
+    apply_run_result(db, application, result)
+
+    assert application.detected_ats_platform == "greenhouse"

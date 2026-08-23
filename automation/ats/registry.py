@@ -6,8 +6,20 @@ Only platforms with a real (non-stub) adapter belong here. The still-stub
 subclasses (SmartRecruiters, Taleo, iCIMS, Ashby, BambooHR, Oracle HCM — Phase
 7) are deliberately NOT registered: calling one would raise
 `NotImplementedError` mid-run. Callers (`app/api/applications.py`) check
-`get_adapter_class(...) is None` and route straight to `needs_review` instead,
-which is a real, honest, plannable outcome rather than a crash.
+`get_adapter_class(...) is None` and hand the run to
+`ApplicationFlowManager` anyway, which falls back to `GenericAdapter` (see
+`automation/ats/generic/generic_adapter.py`) rather than an immediate
+`needs_review` — automation is attempted with the generic label/name/
+placeholder fill every real adapter also uses, and a human reviews the
+result. `GenericAdapter` is a real, working fallback, not a crash path, but
+it is still never a dedicated adapter for any of these platforms: see
+`ApplicationFlowManager._fall_back_to_generic_adapter`, which forces
+`ats_platform` to `"custom"` for exactly this reason — some of these platform
+names (`"smartrecruiters"`, `"ashby"`) are members of
+`ApplicationFlowManager.PUBLIC_ATS_PLATFORMS`, and without that reassignment
+a confidently-detected-but-unregistered posting on one of them could
+otherwise satisfy the AUTO_SUBMIT gate despite no dedicated adapter having
+run.
 
 Workday joined this table once multi-page support landed. It could not usefully
 have been registered before: a Workday application is 4-6 pages, and a flow

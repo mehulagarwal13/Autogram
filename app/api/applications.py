@@ -586,23 +586,50 @@ def _run_application(application_id: str, resume_document_id: str, job_descripti
         adapter_cls = get_adapter_class(ats_platform)
 
         if adapter_cls is None and ats_platform != FALLBACK_ATS:
-            # A CONFIDENTLY detected platform with no adapter implemented yet
-            # (Phase 7 gap) — clicking around a page already identified as,
-            # say, Workday won't produce an adapter that doesn't exist.
-            application_repository.mark_unsupported_ats(
-                db, application, ats_platform=ats_platform, confidence=detection["confidence"]
-            )
+            # A CONFIDENTLY detected platform with no dedicated adapter
+            # implemented yet (e.g. oracle_hcm, taleo, icims, smartrecruiters,
+            # ashby, bamboohr — see automation/ats/registry.py). This used to
+            # be an instant dead end (needs_review, automation never even
+            # attempted) on the theory that "clicking around a page already
+            # identified as, say, Workday won't produce an adapter that
+            # doesn't exist." That reasoning stops applying once GenericAdapter
+            # is a real, working fallback: `adapter_cls` is left `None` here on
+            # purpose and handed to the flow manager exactly like the
+            # FALLBACK_ATS ("custom") case below — its own
+            # `_resolve_adapter_from_listing_page` re-detects against the LIVE
+            # page and, when no REGISTERED adapter resolves (which it won't,
+            # for any of these platforms, since none is registered), falls back
+            # to GenericAdapter's same label/name/placeholder-driven fill every
+            # real adapter already uses — never a crash.
+            #
+            # Note this is NOT gated on whether `ats_platform` happens to be a
+            # member of `ApplicationFlowManager.PUBLIC_ATS_PLATFORMS` — two of
+            # that set's entries ("smartrecruiters", "ashby") have no adapter
+            # registered either, so relying on non-membership here would be
+            # wrong for exactly those two. What actually keeps this safe is
+            # that `_resolve_adapter_from_listing_page`'s
+            # `_fall_back_to_generic_adapter` unconditionally reassigns
+            # `self.ats_platform` to `GenericAdapter.name` ("custom") the
+            # moment it hands off to the generic fallback, regardless of what
+            # this variable said going in — so `decide_action` never sees a
+            # `PUBLIC_ATS_PLATFORMS` member for a run GenericAdapter actually
+            # filled, and AUTO_SUBMIT is never on the table for any of these. A
+            # human still reviews (and, in copilot mode, submits) every one of
+            # these — this only replaces "automation never even tried" with
+            # "automation tried, a human confirms."
             logger.info(
-                "Application %s: no adapter for '%s' yet — marked needs_review.",
+                "Application %s: '%s' confidently detected but no dedicated adapter yet — "
+                "attempting the generic fallback instead of an immediate needs_review.",
                 application_id, ats_platform,
             )
-            return
-        # adapter_cls is None AND ats_platform == FALLBACK_ATS ("custom"):
-        # pre-flight detection found nothing recognizable at all — handed to
+            adapter_cls = None
+        # adapter_cls is None (either FALLBACK_ATS/"custom", or a confidently
+        # detected platform with no dedicated adapter — see above): handed to
         # the flow manager anyway ("Apply from Job Link"), which re-detects
         # against the LIVE page and, if this looks like a job-listing page
         # rather than a form, clicks its own Apply/Apply Now/Start
-        # Application control and re-detects again before giving up — see
+        # Application control and re-detects again before falling back to
+        # GenericAdapter — see
         # ApplicationFlowManager._resolve_adapter_from_listing_page.
 
         profile = profile_repository.get_by_user_id(db, application.user_id)
@@ -678,7 +705,29 @@ def _run_application(application_id: str, resume_document_id: str, job_descripti
         # open for review, hence the fresh one-off thread rather than a
         # shared pool or calling manager.run() directly here.
         result = _run_on_dedicated_thread(manager.run)
-        application_repository.apply_run_result(db, application, result)
+        # `db` has been alive for the ENTIRE automation run above — commonly
+        # many minutes, since `answer_engine` (constructed with this same
+        # session) keeps using it throughout for cache reads/writes. If
+        # anything on it failed and left its transaction in a
+        # needs-rollback state at any point during that run (a dropped
+        # connection, a transient write failure — observed live: a
+        # ~19-minute Amex run's `_fill_opt_in_checkboxes` lazy-load blew up
+        # with `PendingRollbackError` from a much earlier, unrelated failed
+        # flush), every later operation on `db` — including this one, the
+        # single most consequential write of the whole run — would raise
+        # too, discarding a real, hard-won result (5 pages filled, résumé
+        # uploaded) that never gets a chance to reach the database. A
+        # dedicated, guaranteed-fresh session for JUST this write means the
+        # result lands regardless of what happened to `db` during the run.
+        result_db = SessionLocal()
+        try:
+            fresh_application = application_repository.get_by_id(result_db, application_id)
+            if fresh_application is not None:
+                application_repository.apply_run_result(result_db, fresh_application, result)
+            else:
+                logger.warning("Application %s vanished before its result could be recorded.", application_id)
+        finally:
+            result_db.close()
     except Exception:
         logger.exception("Background application run crashed for %s", application_id)
         db.rollback()

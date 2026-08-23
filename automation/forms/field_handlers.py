@@ -485,11 +485,24 @@ def _coerce_checkbox_intent(value) -> bool | None:
 
 
 def _find_label_for(page: Page, input_locator: Locator) -> Locator | None:
-    """The `<label>` associated with `input_locator`: via its `id`/`for`
-    pairing, or an ancestor `<label>` wrapping it directly — whichever
-    resolves first. Shared by `CheckboxHandler` and `RadioHandler` (PART 8/9)
-    since both need the exact same "what's the real clickable surface when
-    the input itself is visually hidden" lookup."""
+    """The real clickable surface associated with `input_locator` when the
+    input itself is visually hidden: a `<label for=id>`, an ancestor
+    `<label>` wrapping it directly, or — checked last, since it's the least
+    standard of the three — whatever `aria-labelledby` names.
+
+    The third case is real, not defensive-programming: observed live on
+    careers.americanexpress.com's required "I agree with the terms and
+    conditions" consent checkbox — `aria-labelledby="legal-disclaimer-
+    checkbox-label"` pointing at a plain, visible `<span>` (not a `<label>`
+    tag at all), with the checkbox itself rendered at a genuine zero-size
+    (`width:0;height:0`) via CSS, not merely `opacity:0` — meaning no click
+    of any kind can ever land ON the input, forced or not; the referenced
+    span is the ONLY element a real click (trusted or synthetic) can
+    actually reach. Checked last because a real `<label>` is the more
+    reliable, standards-first association when one exists — `aria-
+    labelledby` is only reached when neither of the first two resolves to
+    anything. Shared by `CheckboxHandler` and `RadioHandler` (PART 8/9)
+    since both need the exact same lookup."""
     try:
         input_id = input_locator.get_attribute("id")
     except PlaywrightError:
@@ -508,6 +521,19 @@ def _find_label_for(page: Page, input_locator: Locator) -> Locator | None:
             return parent_label.first
     except PlaywrightError:
         pass
+    try:
+        labelled_by = input_locator.get_attribute("aria-labelledby")
+    except PlaywrightError:
+        labelled_by = None
+    if labelled_by:
+        for ref_id in labelled_by.split():
+            escaped = ref_id.replace("\\", "\\\\").replace('"', '\\"')
+            try:
+                referenced = page.locator(f'[id="{escaped}"]')
+                if referenced.count() > 0 and referenced.first.is_visible():
+                    return referenced.first
+            except PlaywrightError:
+                continue
     return None
 
 
@@ -623,8 +649,21 @@ class CheckboxHandler(FieldHandler):
 
         # Attempt 2: the associated <label> — the real clickable surface for
         # the "<input type=checkbox hidden> + <label>I agree</label>" pattern.
+        #
+        # Clicked near its TOP-LEFT corner, not Playwright's default
+        # dead-center: observed live on careers.americanexpress.com, the
+        # `aria-labelledby`-referenced element `_find_label_for` resolves is
+        # an entire "icon + text" ROW (283px wide), with the actual click
+        # listener (Knockout's `toggleAccepted`) bound only to a small
+        # (~22px) icon at its start — clicking dead-center landed on plain
+        # text 100+px past the icon and dispatched fine (so this attempt
+        # looked like it "succeeded") without ever reaching anything that
+        # listens. A small top-left offset still lands correctly inside an
+        # ordinary single-surface label (the common case every existing test
+        # covers) while also reaching an icon-at-the-start one — checkbox
+        # icons precede their text in every LTR UI this matters for.
         label = _find_label_for(field.page, field.locator)
-        if label is not None and safe_click(label, field.page):
+        if label is not None and safe_click(label, field.page, position={"x": 10, "y": 10}):
             return
 
         # Attempt 3: a role="checkbox" element's own click (custom, non-<input>
@@ -1442,6 +1481,48 @@ def _read_dropdown_displayed_value(field: Field) -> str | None:
         return None
 
 
+def _selected_option_via_aria_controls(field: Field) -> str | None:
+    """Text of the option marked `aria-selected="true"` inside the popup a
+    combobox trigger's own `aria-controls` names — `None` if the trigger has
+    no such attribute, no element with that id exists, or nothing inside it
+    is currently marked selected.
+
+    A second, ARIA-spec-grounded signal for widgets `_read_dropdown_displayed_value`'s
+    naming-convention heuristics (`*-control`/`*-container`, react-select's
+    own convention) can't see — observed live against
+    careers.americanexpress.com's own custom combobox (`class="cx-select-input"`,
+    `role="combobox"`, `aria-haspopup="grid"`): a real option click landed and
+    was genuinely accepted by the widget (confirmed by `aria-selected` on the
+    option), but nothing in `_display_value_scopes` recognized SAP's naming
+    convention, and the `<input>` itself never had its `value` attribute
+    written — `_read_dropdown_displayed_value` came back empty every time,
+    burning all 3 retries re-selecting an option that had already stuck the
+    very first time. `aria-controls` is the one part of this the WAI-ARIA
+    combobox pattern requires regardless of library or naming convention, and
+    it stays on the trigger whether the popup is open or closed — so this
+    works even when `verify()` runs after the popup has already closed,
+    PROVIDED the widget leaves the (now hidden) listbox mounted rather than
+    unmounting it outright, which is the common case for exactly this
+    pattern."""
+    try:
+        controls_id = field.locator.get_attribute("aria-controls")
+    except PlaywrightError:
+        return None
+    if not controls_id:
+        return None
+    try:
+        popup = field.page.locator(f'[id="{controls_id}"]')
+        if popup.count() == 0:
+            return None
+        selected = popup.first.locator('[aria-selected="true"]')
+        if selected.count() == 0:
+            return None
+        text = (selected.first.text_content() or "").strip()
+    except PlaywrightError:
+        return None
+    return text or None
+
+
 class _DropdownHandler(FieldHandler):
     """Shared algorithm for every non-native, JS-driven dropdown:
 
@@ -1516,7 +1597,15 @@ class _DropdownHandler(FieldHandler):
 
     def verify(self, field: Field, value) -> tuple[bool, str | None]:
         actual = _read_dropdown_displayed_value(field)
-        return self._matches(actual or "", value), actual
+        if self._matches(actual or "", value):
+            return True, actual
+        # The display-value heuristic above found nothing (or the wrong
+        # thing) for this widget's particular markup — try the ARIA-standard
+        # signal before giving up. See `_selected_option_via_aria_controls`.
+        via_aria = _selected_option_via_aria_controls(field)
+        if via_aria is not None:
+            return self._matches(via_aria, value), via_aria
+        return False, actual
 
 
 class ReactSelectHandler(_DropdownHandler):

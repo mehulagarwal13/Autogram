@@ -416,6 +416,78 @@ def test_combobox_handler_reports_structured_failure_when_no_option_ever_matches
 
 
 # ---------------------------------------------------------------------------
+# Regression: a combobox whose selection is only ever visible via
+# aria-selected on the option itself, never through the trigger's own
+# displayed text/value or any `*-control`/`*-container`-named ancestor
+# (the react-select convention `_read_dropdown_displayed_value` otherwise
+# relies on). Modeled on careers.americanexpress.com's own custom combobox
+# widget (`class="cx-select-input"`, `role="combobox"`,
+# `aria-haspopup="grid"`, `aria-controls="<id>-listbox"`), observed live: a
+# real option click landed and the widget genuinely accepted it (the option
+# carried `aria-selected="true"` immediately after), but every one of
+# `_read_dropdown_displayed_value`'s naming-convention heuristics came back
+# empty, and 3 retries all re-selected an option that had already stuck the
+# first time before giving up with a bogus `verification_failed`. The popup
+# here is left mounted (display:none) after closing rather than removed —
+# the common case for this pattern, and what makes checking aria-controls
+# after the fact possible at all.
+# ---------------------------------------------------------------------------
+
+_ARIA_CONTROLS_ONLY_DROPDOWN_HTML = """
+<input id="trigger" type="text" role="combobox" aria-autocomplete="list" aria-haspopup="grid"
+       aria-controls="trigger-listbox" aria-expanded="false">
+<div id="trigger-listbox" role="listbox" style="display:none;">
+  <div class="cx-option" role="option">United States</div>
+  <div class="cx-option" role="option">India</div>
+</div>
+<script>
+  const trigger = document.getElementById('trigger');
+  const menu = document.getElementById('trigger-listbox');
+  trigger.addEventListener('click', () => { menu.style.display = 'block'; });
+  menu.querySelectorAll('.cx-option').forEach(opt => {
+    opt.addEventListener('click', () => {
+      // This widget resets its own search box back to empty once a
+      // selection is made (a real, common combobox UX: the box you typed
+      // into to filter is not where the chosen value ends up displayed) —
+      // and never writes the selection into any *-control/*-container-named
+      // element either. The clicked option's own aria-selected state is the
+      // ONLY surviving signal, exactly as observed live.
+      menu.querySelectorAll('.cx-option').forEach(o => o.removeAttribute('aria-selected'));
+      opt.setAttribute('aria-selected', 'true');
+      menu.style.display = 'none';
+      trigger.value = '';
+    });
+  });
+</script>
+"""
+
+
+def test_combobox_handler_verifies_via_aria_controls_when_no_display_value_is_ever_written(page):
+    _render(page, _ARIA_CONTROLS_ONLY_DROPDOWN_HTML)
+    field = describe_field(page.locator("#trigger"), label="Country", page=page)
+
+    outcome = fill_field(field, "India")
+
+    assert outcome.filled is True
+    assert outcome.actual_value == "India"
+    # Confirms this genuinely went through the aria-controls fallback rather
+    # than coincidentally finding text some other way: the trigger's own
+    # displayed value is empty, exactly as modeled (reset after selection).
+    assert (page.locator("#trigger").get_attribute("value") or "") == ""
+
+
+def test_combobox_handler_via_aria_controls_still_fails_when_nothing_was_ever_selected(page):
+    _render(page, _ARIA_CONTROLS_ONLY_DROPDOWN_HTML)
+    field = describe_field(page.locator("#trigger"), label="Country", page=page)
+
+    outcome = fill_field(field, "Germany")  # not one of the two rendered options
+
+    assert outcome.filled is False
+    assert outcome.failure is not None
+    assert outcome.failure.failure_reason == "verification_failed"
+
+
+# ---------------------------------------------------------------------------
 # Regression: dropdown-open timing/fallback-click robustness. Triggered by a
 # real Greenhouse posting (PayPay India) where the react-select-style
 # Country picker could not be selected. Two distinct, real-world failure

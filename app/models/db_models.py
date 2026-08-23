@@ -474,7 +474,13 @@ class Application(Base):
     job_url_hash = Column(String, nullable=False, index=True)  # sha256(job_url) — see application_repository
     company = Column(String, nullable=True)
     position = Column(String, nullable=True)
-    ats_platform = Column(String, nullable=True)  # filled in once ATSDetector runs
+    ats_platform = Column(String, nullable=True)  # the adapter that actually ran — e.g. "custom" for GenericAdapter
+    # The pre-flight `ATSDetector` guess, kept separate from `ats_platform`
+    # above so "detected smartrecruiters, GenericAdapter actually filled it"
+    # is visible instead of silently collapsed into one field. `None` when
+    # detection never ran differently from what was resolved (or for rows
+    # written before this column existed).
+    detected_ats_platform = Column(String, nullable=True)
     status = Column(String, nullable=False, default="pending")  # see VALID_APPLICATION_STATUSES
     autopilot_enabled = Column(Boolean, nullable=False, default=False)
     applied_date = Column(DateTime, nullable=True)

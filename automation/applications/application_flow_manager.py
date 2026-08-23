@@ -82,6 +82,7 @@ from automation.applications.page_navigator import (
 )
 from automation.ats.base import ATSAdapter, FieldFillResult
 from automation.ats.detector import ATSDetector, FALLBACK_ATS
+from automation.ats.generic.generic_adapter import GenericAdapter
 from automation.ats.registry import get_adapter_class
 from automation.browser.browser_manager import BrowserManager
 from automation.browser.selectors import (
@@ -360,6 +361,18 @@ class ApplicationFlowManager:
         self.user_id = user_id
         self.job_url = job_url
         self.ats_platform = ats_platform
+        # Immutable snapshot of the pre-flight `ATSDetector` guess (e.g.
+        # "smartrecruiters"), kept SEPARATE from `self.ats_platform` above,
+        # which is mutated as the run progresses to reflect whichever adapter
+        # actually ends up doing the work (see `_detect_supported_ats` and
+        # `_resolve_adapter_from_listing_page`'s GenericAdapter fallback).
+        # `self.ats_platform` is the one `decide_action` reads — it must
+        # always name the adapter that ran, never a platform guess nobody
+        # actually automated — while this one is purely for observability:
+        # a dashboard/audit log can show "Detected: smartrecruiters / Resolved:
+        # custom" instead of silently attributing a generic-adapter fill to a
+        # dedicated adapter that never ran.
+        self.detected_ats_platform = ats_platform
         self.adapter_cls = adapter_cls
         self.profile = profile
         self.resume_document = resume_document
@@ -449,31 +462,52 @@ class ApplicationFlowManager:
     # Entry point
     # ------------------------------------------------------------------
 
-    def run(self) -> ApplicationRunResult:
+    def run(self, *, resume_page: Page | None = None) -> ApplicationRunResult:
         """Entry point. Wraps the actual run in a per-run log capture (§18 —
         see `_RunLogCapture`) and guarantees `LIVE_RUN_STATE` is cleared when
         this run is done, one way or another — a run that ends in a review
         status is no longer "in progress" for the live view even though its
-        browser may stay open (see `_finish_browser_session`)."""
+        browser may stay open (see `_finish_browser_session`).
+
+        `resume_page`: continue on an ALREADY-OPEN page instead of opening a
+        fresh tab and navigating to `self.job_url` — for a `manual_required`/
+        `needs_review` run whose browser was left open (§ manual review
+        handoff) and where a human has since fixed whatever blocked it (e.g.
+        ticked a required consent checkbox) directly on that tab. Re-navigating
+        would reload the page and throw away exactly the correction the human
+        just made, which is why this is a distinct path from a normal `run()`
+        rather than something `_resolve_adapter_from_listing_page` or a retry
+        could paper over. `_OPEN_REVIEW_SESSIONS` (this same module) is the
+        in-process registry a long-lived server can use to find that page
+        again; it does not survive a process restart, so a caller reconnecting
+        from a fresh process (e.g. over CDP, matching the tab by URL) is
+        equally valid — this method doesn't care how `resume_page` was found,
+        only that it's the SAME live page, never a freshly-navigated one."""
         log_capture = _RunLogCapture(self.application_id)
         automation_logger = logging.getLogger("automation")
         automation_logger.addHandler(log_capture)
         try:
-            result = self._run_captured()
+            result = self._run_captured(resume_page=resume_page)
             result.log_lines = log_capture.lines
             return result
         finally:
             automation_logger.removeHandler(log_capture)
             clear_live_state(self.application_id)
 
-    def _run_captured(self) -> ApplicationRunResult:
+    def _run_captured(self, *, resume_page: Page | None = None) -> ApplicationRunResult:
         try:
             context = self.browser_manager.launch_context()
-            # `browser_manager.new_page()`, not `context.new_page()`: under the
-            # default `cdp` mode this context is the user's own Chrome, and the
-            # manager has to know which tabs are ours so cleanup closes those
-            # and leaves their Gmail/LinkedIn tabs alone.
-            page = self.browser_manager.new_page()
+            if resume_page is not None:
+                # Adopt rather than open a new tab — this the whole point of
+                # a resume: continue on the SAME page a human just acted on.
+                self.browser_manager.adopt_page(resume_page)
+                page = resume_page
+            else:
+                # `browser_manager.new_page()`, not `context.new_page()`: under
+                # the default `cdp` mode this context is the user's own Chrome,
+                # and the manager has to know which tabs are ours so cleanup
+                # closes those and leaves their Gmail/LinkedIn tabs alone.
+                page = self.browser_manager.new_page()
             self.browser_manager.start_trace(context)
         except Exception as e:  # noqa: BLE001 - launching/preparing the browser itself failed
             logger.exception("application %s: could not launch or prepare the browser", self.application_id)
@@ -485,12 +519,13 @@ class ApplicationFlowManager:
                 application_id=self.application_id,
                 status="failed",
                 ats_platform=self.ats_platform,
+                detected_ats_platform=self.detected_ats_platform,
                 confidence=0.0,
                 error_log=self._safe_write_error_log(repr(e)),
             )
 
         try:
-            result = self._run_on_page(page)
+            result = self._run_on_page(page, skip_navigation=resume_page is not None)
         except Exception as e:  # noqa: BLE001 - any failure becomes a reportable result, never a crash
             logger.exception("application %s: run failed", self.application_id)
             result = self._build_failure_result(page, e)
@@ -546,14 +581,23 @@ class ApplicationFlowManager:
     # Internals
     # ------------------------------------------------------------------
 
-    def _run_on_page(self, page: Page) -> ApplicationRunResult:
-        self.browser_manager.run_with_retries(lambda: page.goto(self.job_url, wait_until="domcontentloaded"))
-        self.checkpoint("navigated")
+    def _run_on_page(self, page: Page, *, skip_navigation: bool = False) -> ApplicationRunResult:
+        if skip_navigation:
+            # Resuming on a page a human already has open (see `run()`'s
+            # `resume_page` docstring) — (re-)navigating here would reload it
+            # and throw away whatever they just fixed on it.
+            self.checkpoint("resumed_existing_page")
+        else:
+            self.browser_manager.run_with_retries(lambda: page.goto(self.job_url, wait_until="domcontentloaded"))
+            self.checkpoint("navigated")
         # `domcontentloaded` above is "the HTML parsed", which on a React/Remix
         # ATS is before the form is hydrated — and filling a form mid-hydration
         # can be silently undone by the framework as it takes over the DOM. See
         # `wait_for_form_ready`'s comment block for the live Greenhouse run
-        # where exactly that dropped an already-verified résumé.
+        # where exactly that dropped an already-verified résumé. Calling this
+        # even when resuming is still correct (and cheap) — it's a readiness
+        # check, not a navigation, and the page may still be settling from
+        # whatever the human just did on it.
         wait_for_form_ready(page)
         logger.info(
             "application %s: reached the job application page (%s, headless=%s)",
@@ -581,6 +625,7 @@ class ApplicationFlowManager:
                     application_id=self.application_id,
                     status="needs_review",
                     ats_platform=self.ats_platform,
+                    detected_ats_platform=self.detected_ats_platform,
                     confidence=0.0,
                     screenshot_paths=self._safe_screenshot(page),
                     error_log=self._safe_write_error_log(reason),
@@ -614,6 +659,7 @@ class ApplicationFlowManager:
                     application_id=self.application_id,
                     status="manual_required",
                     ats_platform=self.ats_platform,
+                    detected_ats_platform=self.detected_ats_platform,
                     confidence=self._aggregate_confidence(all_results),
                     screenshot_paths=self._safe_screenshot(page),
                     error_log=self._safe_write_error_log(reason),
@@ -629,6 +675,7 @@ class ApplicationFlowManager:
                     application_id=self.application_id,
                     status="manual_required",
                     ats_platform=self.ats_platform,
+                    detected_ats_platform=self.detected_ats_platform,
                     confidence=0.0,
                     screenshot_paths=self._safe_screenshot(page),
                     error_log=self._safe_write_error_log(progress.blocked_reason),
@@ -687,6 +734,7 @@ class ApplicationFlowManager:
                 application_id=self.application_id,
                 status="manual_required",
                 ats_platform=self.ats_platform,
+                detected_ats_platform=self.detected_ats_platform,
                 confidence=confidence,
                 screenshot_paths=self._safe_screenshot(page),
                 error_log=self._safe_write_error_log(reason),
@@ -708,6 +756,7 @@ class ApplicationFlowManager:
                 application_id=self.application_id,
                 status="needs_review",
                 ats_platform=self.ats_platform,
+                detected_ats_platform=self.detected_ats_platform,
                 confidence=confidence,
                 screenshot_paths=self._safe_screenshot(page),
                 error_log=self._safe_write_error_log(reason),
@@ -756,6 +805,7 @@ class ApplicationFlowManager:
             application_id=self.application_id,
             status=status,
             ats_platform=self.ats_platform,
+            detected_ats_platform=self.detected_ats_platform,
             confidence=confidence,
             screenshot_paths=screenshot_paths,
             error_log=error_log,
@@ -1098,6 +1148,7 @@ class ApplicationFlowManager:
             application_id=self.application_id,
             status="manual_required",
             ats_platform=self.ats_platform,
+            detected_ats_platform=self.detected_ats_platform,
             confidence=self._aggregate_confidence(all_results),
             screenshot_paths=self._safe_screenshot(page),
             error_log=self._safe_write_error_log(reason),
@@ -1170,15 +1221,40 @@ class ApplicationFlowManager:
             return None, None
 
     def _resolve_adapter_from_listing_page(self, page: Page) -> tuple[type[ATSAdapter], Page] | None:
-        """"Apply from Job Link": called only when pre-flight detection came
-        back as `FALLBACK_ATS` — this page might be a job LISTING/description
-        page sitting in front of a supported ATS, reached by clicking its own
-        Apply/Apply Now/Start Application control, rather than itself being
-        unsupported. Returns `None` (never bypassing anything) when a
-        human-only gate's wait times out, or when no supported ATS can be
-        resolved even after trying the click — the caller then reports
-        `needs_review`, exactly as `mark_unsupported_ats` would have for a
-        confidently-detected-but-unimplemented platform.
+        """"Apply from Job Link": called whenever there's no REGISTERED
+        adapter to hand this run to outright — either pre-flight detection
+        came back as `FALLBACK_ATS` (nothing recognizable at all), or it
+        confidently named a real platform this deployment has no adapter
+        for yet (e.g. `oracle_hcm`, `taleo` — see `ats/registry.py`). Either
+        way this page might be a job LISTING/description page sitting in
+        front of a supported ATS, reached by clicking its own Apply/Apply
+        Now/Start Application control, rather than itself being the form.
+
+        If, after that, still no REGISTERED adapter resolves, this falls
+        back to `GenericAdapter` rather than giving up — that is what makes
+        "apply from any job link" actually mean any link: an unrecognized
+        platform still gets the same label/name/placeholder-driven fill
+        every real adapter's `answer_questions()` also just delegates to
+        (see `GenericAdapter`'s module docstring). It is never mistaken for
+        a fully-automated run: every fallback goes through
+        `_fall_back_to_generic_adapter`, which forces `self.ats_platform` to
+        `"custom"` — `GenericAdapter.detect()`'s low, constant confidence and
+        `"custom"`'s absence from `PUBLIC_ATS_PLATFORMS` then mean a run
+        through it can only end at `NEEDS_REVIEW` or `COPILOT_REVIEW`, never
+        `AUTO_SUBMIT` — a human always reviews it. (Without that
+        reassignment, a page originally detected as a confident-but-
+        unregistered `PUBLIC_ATS_PLATFORMS` member — "smartrecruiters" or
+        "ashby" today — would still carry that platform name into
+        `decide_action` and could reach AUTO_SUBMIT on a well-filled simple
+        form despite GenericAdapter, not a vetted adapter, having done the
+        filling; see `_fall_back_to_generic_adapter`'s own docstring.)
+
+        Only returns `None` (never bypassing anything) when a human-only
+        gate's wait times out — there is a real, unresolved block on this
+        page in that case, not merely an unrecognized one, and GenericAdapter
+        would have nothing fillable to do about it anyway (see
+        `_process_page`'s own human-gate/CAPTCHA checks, which run again once
+        an adapter is constructed).
 
         CAPTCHA/human-gate checks happen here FIRST, before ever looking for
         an Apply button — a listing page can be gated exactly like a form can
@@ -1205,25 +1281,59 @@ class ApplicationFlowManager:
         if apply_button is None:
             logger.info(
                 "application %s: no supported ATS detected and no Apply/Apply Now/Start Application "
-                "control found on %s.", self.application_id, page.url,
+                "control found on %s — falling back to the generic adapter on this page.",
+                self.application_id, page.url,
             )
-            return None
+            return self._fall_back_to_generic_adapter(page)
 
         self.checkpoint("apply_entry_button_clicked")
         target_page = self._click_apply_and_follow(page, apply_button)
         if target_page is None:
-            return None
+            logger.info(
+                "application %s: Apply control could not be followed to a new page — "
+                "falling back to the generic adapter on the original page.", self.application_id,
+            )
+            return self._fall_back_to_generic_adapter(page)
 
         wait_for_form_ready(target_page)
         resolved = self._detect_supported_ats(target_page)
         if resolved is None:
             logger.info(
                 "application %s: clicked Apply but the resulting page (%s) still isn't a "
-                "recognized/supported ATS.", self.application_id, target_page.url,
+                "recognized/supported ATS — falling back to the generic adapter there.",
+                self.application_id, target_page.url,
             )
-            return None
+            return self._fall_back_to_generic_adapter(target_page)
         self.checkpoint("ats_detected_after_apply_click")
         return resolved[0], target_page
+
+    def _fall_back_to_generic_adapter(self, page: Page) -> tuple[type[ATSAdapter], Page]:
+        """The single place `_resolve_adapter_from_listing_page` hands a run
+        to `GenericAdapter`. This is a SAFETY-CRITICAL assignment, not
+        bookkeeping: `decide_action` (module-level, above) reads
+        `self.ats_platform` to decide whether AUTO_SUBMIT is even on the
+        table, via `ats_platform in PUBLIC_ATS_PLATFORMS`. Two of that set's
+        members — "smartrecruiters" and "ashby" — have no adapter registered
+        in `ats/registry.py` yet, so a run that started life confidently
+        detected as one of THOSE would, without this reassignment, still
+        carry that platform name all the way to `decide_action` even though
+        GenericAdapter — not a vetted, platform-specific adapter — is what
+        actually filled the form. Combined with autopilot enabled and a
+        simple form the generic label/name sweep fills completely (trivially
+        >= AUTO_SUBMIT_CONFIDENCE_THRESHOLD), that would silently AUTO_SUBMIT
+        an application nobody ever reviewed — exactly the outcome this
+        module's docstrings claim can't happen. Forcing `self.ats_platform`
+        to `GenericAdapter.name` ("custom", which is never a member of
+        `PUBLIC_ATS_PLATFORMS`) here closes that gap for every caller, rather
+        than relying on each of the three call sites to remember it.
+
+        `self.detected_ats_platform` — the original pre-flight guess — is
+        deliberately left untouched, so observability/audit can still show
+        what was actually detected alongside what actually ran (see
+        `ApplicationRunResult.detected_ats_platform`)."""
+        self.ats_platform = GenericAdapter.name
+        self.checkpoint("generic_adapter_fallback")
+        return GenericAdapter, page
 
     def _detect_supported_ats(self, page: Page) -> tuple[type[ATSAdapter], str] | None:
         """Re-runs full (tier-1 + tier-2) `ATSDetector` detection against the
@@ -1480,6 +1590,7 @@ class ApplicationFlowManager:
             application_id=self.application_id,
             status="failed",
             ats_platform=self.ats_platform,
+            detected_ats_platform=self.detected_ats_platform,
             confidence=0.0,
             screenshot_paths=self._safe_screenshot(page),
             error_log=self._safe_write_error_log(repr(error)),

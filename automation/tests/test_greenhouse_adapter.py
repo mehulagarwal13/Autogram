@@ -510,6 +510,32 @@ def test_answer_questions_checks_a_required_privacy_policy_consent_checkbox(page
     assert matched and matched[0].filled is True
 
 
+def test_answer_questions_checks_a_required_consent_checkbox_hidden_behind_its_label(page, resume_file):
+    """Observed live on careers.americanexpress.com: a required consent
+    checkbox rendered as a visually-hidden native `<input type=checkbox>`
+    (CSS-hidden for custom styling — `class="input-row__hidden-control"`
+    there) with its `<label>` as the only visible, clickable surface. Gating
+    this pass on the INPUT's own visibility silently skipped it every time,
+    which is exactly what blocked that real application from ever advancing
+    past its first page. `CheckboxHandler` already knows how to click a
+    hidden checkbox's label (see its own docstring) — the fix is letting
+    this pass reach it at all when the LABEL, not the input, is what's
+    actually visible."""
+    page.set_content(
+        '<html><body>'
+        '<label for="agree_q">I agree with the terms and conditions *</label>'
+        '<input type="checkbox" id="agree_q" required style="position:absolute;opacity:0;width:0;height:0;">'
+        '</body></html>'
+    )
+    adapter = GreenhouseAdapter(page=page, profile=_profile(), resume_document=_resume_document(resume_file))
+
+    results = adapter.answer_questions()
+
+    assert page.locator("#agree_q").is_checked() is True
+    matched = [r for r in results if r.profile_path == "consent_checkbox"]
+    assert matched and matched[0].filled is True
+
+
 def test_answer_questions_does_not_auto_check_an_optional_non_consent_checkbox(page, resume_file):
     """Regression safety: this pass must stay narrow. An optional marketing
     opt-in (not required, no consent-style wording) must never be silently

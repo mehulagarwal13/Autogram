@@ -31,3 +31,9 @@ trace.zip
 screenshot*.png
 test-results/
 playwright-report/
+
+# Root-level Remotion demo-video project (src/, remotion.config.ts, tsconfig.json)
+node_modules/
+package-lock.json
+out/
+.remotion/

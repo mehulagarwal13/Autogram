@@ -1735,14 +1735,31 @@ class ATSAdapter(ABC):
                     or input_locator.get_attribute("required") is not None
                     or (input_locator.get_attribute("aria-required") or "").lower() == "true"
                 )
-                is_visible = input_locator.is_visible()
+                # NOT just `input_locator.is_visible()`: a required consent
+                # checkbox is very commonly rendered as a visually-hidden
+                # native `<input type=checkbox>` (CSS-hidden for custom
+                # styling) with its `<label>` — the text this whole pass
+                # already matched on — as the actual visible, clickable
+                # surface. Observed live on careers.americanexpress.com:
+                # `<input type=checkbox class="input-row__hidden-control"
+                # required ...>` with the "I agree with the terms and
+                # conditions" text in a fully visible label. Gating on the
+                # INPUT's own visibility here silently skipped it every time
+                # — before ever reaching `fill_field()`, whose
+                # `CheckboxHandler` already knows how to click exactly this
+                # pattern's label as a fallback (see that handler's own
+                # docstring) and was never even given the chance. Gating on
+                # "input visible OR its label visible" still correctly skips
+                # a checkbox that's hidden because it belongs to a LATER page
+                # of a multi-step wizard — that label would be hidden too.
+                is_reachable = input_locator.is_visible() or label.is_visible()
             except PlaywrightError as e:
                 logger.debug("Could not inspect consent checkbox candidate %r (%s) — skipping.", text, e)
                 continue
 
             if already_examined or tag_name != "input" or input_type != "checkbox":
                 continue
-            if not looks_required or not is_visible:
+            if not looks_required or not is_reachable:
                 continue
 
             self._mark_examined(input_locator)

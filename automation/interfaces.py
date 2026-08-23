@@ -282,6 +282,11 @@ class ApplicationRunResult:
 
     application_id: str
     status: str  # "applied" | "failed" | "manual_required" | "needs_review" | "copilot_review"
+    # The platform whose adapter actually ran this application — safety-
+    # critical: `ApplicationFlowManager.decide_action` gates AUTO_SUBMIT on
+    # THIS value being a member of `PUBLIC_ATS_PLATFORMS`, so it must always
+    # name the adapter that did the work (e.g. "custom" for GenericAdapter),
+    # never the pre-flight platform guess when the two diverge.
     ats_platform: str
     confidence: float
     screenshot_paths: list[str] = field(default_factory=list)
@@ -301,6 +306,14 @@ class ApplicationRunResult:
     # didn't already supply one, never overwriting an explicit hint.
     detected_company: str | None = None
     detected_position: str | None = None
+    # Observability only — never read by `decide_action` or any safety check.
+    # The pre-flight `ATSDetector` guess (e.g. "smartrecruiters"), kept
+    # separate from `ats_platform` above so a dashboard/audit log can show
+    # "Detected: smartrecruiters / Resolved: custom" instead of silently
+    # reporting a GenericAdapter run as though a dedicated adapter performed
+    # it. `None` for callers that never set it (e.g. hand-built results in
+    # older tests) — treat that as "same as ats_platform", not "unknown".
+    detected_ats_platform: str | None = None
 
 
 class LLMCallable(Protocol):

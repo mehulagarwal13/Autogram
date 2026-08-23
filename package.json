@@ -1,0 +1,24 @@
+{
+  "name": "autogram-demo-video",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Remotion product-demo video for Autogram. Isolated from the frontend/ (Vite app) and extension/ (browser extension) Node projects — this is its own composition, not part of the shipped product.",
+  "scripts": {
+    "video": "remotion studio src/index.ts",
+    "video:render": "remotion render src/index.ts AutogramDemo out/autogram-demo.mp4",
+    "video:still": "remotion still src/index.ts AutogramDemo out/thumbnail.png",
+    "video:amex:render": "remotion render src/index.ts AutogramAmericanExpressDemo out/autogram-american-express-demo.mp4",
+    "video:amex:still": "remotion still src/index.ts AutogramAmericanExpressDemo out/amex-thumbnail.png"
+  },
+  "dependencies": {
+    "@remotion/cli": "^4.0.514",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8",
+    "remotion": "^4.0.514"
+  },
+  "devDependencies": {
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "typescript": "^5.6.3"
+  }
+}

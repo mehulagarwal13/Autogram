@@ -45,6 +45,12 @@ class ApplicationResponse(BaseModel):
     company: str | None = None
     position: str | None = None
     ats_platform: str | None = None
+    # The pre-flight `ATSDetector` guess, kept separate from `ats_platform`
+    # above (which always names the adapter that actually ran, e.g. "custom"
+    # for GenericAdapter) — see `Application.detected_ats_platform`. Lets the
+    # dashboard show "Detected: smartrecruiters / Resolved: custom" instead
+    # of implying a dedicated adapter handled a run GenericAdapter filled.
+    detected_ats_platform: str | None = None
     status: str
     autopilot_enabled: bool
     applied_date: datetime | None = None

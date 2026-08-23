@@ -179,20 +179,6 @@ def report_status(
     return application
 
 
-def mark_unsupported_ats(db: Session, application: Application, *, ats_platform: str, confidence: float) -> Application:
-    """No `ATSAdapter` is implemented yet for `ats_platform` (see
-    `automation/ats/registry.py`) — routes straight to `needs_review` instead
-    of attempting automation and hitting a stub's `NotImplementedError`."""
-    application.ats_platform = ats_platform
-    application.confidence_score = confidence
-    application.status = "needs_review"
-    application.failure_reason = f"No automation adapter implemented yet for '{ats_platform}' (Phase 7)."
-    application.updated_at = datetime.now(timezone.utc)
-    db.commit()
-    db.refresh(application)
-    return application
-
-
 def apply_run_result(db: Session, application: Application, result) -> Application:
     """Persists an `automation.interfaces.ApplicationRunResult` (duck-typed —
     accepts anything with `.status`/`.ats_platform`/`.confidence`/
@@ -200,6 +186,13 @@ def apply_run_result(db: Session, application: Application, result) -> Applicati
     row and appends a new `AutomationRun` row so a retried application keeps
     its full run history (§14 Logging and Debugging)."""
     application.ats_platform = result.ats_platform
+    # Observability only (never read for any safety decision): the pre-flight
+    # guess, kept separate from `ats_platform` above so a run resolved by
+    # GenericAdapter is never displayed as though a dedicated adapter ran it
+    # (see `automation.interfaces.ApplicationRunResult.detected_ats_platform`).
+    # Falls back to `result.ats_platform` for older/hand-built results that
+    # never set it, so this column is never spuriously blank for those.
+    application.detected_ats_platform = getattr(result, "detected_ats_platform", None) or result.ats_platform
     application.status = result.status
     application.confidence_score = result.confidence
     application.pages_completed = getattr(result, "pages_completed", None)

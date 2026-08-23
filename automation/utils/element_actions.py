@@ -45,6 +45,7 @@ def safe_click(
     fallback_locator: Locator | None = None,
     max_attempts: int = DEFAULT_CLICK_ATTEMPTS,
     timeout_ms: int = DEFAULT_CLICK_TIMEOUT_MS,
+    position: dict | None = None,
 ) -> bool:
     """Clicks `locator`, retrying on interception/transient failure before
     giving up. Every attempt: scroll the element into view (best-effort —
@@ -54,6 +55,17 @@ def safe_click(
     specific nested control — see `field_handlers.py`'s
     `_INNER_CLICK_TARGET_SELECTOR` use of this exact pattern), tries that
     once as a last resort.
+
+    `position` (`{"x": float, "y": float}`, offset from the element's own
+    top-left corner) overrides Playwright's default of clicking dead-center
+    — for a wide element where only a small part of it is actually wired to
+    a click handler (see `field_handlers.py::CheckboxHandler`'s use of this:
+    a checkbox's associated label/span often spans an entire "icon + text"
+    row, with the click listener bound only to the small icon at its
+    START, not the row as a whole — observed live on careers.
+    americanexpress.com's own custom checkbox, where clicking dead-center of
+    a 283px-wide label landed on plain text 100+px past the 22px icon that
+    was the only part anything was listening on).
 
     Returns whether a click was actually dispatched without raising — NOT
     whether it had the intended effect (opened a menu, checked a box, ...);
@@ -68,7 +80,7 @@ def safe_click(
         except PlaywrightError as e:
             logger.debug("safe_click: scroll_into_view_if_needed failed (attempt %d): %s", attempt, e)
         try:
-            locator.click(timeout=timeout_ms)
+            locator.click(timeout=timeout_ms, position=position)
             return True
         except PlaywrightError as e:
             logger.debug("safe_click: click failed (attempt %d/%d): %s", attempt, max_attempts, e)

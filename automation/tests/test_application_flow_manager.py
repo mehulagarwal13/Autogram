@@ -716,17 +716,34 @@ class TestApplyFromJobLink:
         finally:
             manager.browser_manager.close()
 
-    def test_returns_none_when_nothing_is_recognizable_and_no_apply_button_exists(self, requires_chromium, tmp_path):
+    def test_falls_back_to_the_generic_adapter_when_nothing_is_recognizable_and_no_apply_button_exists(
+        self, requires_chromium, tmp_path,
+    ):
+        """Nothing recognizable AND no Apply control to reach a real ATS from
+        — this used to be the dead end that returned `None` outright. It now
+        falls back to `GenericAdapter` on the SAME page instead: an
+        unrecognized page still deserves the same label/name/placeholder
+        fill attempt every real adapter uses, gated to NEEDS_REVIEW/
+        COPILOT_REVIEW (never AUTO_SUBMIT) exactly like any other
+        `"custom"`-platform run — see `GenericAdapter`'s module docstring."""
         manager = _manager_for_listing_page(tmp_path, _LISTING_PAGE_NO_APPLY_HTML)
         manager.browser_manager.launch_context()
         page = manager.browser_manager.new_page()
         try:
             page.goto(_LISTING_PAGE_NO_APPLY_HTML)
-            assert manager._resolve_adapter_from_listing_page(page) is None
+            resolved = manager._resolve_adapter_from_listing_page(page)
+            assert resolved is not None
+            adapter_cls, resolved_page = resolved
+            assert adapter_cls.name == "custom"
+            assert resolved_page is page
+            assert "generic_adapter_fallback" in manager.steps_completed
         finally:
             manager.browser_manager.close()
 
     def test_stops_on_a_captcha_present_on_the_listing_page_itself(self, requires_chromium, tmp_path):
+        """A human-only gate is a genuine, unresolved block — unlike "nothing
+        recognizable", it is NOT a case GenericAdapter could do anything
+        useful with, so this is the one case that still returns `None`."""
         manager = _manager_for_listing_page(tmp_path, _CAPTCHA_HTML, human_wait_timeout_s=0)
         manager.browser_manager.launch_context()
         page = manager.browser_manager.new_page()
@@ -737,19 +754,101 @@ class TestApplyFromJobLink:
         finally:
             manager.browser_manager.close()
 
-    def test_run_reaches_needs_review_with_a_clear_reason_when_nothing_is_resolvable(self, requires_chromium, tmp_path):
+    def test_run_reaches_needs_review_via_the_generic_adapter_when_nothing_is_resolvable(
+        self, requires_chromium, tmp_path,
+    ):
         """End-to-end via `run()`: `adapter_cls=None` must never crash the
         run — it either resolves a real adapter (see the tests above) or
-        lands cleanly in `needs_review` with a reason a human can act on,
-        exactly like an already-known-unsupported platform would."""
+        runs the generic fallback and lands cleanly in `needs_review` on its
+        own (zero fillable fields -> zero confidence -> below the
+        NEEDS_REVIEW_CONFIDENCE_THRESHOLD), never a crash and never a
+        confidently-wrong AUTO_SUBMIT."""
         manager = _manager_for_listing_page(tmp_path, _LISTING_PAGE_NO_APPLY_HTML, autopilot_enabled=True)
 
         result = manager.run()
 
         assert result.status == "needs_review"
         assert result.confidence == 0.0
-        assert "unsupported_ats" in manager.steps_completed
-        assert "Apply" in Path(result.error_log).read_text(encoding="utf-8")
+        assert result.ats_platform == "custom"
+        assert result.detected_ats_platform == "custom"
+        assert "generic_adapter_fallback" in manager.steps_completed
+
+    # -----------------------------------------------------------------
+    # Regression: a confidently-detected platform with no registered
+    # adapter must NEVER carry its original platform name into
+    # decide_action once GenericAdapter is the one actually filling the
+    # form — see ApplicationFlowManager._fall_back_to_generic_adapter and
+    # the "smartrecruiters"/"ashby" gap this closes (both are members of
+    # PUBLIC_ATS_PLATFORMS despite having no adapter in ats/registry.py).
+    # -----------------------------------------------------------------
+
+    @pytest.mark.parametrize("detected_platform", ["smartrecruiters", "ashby", "oracle_hcm", "taleo"])
+    def test_falling_back_to_generic_adapter_reassigns_ats_platform_to_custom(
+        self, requires_chromium, tmp_path, detected_platform,
+    ):
+        """Whatever the pre-flight guess was — including a `PUBLIC_ATS_PLATFORMS`
+        member like `smartrecruiters`/`ashby` — `self.ats_platform` must read
+        `"custom"` the instant `_resolve_adapter_from_listing_page` falls back
+        to GenericAdapter, and the ORIGINAL guess must survive separately as
+        `detected_ats_platform` for observability (see
+        ApplicationRunResult.detected_ats_platform)."""
+        manager = _manager_for_listing_page(
+            tmp_path, _LISTING_PAGE_NO_APPLY_HTML, ats_platform=detected_platform,
+        )
+        assert manager.ats_platform == detected_platform  # sanity: this IS the pre-flight guess
+        manager.browser_manager.launch_context()
+        page = manager.browser_manager.new_page()
+        try:
+            page.goto(_LISTING_PAGE_NO_APPLY_HTML)
+            resolved = manager._resolve_adapter_from_listing_page(page)
+            assert resolved is not None
+            adapter_cls, _resolved_page = resolved
+            assert adapter_cls.name == "custom"
+            assert manager.ats_platform == "custom"
+            assert manager.detected_ats_platform == detected_platform
+        finally:
+            manager.browser_manager.close()
+
+    @pytest.mark.parametrize("detected_platform", ["smartrecruiters", "ashby"])
+    def test_run_never_auto_submits_via_generic_adapter_even_at_perfect_confidence(
+        self, requires_chromium, tmp_path, detected_platform,
+    ):
+        """THE core regression test for the safety bug: `smartrecruiters` and
+        `ashby` are both in `PUBLIC_ATS_PLATFORMS` (real, AUTO_SUBMIT-eligible
+        platform names) but have no adapter registered in `ats/registry.py` —
+        so a posting confidently detected as one of these, with no Apply
+        button to reach a registered adapter from, falls straight through to
+        GenericAdapter on this SAME page. That page's every field is
+        trivially resolvable from the profile (first/last/email/phone), which
+        drives confidence to a perfect 1.0 — the exact condition that, before
+        `_fall_back_to_generic_adapter` forced `ats_platform` to `"custom"`,
+        would have satisfied `decide_action`'s `AUTO_SUBMIT` branch outright.
+        With autopilot on and confidence maxed out, the run must still land at
+        `copilot_review` (never `applied`), because `"custom"` — not
+        `detected_platform` — is what `decide_action` actually sees."""
+        form_html = (
+            "data:text/html,<html><body><form>"
+            "<label for='fn'>First Name</label><input id='fn'>"
+            "<label for='ln'>Last Name</label><input id='ln'>"
+            "<label for='em'>Email</label><input id='em' type='email'>"
+            "<label for='ph'>Phone</label><input id='ph' type='tel'>"
+            "<input type='file' name='resume'>"
+            "<button type='submit'>Submit Application</button>"
+            "</form></body></html>"
+        )
+        (tmp_path / "resume.pdf").write_bytes(b"%PDF-1.4 fake resume bytes")
+        manager = _manager_for_listing_page(
+            tmp_path, form_html, ats_platform=detected_platform, autopilot_enabled=True,
+        )
+
+        result = manager.run()
+
+        assert result.status != "applied"
+        assert result.status == "copilot_review"
+        assert result.confidence == 1.0
+        assert result.ats_platform == "custom"
+        assert result.detected_ats_platform == detected_platform
+        assert "generic_adapter_fallback" in manager.steps_completed
 
 
 def test_run_stops_immediately_when_clicking_next_does_not_advance(requires_chromium, tmp_path):

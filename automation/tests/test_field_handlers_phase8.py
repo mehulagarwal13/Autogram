@@ -227,6 +227,90 @@ def test_a_real_click_is_what_checks_a_properly_sized_custom_checkbox(page):
     assert page.evaluate("() => window.__syntheticClicks") == 0
 
 
+# Observed live on careers.americanexpress.com's required "I agree with the
+# terms and conditions" consent checkbox: `aria-labelledby` pointing at a
+# plain, visible `<span>` — NOT a `<label>` tag, so `_find_label_for`'s first
+# two lookups (`label[for=]`, an ancestor `<label>`) both come up empty — and
+# the input itself rendered at a genuine zero-size (`width:0;height:0`),
+# never merely `opacity:0`, so no click of any kind (real or forced) can ever
+# land ON it. The visible span is the ONLY reachable click target; clicking
+# it is what the site's own JS listens on to flip the checkbox for real.
+_ARIA_LABELLEDBY_ONLY_CHECKBOX_HTML = """
+<input id="consent" type="checkbox" required aria-labelledby="consent-label"
+       style="position:absolute;width:0;height:0;opacity:0;">
+<span id="consent-label">I agree with the terms and conditions</span>
+<script>
+  window.__trustedClicks = 0;
+  window.__syntheticClicks = 0;
+  const input = document.getElementById('consent');
+  document.getElementById('consent-label').addEventListener('click', function(e) {
+    if (e.isTrusted) { window.__trustedClicks++; } else { window.__syntheticClicks++; }
+    input.checked = true;
+    input.dispatchEvent(new Event('change', {bubbles: true}));
+  });
+</script>
+"""
+
+
+def test_checkbox_handler_clicks_an_aria_labelledby_span_when_no_real_label_exists(page):
+    _render(page, _ARIA_LABELLEDBY_ONLY_CHECKBOX_HTML)
+    field = describe_field(page.locator("#consent"), label="I agree with the terms and conditions", page=page)
+
+    outcome = fill_field(field, True)
+
+    assert outcome.filled is True
+    assert page.locator("#consent").is_checked() is True
+    # Confirms this went through a genuine click on the referenced span
+    # (attempt 2, via the aria-labelledby fallback in `_find_label_for`),
+    # never the JS-only last resort — the zero-size input could never have
+    # been clicked directly, so this is the only real path available.
+    assert page.evaluate("() => window.__trustedClicks") == 1
+    assert page.evaluate("() => window.__syntheticClicks") == 0
+
+
+# The fuller real shape: the `aria-labelledby`-referenced element is not
+# itself the click target — it's a WIDE "icon + text" ROW, and only a small
+# icon nested at its START actually has a click listener bound (Knockout's
+# `toggleAccepted`, on careers.americanexpress.com). Clicking dead-center of
+# the wide row (Playwright's default) lands on the text, well past the
+# narrow icon, and dispatches "successfully" without ever reaching anything
+# that listens — which is exactly what silently left that real application's
+# consent checkbox unaccepted despite `fill_field` reporting it filled.
+_ICON_PLUS_TEXT_LABEL_CHECKBOX_HTML = """
+<input id="consent" type="checkbox" required aria-labelledby="consent-label"
+       style="position:absolute;width:0;height:0;opacity:0;">
+<span id="consent-label" style="display:inline-block;width:300px;height:22px;">
+  <span id="consent-icon" style="display:inline-block;width:22px;height:22px;"></span>
+  <span>I agree with the terms and conditions</span>
+</span>
+<script>
+  window.__trustedClicks = 0;
+  window.__syntheticClicks = 0;
+  const input = document.getElementById('consent');
+  document.getElementById('consent-icon').addEventListener('click', function(e) {
+    if (e.isTrusted) { window.__trustedClicks++; } else { window.__syntheticClicks++; }
+    input.checked = true;
+    input.dispatchEvent(new Event('change', {bubbles: true}));
+  });
+</script>
+"""
+
+
+def test_checkbox_handler_clicks_the_icon_at_the_start_of_a_wide_labelled_row(page):
+    _render(page, _ICON_PLUS_TEXT_LABEL_CHECKBOX_HTML)
+    field = describe_field(page.locator("#consent"), label="I agree with the terms and conditions", page=page)
+
+    outcome = fill_field(field, True)
+
+    assert outcome.filled is True
+    assert page.locator("#consent").is_checked() is True
+    # The click landed on the icon specifically — not merely "somewhere that
+    # happened to work" — proving this went through the top-left-offset
+    # click on attempt 2, not a lucky dead-center hit or the JS fallback.
+    assert page.evaluate("() => window.__trustedClicks") == 1
+    assert page.evaluate("() => window.__syntheticClicks") == 0
+
+
 def test_the_js_fallback_flips_aria_checked_when_every_click_is_blocked(page):
     """The real gap. With clicks intercepted, the fallback used to assign
     `el.checked` on a `<div>` — an expando property with no effect on a
