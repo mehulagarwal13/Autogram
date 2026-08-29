@@ -90,6 +90,24 @@ TASK_ROUTES: dict[str, TaskRoute] = {
         max_tokens=400,
         json_mode=True,   # {"document_id": ..., "confidence": ..., "reason": ...}
     ),
+    # --- Autonomous agent (general-purpose observe/decide/act loop) ---
+    # One call per loop iteration
+    # (`automation/agents/autonomous/decision.py::decide_next_step`) — given
+    # the current page state + task context, returns exactly one of
+    # EXECUTE_ACTION / REQUEST_HUMAN_INTERVENTION /
+    # APPLICATION_READY_FOR_SUBMISSION / TASK_COMPLETED / TASK_FAILED as
+    # structured JSON. temperature=0.0: this is a control-flow decision, not
+    # prose generation — determinism matters far more than variety. Left on
+    # gpt-4.1-mini for now, same caveat as `field_reasoning` above: whether
+    # this should move to a premium model is a pending product decision, not
+    # a default made here.
+    "autonomous_agent_decision": TaskRoute(
+        provider="openai",
+        model="gpt-4.1-mini",
+        temperature=0.0,
+        max_tokens=1500,
+        json_mode=True,
+    ),
 }
 
 

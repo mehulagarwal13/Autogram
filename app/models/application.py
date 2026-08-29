@@ -5,6 +5,26 @@ from pydantic import BaseModel, ConfigDict, Field, HttpUrl, computed_field
 from app.services.application_repository import DISPLAY_STATUS_MAP
 
 
+class ReapplyAcknowledgement(BaseModel):
+    """The caller naming the EXACT prior submission it is deliberately
+    overriding, in order to apply to the same job again.
+
+    Defined here, and re-exported by `app/api/autonomous_agent.py`, so BOTH
+    start routes speak one consent vocabulary rather than two incompatible
+    ones. See that module for the full rationale; in short, it is not a
+    `reapply: true` flag because a bare flag is exactly what a retrying HTTP
+    client or sticky frontend state sets by accident. To fill this in a client
+    must have received the `application_already_submitted` 409 and copied the
+    specific id out of it, and the server requires it to match the CURRENT
+    latest submission — so it self-invalidates once a newer submission exists,
+    with no token store.
+    """
+
+    path: str                          # "autonomous" | "deterministic"
+    task_id: str | None = None         # when path == "autonomous"
+    application_id: str | None = None  # when path == "deterministic"
+
+
 class ApplicationStartRequest(BaseModel):
     """`POST /applications/start` body. `autopilot_enabled` defaults to
     `False` (copilot mode — form gets filled, a human clicks submit) since
@@ -12,6 +32,11 @@ class ApplicationStartRequest(BaseModel):
     a standing account setting silently applied everywhere."""
 
     job_url: HttpUrl
+    #: Deliberate re-application after a genuine prior submission. Omitted on
+    #: every normal start, so the default — refuse an accidental duplicate — is
+    #: unchanged. Overrides ONLY the lifetime "already submitted" guard, never
+    #: active-automation ownership.
+    acknowledge_previous_submission: ReapplyAcknowledgement | None = None
     autopilot_enabled: bool = False
     company: str | None = None    # optional hint; ATSAdapter/detector don't need it
     position: str | None = None   # optional hint, shown back in list views
@@ -274,3 +299,24 @@ class ReportStatusRequest(BaseModel):
     status: str
     reason: str | None = None
     confidence: float | None = None
+
+
+class VerificationCodeRequest(BaseModel):
+    """`POST /applications/{id}/verification-code` — a one-time passcode the
+    human read from their own email/SMS and typed into Autogram.
+
+    HARD RULE, enforced by every layer that touches this value: `code` is
+    transient. It is handed straight to
+    `automation.applications.verification_channel.deliver`, which holds it in
+    process memory until the paused run types it into the live page, and is
+    then dropped. It is NEVER written to any table, never logged, never placed
+    in `LIVE_RUN_STATE` (which the live endpoint returns to the browser), never
+    added to the chat transcript, and never returned by any GET.
+
+    Deliberately NOT reusing `ReportStatusRequest` or the answer routes: those
+    persist what they are given, which for a verification code would be exactly
+    the leak this whole design exists to prevent. A separate model makes the
+    difference impossible to miss at the call site.
+    """
+
+    code: str

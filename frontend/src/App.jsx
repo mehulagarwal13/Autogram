@@ -3,6 +3,7 @@ import { NavLink, Route, Routes } from "react-router-dom";
 import {
   BrainCircuit, CheckCircle2, AlertCircle, Info, X, LogOut, Loader2,
   Home as HomeIcon, Search, LayoutDashboard, UserCircle2, FileText, Settings as SettingsIcon,
+  Bot,
 } from "lucide-react";
 import { api, auth, setUnauthorizedHandler } from "./api";
 import AuthPage from "./components/AuthPage";
@@ -13,11 +14,13 @@ import ApplicationDetail from "./pages/ApplicationDetail";
 import Profile from "./pages/Profile";
 import ResumeManagement from "./pages/ResumeManagement";
 import Settings from "./pages/Settings";
+import AutonomousAgent from "./pages/AutonomousAgent";
 
 const NAV_LINKS = [
   { to: "/", label: "Home", icon: HomeIcon, end: true },
   { to: "/search", label: "Job Search", icon: Search },
   { to: "/applications", label: "Applications", icon: LayoutDashboard },
+  { to: "/agent", label: "Autonomous Agent", icon: Bot },
   { to: "/profile", label: "Profile", icon: UserCircle2 },
   { to: "/resumes", label: "Resumes", icon: FileText },
   { to: "/settings", label: "Settings", icon: SettingsIcon },
@@ -173,6 +176,8 @@ export default function App() {
             <Route path="/search" element={<JobsAndMatches resume={resume} setResume={setResume} toast={toast} />} />
             <Route path="/applications" element={<Applications toast={toast} />} />
             <Route path="/applications/:id" element={<ApplicationDetail toast={toast} />} />
+            <Route path="/agent" element={<AutonomousAgent toast={toast} />} />
+            <Route path="/agent/:id" element={<AutonomousAgent toast={toast} />} />
             <Route path="/profile" element={<Profile toast={toast} />} />
             <Route path="/resumes" element={<ResumeManagement toast={toast} />} />
             <Route path="/settings" element={<Settings toast={toast} />} />

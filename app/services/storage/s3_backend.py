@@ -34,7 +34,9 @@ class S3StorageBackend(StorageBackend):
     """
 
     def __init__(self, *, bucket: str, region: str | None = None, endpoint_url: str | None = None):
-        import boto3  # noqa: local import — only required when STORAGE_BACKEND=s3
+        # Local import: only required when STORAGE_BACKEND=s3, so the
+        # default local-disk deployment does not need boto3 installed.
+        import boto3  # noqa: PLC0415
 
         self._bucket = bucket
         self._client = boto3.client("s3", region_name=region, endpoint_url=endpoint_url or None)

@@ -64,6 +64,7 @@ someone closes it by hand.
 from __future__ import annotations
 
 import logging
+import re
 import time
 from dataclasses import dataclass, field as _dc_field
 from datetime import datetime, timezone
@@ -85,7 +86,9 @@ from automation.ats.detector import ATSDetector, FALLBACK_ATS
 from automation.ats.generic.generic_adapter import GenericAdapter
 from automation.ats.registry import get_adapter_class
 from automation.browser.browser_manager import BrowserManager
+from automation.applications import verification_channel
 from automation.browser.selectors import (
+    VERIFICATION_CODE_INPUT_SELECTOR,
     find_apply_entry_button,
     find_human_gate,
     find_job_posting_title_and_company,
@@ -692,7 +695,29 @@ class ApplicationFlowManager:
 
             navigation = self._advance_to_next_page(adapter, page, page_index, progress.signature, all_results)
             if not navigation.advanced:
-                return self._navigation_blocked_result(page, page_index, navigation, all_results)
+                # ESCALATE BEFORE GIVING UP. The page is genuinely stuck — a
+                # required field this run could not fill, a widget it does not
+                # know how to operate (Amex's "Add Experience"/"Add Skill"
+                # repeating sections are the motivating case), or a validation
+                # error it cannot clear.
+                #
+                # Until now this ended the run immediately with
+                # `manual_required`, which is honest but wasteful: the browser
+                # is still open on exactly the page that needs one thing done,
+                # and the human is right there. Asking first turns a dead run
+                # into a pause the person can resolve in seconds, and the
+                # existing wait already resumes ON THE SAME PAGE and re-checks
+                # rather than assuming anything changed.
+                #
+                # Falls through to the original behaviour on timeout, so the
+                # worst case is exactly what happened before.
+                if self._wait_for_human_to_unblock_page(page, page_index, navigation):
+                    self.checkpoint(f"step_{page_index}_unblocked_by_human", page_number=page_index + 1)
+                    navigation = self._advance_to_next_page(
+                        adapter, page, page_index, capture_page_signature(page), all_results,
+                    )
+                if not navigation.advanced:
+                    return self._navigation_blocked_result(page, page_index, navigation, all_results)
             self.checkpoint(f"step_{page_index}_advanced")
         else:
             logger.warning(
@@ -862,7 +887,7 @@ class ApplicationFlowManager:
             reason = f"Human intervention required before this form can be filled: {human_gate}."
             self.checkpoint("human_gate_detected", page_number=page_index + 1)
             logger.info("application %s: %s", self.application_id, reason)
-            if not self._wait_for_human(page_index, reason, lambda: find_human_gate(page) is None):
+            if not self._wait_for_human(page_index, reason, lambda: find_human_gate(page) is None, page=page):
                 return _PageProgress(signature=capture_page_signature(page), blocked_reason=reason)
             wait_for_page_settled(page)
 
@@ -1113,6 +1138,58 @@ class ApplicationFlowManager:
 
         return changed
 
+    def _wait_for_human_to_unblock_page(
+        self, page: Page, page_index: int, navigation: NavigationOutcome,
+    ) -> bool:
+        """Pause and ask a human to finish what this run could not, then report
+        whether the page became advanceable.
+
+        This is the capability-gap counterpart to the security gates. Those
+        pause for a CAPTCHA or an OTP; this pauses for "the form wants
+        something I could not supply" — a required field that exhausted its
+        retries, a validation error that would not clear, or a repeating
+        section (Add Experience / Add Skill / Add License) whose add-then-fill
+        pattern this adapter cannot drive.
+
+        Deliberately reuses `_wait_for_human`, so the pause behaves exactly
+        like every other one: the same `manual_required` status, the same live
+        reason in the UI, the same poll, and a resume on the SAME page with a
+        fresh re-read rather than an assumption about what changed.
+
+        The clear condition is the honest one — "are the required fields now
+        filled?" — not "did anything on the page change". A human clicking
+        around must not be mistaken for the blocker being resolved.
+        """
+        missing = find_unfilled_required_fields(page)
+        details = []
+        if navigation.validation_errors:
+            details.append("the form reported: " + "; ".join(navigation.validation_errors))
+        if missing:
+            details.append("still empty: " + ", ".join(missing[:6]))
+        elif navigation.click_failed:
+            # No empty required field AND the control would not click: usually a
+            # widget the adapter cannot operate rather than a missing value.
+            details.append(
+                "this page has a section Autogram could not complete on its own "
+                "(repeating sections like Add Experience or Add Skill need to be added by hand)"
+            )
+        reason = (
+            f"Autogram could not get past page {page_index + 1} on its own"
+            + (f" — {'; '.join(details)}" if details else "")
+            + ". Please complete what's missing in the automation's browser window; "
+              "it will carry on by itself once the page can continue."
+        )
+
+        def cleared() -> bool:
+            # Only "the required fields are filled" counts. If none were
+            # detectable in the first place there is nothing to poll for, so
+            # fall back to the navigation control becoming clickable.
+            if missing:
+                return not find_unfilled_required_fields(page)
+            return not find_validation_errors(page)
+
+        return self._wait_for_human(page_index, reason, cleared, page=page)
+
     def _navigation_blocked_result(
         self,
         page: Page,
@@ -1162,7 +1239,9 @@ class ApplicationFlowManager:
     # navigation" section), so a platform-specific override raising must degrade
     # to the generic answer rather than crash a run that is otherwise fine.
 
-    def _wait_for_human(self, page_index: int, reason: str, cleared: Callable[[], bool]) -> bool:
+    def _wait_for_human(
+        self, page_index: int, reason: str, cleared: Callable[[], bool], page: Page | None = None,
+    ) -> bool:
         """Pauses this run for a human to resolve `reason` (a CAPTCHA or
         other human-only gate) in this run's own visible browser, polling
         `cleared()` every `HUMAN_WAIT_POLL_INTERVAL_S` up to
@@ -1189,29 +1268,192 @@ class ApplicationFlowManager:
             self.application_id, self.human_wait_timeout_s, page_index + 1, reason,
         )
         deadline = time.monotonic() + self.human_wait_timeout_s
-        while time.monotonic() < deadline:
-            time.sleep(HUMAN_WAIT_POLL_INTERVAL_S)
-            try:
-                if cleared():
-                    logger.info(
-                        "application %s: human verification completed on page %d — resuming automatically.",
-                        self.application_id, page_index + 1,
+        try:
+            while time.monotonic() < deadline:
+                time.sleep(HUMAN_WAIT_POLL_INTERVAL_S)
+                # A code the human typed into Autogram's own UI, rather than
+                # into this browser window. Tried BEFORE `cleared()` so a code
+                # that clears the gate is noticed on this same iteration.
+                if page is not None:
+                    self._try_deliver_verification_code(page, page_index)
+                try:
+                    if cleared():
+                        logger.info(
+                            "application %s: human verification completed on page %d — resuming automatically.",
+                            self.application_id, page_index + 1,
+                        )
+                        self.checkpoint("human_verification_completed", page_number=page_index + 1)
+                        state["status"] = "IN_PROGRESS"
+                        state.pop("reason", None)
+                        return True
+                except Exception:  # noqa: BLE001 - a broken poll check must never crash the wait loop
+                    logger.exception(
+                        "application %s: error while checking whether the human gate cleared — still waiting.",
+                        self.application_id,
                     )
-                    self.checkpoint("human_verification_completed", page_number=page_index + 1)
-                    state["status"] = "IN_PROGRESS"
-                    state.pop("reason", None)
-                    return True
-            except Exception:  # noqa: BLE001 - a broken poll check must never crash the wait loop
-                logger.exception(
-                    "application %s: error while checking whether the human gate cleared — still waiting.",
+
+            logger.warning(
+                "application %s: human verification wait timed out after %.0fs on page %d.",
+                self.application_id, self.human_wait_timeout_s, page_index + 1,
+            )
+            return False
+        finally:
+            # However this wait ends — resumed, timed out, or raised — never
+            # leave an uncollected code sitting in memory.
+            verification_channel.discard(self.application_id)
+
+    def _try_deliver_verification_code(self, page: Page, page_index: int) -> None:
+        """Type a code the human entered in Autogram into this run's live page.
+
+        Only ever called from inside the human-gate wait, so a code can never be
+        typed into a page that is not actually asking for one.
+
+        SECRET HANDLING, identical in spirit to the autonomous path's
+        `_try_consume_pending_secret`:
+
+        * the value is popped (consumed once) and held in a local only;
+        * it is never logged, never checkpointed, never written to the database,
+          and never attached to `LIVE_RUN_STATE` — which `GET /applications/{id}/live`
+          returns to the browser;
+        * failure is reported as a fact ("could not be entered"), never with the
+          value.
+
+        Best-effort by design: if the field cannot be found or filled, the wait
+        simply continues, and the human can still clear the gate in the browser
+        window exactly as before. Nothing about the previous behaviour is
+        removed — this only adds a second way in.
+        """
+        code = verification_channel.take(self.application_id)
+        if code is None:
+            return
+        try:
+            if not self._fill_verification_code(page, code):
+                logger.warning(
+                    "application %s: a verification code was supplied but no code field is on the page.",
                     self.application_id,
                 )
+                return
+            self.checkpoint("verification_code_entered", page_number=page_index + 1)
+            logger.info("application %s: entered a human-supplied verification code.", self.application_id)
+            # A new attempt supersedes any previous rejection notice, so the UI
+            # does not keep showing "that code was not accepted" while a fresh
+            # one is being checked.
+            state = LIVE_RUN_STATE.setdefault(self.application_id, {})
+            state.pop("verification_rejected", None)
+            state["verification_submitted_at"] = time.time()
+            # Submitting is best-effort and deliberately separate: many forms
+            # auto-advance on the last digit, and a wrong guess at the submit
+            # control must not undo a correctly-filled code.
+            self._try_submit_verification(page, page_index)
+            self._note_verification_outcome(page)
+        except Exception:  # noqa: BLE001 - never let this break the wait
+            logger.exception(
+                "application %s: the supplied verification code could not be entered.", self.application_id,
+            )
+        finally:
+            # Drop the local reference immediately; the module-level slot was
+            # already emptied by `take`.
+            code = None
 
-        logger.warning(
-            "application %s: human verification wait timed out after %.0fs on page %d.",
-            self.application_id, self.human_wait_timeout_s, page_index + 1,
+
+    def _fill_verification_code(self, page: Page, code: str) -> bool:
+        """Type `code` into the page's verification input(s). Returns False if
+        there is nothing to type into.
+
+        Handles BOTH shapes real sites use, because the common one is not the
+        simple one:
+
+        * **one input** — `fill()` the whole code.
+        * **one box per digit** — the "six circles" layout (American Express
+          uses exactly this). Each box is `maxlength=1`, so filling the first
+          with the whole code silently stores a single character and the form
+          rejects it. Observed on a real Amex application: the code has to be
+          distributed one character per box.
+
+        Split fields are typed with `press_sequentially` rather than `fill`,
+        because these components are almost always JS-driven — they listen for
+        key events to auto-advance focus and to enable the Verify button, and a
+        programmatic `fill` that skips those events leaves the button disabled
+        with the boxes looking correctly populated.
+        """
+        fields = [f for f in page.locator(VERIFICATION_CODE_INPUT_SELECTOR).all() if f.is_visible()]
+        if not fields:
+            return False
+
+        if len(fields) == 1:
+            single = fields[0]
+            # A lone box that only accepts one character is still a per-digit
+            # layout whose siblings this selector did not match; typing the
+            # whole code would be silently truncated.
+            if (single.get_attribute("maxlength") or "") == "1" and len(code) > 1:
+                single.press_sequentially(code, delay=60)
+            else:
+                single.fill(code)
+            return True
+
+        # Per-digit layout: one character each, in document order.
+        for box, character in zip(fields, code):
+            box.click()
+            box.press_sequentially(character, delay=60)
+        logger.info(
+            "application %s: entered the verification code across %d input boxes.",
+            self.application_id, min(len(fields), len(code)),
         )
-        return False
+        return True
+
+    def _note_verification_outcome(self, page: Page) -> None:
+        """Tell the user whether the code they just sent was accepted.
+
+        Without this the UI is silent after a rejected code: the run stays
+        paused and looks identical to "still waiting for you to type one", so a
+        user who mistyped has no idea anything happened. They then sit waiting
+        for automation that is itself waiting for them.
+
+        Checked AFTER a short settle, because a real form navigates or re-renders
+        on submit and reading immediately would report the pre-submit page. This
+        is an observation only — it never changes control flow. Whether the run
+        actually resumes is decided solely by the wait loop's own `cleared()`
+        check, which re-reads the live page; a wrong reading here can therefore
+        mislabel a message but can never resume a run that is still blocked.
+
+        Records a BOOLEAN, never anything derived from the code itself.
+        """
+        try:
+            wait_for_page_settled(page)
+            still_blocked = find_human_gate(page) is not None
+        except Exception:  # noqa: BLE001 - an observation must never break the wait
+            return
+        state = LIVE_RUN_STATE.setdefault(self.application_id, {})
+        if still_blocked:
+            state["verification_rejected"] = True
+            self.checkpoint("verification_code_rejected")
+            logger.info(
+                "application %s: the verification code was not accepted — still waiting.",
+                self.application_id,
+            )
+        else:
+            state.pop("verification_rejected", None)
+
+    def _try_submit_verification(self, page: Page, page_index: int) -> None:
+        """Click the verify/continue control next to a just-filled code field.
+
+        Separate from filling so that a form which auto-submits — or one whose
+        button this cannot find — still benefits from the code having been
+        entered. The human can press the button themselves in that case.
+        """
+        for name in ("verify", "submit", "continue", "confirm", "next"):
+            try:
+                button = page.get_by_role("button", name=re.compile(name, re.I)).first
+                if button.count() and button.is_visible():
+                    button.click()
+                    self.checkpoint("verification_code_submitted", page_number=page_index + 1)
+                    return
+            except Exception:  # noqa: BLE001 - try the next candidate
+                continue
+        logger.info(
+            "application %s: code entered but no verify button was found — the form may auto-submit.",
+            self.application_id,
+        )
 
     def _safe_detect_job_posting_metadata(self, page: Page) -> tuple[str | None, str | None]:
         try:
@@ -1269,7 +1511,7 @@ class ApplicationFlowManager:
         if human_gate is not None:
             reason = f"Human intervention required before this job page can be opened: {human_gate}."
             self.checkpoint("human_gate_detected", page_number=1)
-            if not self._wait_for_human(0, reason, lambda: find_human_gate(page) is None):
+            if not self._wait_for_human(0, reason, lambda: find_human_gate(page) is None, page=page):
                 return None
 
         resolved = self._detect_supported_ats(page)

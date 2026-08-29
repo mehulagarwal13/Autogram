@@ -14,8 +14,23 @@ from __future__ import annotations
 import uuid
 from pathlib import Path
 
-from app.services.file_storage import compute_file_hash  # re-exported for callers
 from app.services.storage import get_storage_backend
+
+# Deliberate RE-EXPORT, not an unused import: `app/api/profile.py` imports
+# `compute_file_hash` from this module (alongside the save/delete helpers) so
+# callers have one document-storage entry point rather than reaching past it
+# into `file_storage`. `__all__` states that intent, and stops a linter's
+# unused-import autofix from silently deleting it again — which it did once,
+# turning every profile-document upload into an ImportError.
+from app.services.file_storage import compute_file_hash
+
+__all__ = [
+    "ALLOWED_EXTENSIONS_BY_TYPE",
+    "MAX_FILE_SIZE_MB",
+    "compute_file_hash",
+    "delete_document_file",
+    "save_document_file",
+]
 
 STORAGE_DIR = Path("storage/documents")
 STORAGE_DIR.mkdir(parents=True, exist_ok=True)  # local-mode default; ignored under STORAGE_BACKEND=s3

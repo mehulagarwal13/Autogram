@@ -67,14 +67,75 @@ def get_by_id(db: Session, application_id: str) -> Application | None:
     return db.query(Application).filter(Application.application_id == application_id).first()
 
 
+#: Statuses where an attempt never actually submitted and is therefore
+#: resumable IN PLACE — mirrors `app/api/applications.py::RETRYABLE_STATUSES`.
+#: Kept here so the "which attempt can be retried?" query and the route's own
+#: branch cannot drift apart.
+_RETRYABLE_STATUSES = ("failed", "manual_required", "needs_review")
+
+
 def get_by_user_and_url(db: Session, user_id: str, job_url: str) -> Application | None:
-    """The idempotency check `POST /applications/start` runs before creating
-    anything new — returns the existing attempt for this (user, job), if any."""
+    """The MOST RECENT attempt for this (user, job), or `None`.
+
+    ⚠ Ambiguous by nature now that a job can have several attempts (see
+    `Application.__table_args__`): "the" application for a job is no longer a
+    well-defined thing. Prefer one of the explicit lookups below, which say
+    which attempt they mean:
+
+    * `get_retryable_attempt_for_job` — an unfinished attempt to resume;
+    * `automation_ownership.find_active_automation` — who is automating now;
+    * `automation_ownership.find_submitted_application` — the latest success;
+    * `get_by_id` — a specific attempt.
+
+    Retained (a) because external callers and tests still reference it, and
+    (b) as the honest "latest attempt, whatever it is" query. It is explicitly
+    ordered newest-first so it is at least deterministic — it previously used a
+    bare `.first()` with no ordering, which returned an arbitrary row the
+    moment more than one existed.
+    """
     job_url_hash = compute_job_url_hash(job_url)
     return (
         db.query(Application)
         .filter(Application.user_id == user_id, Application.job_url_hash == job_url_hash)
+        .order_by(Application.created_at.desc())
         .first()
+    )
+
+
+def get_retryable_attempt_for_job(db: Session, user_id: str, job_url: str) -> Application | None:
+    """The most recent attempt for this (user, job) that can be retried IN
+    PLACE — i.e. one that never submitted (`failed`, `manual_required`,
+    `needs_review`).
+
+    This is what `POST /applications/start` uses to decide "resume the
+    existing attempt" vs "insert a new one", and it is deliberately narrow:
+    an `applied` attempt must never be selected here, because retrying it
+    would reset `status`/`applied_date` and erase the submission history. An
+    in-progress attempt is likewise excluded — that case is already refused
+    upstream by the active-automation guard.
+    """
+    job_url_hash = compute_job_url_hash(job_url)
+    return (
+        db.query(Application)
+        .filter(
+            Application.user_id == user_id,
+            Application.job_url_hash == job_url_hash,
+            Application.status.in_(_RETRYABLE_STATUSES),
+        )
+        .order_by(Application.created_at.desc())
+        .first()
+    )
+
+
+def list_attempts_for_job(db: Session, user_id: str, job_url: str) -> list[Application]:
+    """Every attempt for this (user, job), newest first — the full history a
+    re-application preserves rather than overwrites."""
+    job_url_hash = compute_job_url_hash(job_url)
+    return (
+        db.query(Application)
+        .filter(Application.user_id == user_id, Application.job_url_hash == job_url_hash)
+        .order_by(Application.created_at.desc())
+        .all()
     )
 
 

@@ -1476,9 +1476,103 @@ def _read_dropdown_displayed_value(field: Field) -> str | None:
     except PlaywrightError:
         pass
     try:
+        # `input_value()`, NOT `get_attribute("value")`. The attribute is the
+        # value baked into the HTML at parse time; a JS-driven combobox commits
+        # its selection to the DOM *property*, leaving the attribute absent.
+        # Reading the attribute therefore returned None for a field that was
+        # correctly filled — which is exactly how a real American Express run
+        # reported "Option selected" and then "Actual value: (none)" three times
+        # in a row for Phone, Country and State.
+        if field.tag_name in ("input", "textarea", "select"):
+            return field.locator.input_value()
         return field.locator.get_attribute("value")
     except PlaywrightError:
         return None
+
+
+def _selected_option_via_active_descendant(field: Field) -> str | None:
+    """Text of the option named by `aria-activedescendant` — `None` if unset or
+    unresolvable.
+
+    The ARIA-standard way a combobox reports which option is currently
+    committed, and the most reliable signal for widgets that CLOSE (and often
+    unmount) their popup after selection: the attribute stays on the input long
+    after the listbox is gone.
+
+    Tried before scanning the popup itself, because a closed popup may no longer
+    exist in the DOM at all.
+    """
+    try:
+        option_id = field.locator.get_attribute("aria-activedescendant")
+    except PlaywrightError:
+        return None
+    if not option_id:
+        return None
+    try:
+        # `text_content()` deliberately: the option is frequently inside a
+        # hidden/collapsed listbox by the time we read it, and `inner_text()`
+        # returns "" for anything not rendered.
+        option = field.page.locator(f"#{css_escape(option_id)}")
+        if option.count() == 0:
+            return None
+        text = (option.first.text_content() or "").strip()
+        return text or None
+    except PlaywrightError:
+        return None
+
+
+def _committed_value_from_hidden_twin(field: Field) -> str | None:
+    """Some components keep the human-readable text in the visible input and the
+    real submitted value in a hidden input sharing the same `name`. When the
+    visible one reads empty, that twin is the committed state.
+
+    Scoped to the enclosing form (or the field's own parent) so an unrelated
+    hidden input elsewhere on the page can never be mistaken for this field's.
+    """
+    try:
+        name = field.locator.get_attribute("name")
+    except PlaywrightError:
+        return None
+    if not name:
+        return None
+    try:
+        scope = field.locator.locator("xpath=ancestor::form[1]")
+        if scope.count() == 0:
+            scope = field.locator.locator("xpath=..")
+        twin = scope.locator(f"input[type='hidden'][name='{name}']")
+        if twin.count() == 0:
+            return None
+        return (twin.first.input_value() or "").strip() or None
+    except PlaywrightError:
+        return None
+
+
+def css_escape(value: str) -> str:
+    """Minimal escape for an id used in a CSS selector. Real ATS ids contain
+    characters CSS treats specially (`:` in `country-codes-dropdownphoneNumber`
+    style ids is common), which would otherwise silently fail to match."""
+    return re.sub(r"([^\w-])", r"\", value)
+
+
+def _has_inspectable_options(field: Field) -> bool:
+    """Whether this widget exposes a popup whose options we can actually read.
+
+    When it does, that popup's `aria-selected` state is the authority on what
+    was committed — including its ABSENCE, which means nothing was. Used to stop
+    verification falling back to the input's leftover search text, which for a
+    searchable combobox is whatever the automation typed to filter with.
+    """
+    try:
+        popup_id = field.locator.get_attribute("aria-controls")
+    except PlaywrightError:
+        return False
+    if not popup_id:
+        return False
+    try:
+        popup = field.page.locator(f"#{css_escape(popup_id)}")
+        return popup.count() > 0 and popup.first.locator("[role='option']").count() > 0
+    except PlaywrightError:
+        return False
 
 
 def _selected_option_via_aria_controls(field: Field) -> str | None:
@@ -1596,16 +1690,55 @@ class _DropdownHandler(FieldHandler):
         logger.info("Option selected for %r.", field.label)
 
     def verify(self, field: Field, value) -> tuple[bool, str | None]:
+        """Confirm the widget actually COMMITTED the selection.
+
+        A custom dropdown has no single place it stores that, so this consults
+        several signals in order of reliability and accepts the first that
+        matches. They are complementary, not redundant — a widget that exposes
+        one often exposes none of the others:
+
+        1. the displayed value / live input property (covers most widgets, and
+           is what a user would read off the screen);
+        2. `aria-activedescendant` — survives the popup closing or unmounting;
+        3. `aria-selected="true"` inside the popup named by `aria-controls`;
+        4. a hidden input twin holding the real submitted value.
+
+        Returning the LAST value actually observed (not just `False`) matters:
+        it is what the failure log reports as "Actual value", which is how a
+        wrong-option bug is told apart from a not-committed-at-all bug.
+        """
+        # STRONG signals first — each is unambiguous evidence that the widget
+        # committed a selection.
+        observed_any: str | None = None
+        for probe in (
+            _selected_option_via_active_descendant,
+            _selected_option_via_aria_controls,
+            _committed_value_from_hidden_twin,
+        ):
+            observed = probe(field)
+            if observed is None:
+                continue
+            if self._matches(observed, value):
+                return True, observed
+            observed_any = observed_any or observed
+
+        # An INSPECTABLE popup that reports nothing selected is authoritative:
+        # the widget is telling us, in its own markup, that no option was
+        # committed. Trusting the input's text over that would be a
+        # false positive — and a dangerous one, because a searchable combobox
+        # still holds the text WE typed to filter it. A failed search for
+        # "Germany" leaves "Germany" sitting in the box, which would otherwise
+        # verify as a successful selection of Germany.
+        if _has_inspectable_options(field):
+            return False, observed_any
+
+        # Only now the displayed value / live input property. Last, because for
+        # a searchable combobox it is the weakest evidence — some widgets even
+        # CLEAR it on commit, which is why the ARIA probes run first.
         actual = _read_dropdown_displayed_value(field)
         if self._matches(actual or "", value):
             return True, actual
-        # The display-value heuristic above found nothing (or the wrong
-        # thing) for this widget's particular markup — try the ARIA-standard
-        # signal before giving up. See `_selected_option_via_aria_controls`.
-        via_aria = _selected_option_via_aria_controls(field)
-        if via_aria is not None:
-            return self._matches(via_aria, value), via_aria
-        return False, actual
+        return False, actual or observed_any
 
 
 class ReactSelectHandler(_DropdownHandler):

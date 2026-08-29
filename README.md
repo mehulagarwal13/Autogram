@@ -191,7 +191,70 @@ uvicorn app.main:app --reload
 
 > Note: the files in `alembic/versions/` describe the old (pre-hardening) schema. On a fresh Neon database the app bootstraps the current schema itself. When you next need a migration, delete the old version files and autogenerate a new baseline: `alembic revision --autogenerate -m "baseline"`.
 
+> ### ⚠️ Production deployment: SINGLE WORKER ONLY
+>
+> **Autogram currently supports exactly one application worker.** Run it as a
+> single `uvicorn` process — no `--workers`, no gunicorn with multiple workers,
+> no horizontally-scaled replicas.
+>
+> This is a real architectural constraint, not a default worth overriding. Four
+> separate mechanisms keep state in **process memory**:
+>
+> | Mechanism | Process-local state | What breaks with a second worker |
+> |---|---|---|
+> | `automation/agents/autonomous/runner.py::_REGISTRY` | `TaskHandle` per task — the pause/resume events and the live browser | A resume or OTP routed to a worker that does not own the handle cannot reach the browser |
+> | `application_flow_manager::_OPEN_REVIEW_SESSIONS` | The still-open browser of a `copilot_review` run | `POST /applications/{id}/approve` finds no session and can never submit |
+> | `app/services/event_bus.py` | WebSocket subscribers | A client connected to worker A never sees events published by worker B |
+> | `app/core/middleware.py` | In-memory rate limiter | Limits apply per worker, so the effective limit multiplies |
+>
+> Startup reconciliation depends on the same property: it treats any
+> still-active row as abandoned *because* those registries are provably empty in
+> a fresh process. With a second worker, one starting up could recover a row
+> another worker is actively running — releasing job ownership while a browser
+> is still driving that application.
+>
+> **Multi-worker deployment requires Redis/externalized state and coordinated
+> task ownership** (the Celery migration tracked in `runner.py`'s docstring). It
+> is a deliberate future phase, not a configuration flag.
+
 Run the test suite with `pytest`.
+
+Some suites need real infrastructure and are skipped silently without it —
+which is easy to mistake for a pass:
+
+```bash
+# Both conftests `setdefault` DATABASE_URL to a localhost stub, which WINS over
+# .env. Export the real URL first or every Postgres-backed test SKIPS.
+export DATABASE_URL="postgresql://...neon.tech/neondb?sslmode=require"
+pytest tests/ automation/tests/ -q
+
+# Real-browser end-to-end suite. Needs Chromium and a real LLM key, and must
+# run in its OWN pytest process — a session-scoped sync_playwright() from
+# another file collides with it (see automation/tests/conftest.py).
+export OPENAI_API_KEY="sk-..."
+pytest automation/tests/test_e2e_hitl_browser.py -v -s
+```
+
+### Linting and type checking
+
+```bash
+ruff check .                      # bug-focused rules only — see ruff.toml for what is on and why
+mypy --config-file mypy.ini       # scoped to the critical workflow modules — see mypy.ini
+```
+
+`ruff check . --fix` is safe for most rules, with one caveat learned the hard
+way: the `F401` autofix deletes deliberate **re-exports**. Declare those in
+`__all__` (see `app/services/document_storage.py`) or the fix will silently
+turn an import someone depends on into an `ImportError`.
+
+### Frontend tests
+
+```bash
+cd frontend
+npm install
+npm test          # vitest, jsdom, React Testing Library
+npm run build     # a build is NOT a test — it type-checks nothing
+```
 
 Typical first workflow: `POST /jobs/ingest` → `POST /jobs/embed-pending` → `POST /resumes/upload` → `/extract` → `/parse` → `/embed` → `/matches/generate`.
 

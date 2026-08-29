@@ -1,1 +1,2 @@
 TargetClosedError('Locator.count: Target page, context or browser has been closed')
+PendingRollbackError("This Session's transaction has been rolled back due to a previous exception during flush. To begin a new transaction with this Session, first issue Session.rollback(). Original exception was: Can't reconnect until invalid transaction is rolled back.  Please rollback() fully before proceeding (Background on this error at: https://sqlalche.me/e/20/8s2b)")

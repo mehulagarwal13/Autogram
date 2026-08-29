@@ -24,6 +24,34 @@ from app.api.applications import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _neutral_automation_ownership(monkeypatch):
+    """`POST /applications/start` now consults `automation_ownership` for the
+    cross-path duplicate/lifetime guards before its own status logic.
+
+    Every test in this module passes a `MagicMock` as `db`, so those queries
+    return truthy mocks — which made the route report a phantom active
+    autonomous task and 409 before reaching the behaviour under test. This
+    fixture makes the cross-path guards report "nothing found" by default, so
+    each test exercises the deterministic logic it was written for. Tests that
+    care about cross-path behaviour override these explicitly.
+    """
+    import app.api.applications as applications_module
+
+    monkeypatch.setattr(
+        applications_module.automation_ownership, "reserve_job_automation",
+        lambda db, *, user_id, job_url: "test-key",
+    )
+    monkeypatch.setattr(
+        applications_module.automation_ownership, "find_active_automation",
+        lambda db, *, user_id, job_url, exclude_task_id=None: None,
+    )
+    monkeypatch.setattr(
+        applications_module.automation_ownership, "find_submitted_application",
+        lambda db, *, user_id, job_url: None,
+    )
+
+
 def test_pick_resume_document_id_uses_explicit_override_when_it_belongs_to_the_profile():
     fake_doc = MagicMock(document_id="doc-1", profile_id="profile-1", document_type="resume")
     with patch("app.api.applications.profile_repository.get_document", return_value=fake_doc):
@@ -82,6 +110,11 @@ def _fake_start_body(**overrides):
         resume_document_id=None,
         job_description=None,
         source="server_automation",
+        # Must be explicitly None: on a bare MagicMock this attribute would be
+        # a truthy auto-created mock, which the route would read as "the caller
+        # supplied a re-application acknowledgement" — the real schema defaults
+        # it to None on every normal start.
+        acknowledge_previous_submission=None,
     )
     defaults.update(overrides)
     return MagicMock(**defaults)
@@ -96,7 +129,7 @@ def test_start_application_retries_a_retryable_application_on_the_same_row(monke
     fake_resume = MagicMock(document_id="doc-1", is_default=True)
     fake_retried = MagicMock(application_id="app-1", status="pending")
 
-    monkeypatch.setattr(applications_module.application_repository, "get_by_user_and_url", lambda db, uid, url: fake_existing)
+    monkeypatch.setattr(applications_module.application_repository, "get_retryable_attempt_for_job", lambda db, uid, url: fake_existing)
     monkeypatch.setattr(applications_module.profile_repository, "get_by_user_id", lambda db, uid: fake_profile)
     monkeypatch.setattr(applications_module.profile_repository, "list_documents", lambda db, pid, document_type=None: [fake_resume])
     retry_calls = {}
@@ -134,8 +167,18 @@ def test_start_application_retries_a_retryable_application_on_the_same_row(monke
 def test_start_application_rejects_an_in_progress_application_with_409(monkeypatch, in_progress_status):
     import app.api.applications as applications_module
 
-    fake_existing = MagicMock(application_id="app-1", status=in_progress_status)
-    monkeypatch.setattr(applications_module.application_repository, "get_by_user_and_url", lambda db, uid, url: fake_existing)
+    # "This job already has a deterministic attempt in progress" is now
+    # reported by the shared ownership boundary rather than by this route
+    # re-deriving it from a single-row lookup (a job can hold several
+    # attempts). The user-visible behaviour is unchanged.
+    monkeypatch.setattr(
+        applications_module.automation_ownership, "find_active_automation",
+        lambda db, *, user_id, job_url, exclude_task_id=None: (
+            applications_module.automation_ownership.ActiveAutomation(
+                path="deterministic", status=in_progress_status, application_id="app-1",
+            )
+        ),
+    )
 
     background_tasks = BackgroundTasks()
     body = _fake_start_body()
@@ -151,8 +194,21 @@ def test_start_application_rejects_an_in_progress_application_with_409(monkeypat
 def test_start_application_rejects_a_completed_application_with_409(monkeypatch):
     import app.api.applications as applications_module
 
-    fake_existing = MagicMock(application_id="app-1", status="applied")
-    monkeypatch.setattr(applications_module.application_repository, "get_by_user_and_url", lambda db, uid, url: fake_existing)
+    # An already-submitted job is now reported by the shared ownership
+    # boundary, and the 409 body is STRUCTURED so the frontend can offer a
+    # deliberate re-application (it needs `application_id` to build the
+    # acknowledgement). This replaces the former plain-string detail.
+    from datetime import datetime, timezone
+
+    when = datetime(2026, 8, 20, 12, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(
+        applications_module.automation_ownership, "find_submitted_application",
+        lambda db, *, user_id, job_url: (
+            applications_module.automation_ownership.SubmittedApplication(
+                path="deterministic", submitted_at=when, application_id="app-1",
+            )
+        ),
+    )
 
     background_tasks = BackgroundTasks()
     body = _fake_start_body()
@@ -161,7 +217,11 @@ def test_start_application_rejects_a_completed_application_with_409(monkeypatch)
         start_application(body, background_tasks, Response(), user=MagicMock(user_id="user-1"), db=MagicMock())
 
     assert exc_info.value.status_code == 409
-    assert exc_info.value.detail == "Application has already been completed."
+    detail = exc_info.value.detail
+    assert detail["reason"] == "application_already_submitted"
+    assert detail["path"] == "deterministic"
+    assert detail["application_id"] == "app-1"
+    assert detail["submitted_at"] == when.isoformat()
     assert not background_tasks.tasks  # nothing new started
 
 
@@ -209,8 +269,31 @@ def test_start_application_retries_after_a_failure_and_stops_retrying_once_appli
         store[job_url] = app
         return app
 
-    def fake_get_by_user_and_url(db, user_id, job_url):
-        return store.get(job_url)
+    # The route now asks three distinct questions instead of one ambiguous
+    # "the application for this job", so the fakes answer each from the same
+    # store. Behaviour under test — retry the same row, then stop once it is
+    # applied — is unchanged.
+    def fake_get_retryable_attempt_for_job(db, user_id, job_url):
+        app = store.get(job_url)
+        if app is not None and app.status in ("failed", "manual_required", "needs_review"):
+            return app
+        return None
+
+    def fake_find_active_automation(db, *, user_id, job_url, exclude_task_id=None):
+        app = store.get(job_url)
+        if app is not None and app.status in ("pending", "processing", "copilot_review"):
+            return applications_module.automation_ownership.ActiveAutomation(
+                path="deterministic", status=app.status, application_id=app.application_id,
+            )
+        return None
+
+    def fake_find_submitted_application(db, *, user_id, job_url):
+        app = store.get(job_url)
+        if app is not None and app.status == "applied":
+            return applications_module.automation_ownership.SubmittedApplication(
+                path="deterministic", submitted_at=None, application_id=app.application_id,
+            )
+        return None
 
     def fake_get_by_id(db, application_id):
         return next((a for a in store.values() if a.application_id == application_id), None)
@@ -238,7 +321,9 @@ def test_start_application_retries_after_a_failure_and_stops_retrying_once_appli
         return app
 
     monkeypatch.setattr(applications_module.application_repository, "create_application", fake_create_application)
-    monkeypatch.setattr(applications_module.application_repository, "get_by_user_and_url", fake_get_by_user_and_url)
+    monkeypatch.setattr(applications_module.application_repository, "get_retryable_attempt_for_job", fake_get_retryable_attempt_for_job)
+    monkeypatch.setattr(applications_module.automation_ownership, "find_active_automation", fake_find_active_automation)
+    monkeypatch.setattr(applications_module.automation_ownership, "find_submitted_application", fake_find_submitted_application)
     monkeypatch.setattr(applications_module.application_repository, "get_by_id", fake_get_by_id)
     monkeypatch.setattr(applications_module.application_repository, "mark_processing", fake_mark_processing)
     monkeypatch.setattr(applications_module.application_repository, "retry_application", fake_retry_application)
@@ -479,7 +564,7 @@ def test_review_question_approve_caches_the_answer_for_future_applications(monke
     import app.api.applications as applications_module
     from app.models.application import QuestionReviewRequest
 
-    application = _owned_application(monkeypatch)
+    _owned_application(monkeypatch)
     fake_question = MagicMock(application_id="app-1", question_text="Notice period?", answer="30 days", human_answer=None)
     monkeypatch.setattr(applications_module.application_question_repository, "get", lambda db, qid: fake_question)
     monkeypatch.setattr(applications_module.application_question_repository, "apply_review", lambda db, q, **kw: fake_question)
@@ -577,7 +662,7 @@ def test_approve_application_persists_an_unconfirmed_submission_as_needs_review(
 def test_reject_application_closes_the_review_session_and_cancels(monkeypatch):
     import app.api.applications as applications_module
 
-    application = _owned_application(monkeypatch, status="copilot_review")
+    _owned_application(monkeypatch, status="copilot_review")
     close_calls = []
     monkeypatch.setattr(applications_module, "close_review_session", lambda aid: close_calls.append(aid))
     monkeypatch.setattr(
@@ -606,7 +691,7 @@ def test_start_application_skips_background_dispatch_for_browser_extension_sourc
     fake_resume = MagicMock(document_id="doc-1", is_default=True)
     fake_application = MagicMock(application_id="app-1", source="browser_extension")
 
-    monkeypatch.setattr(applications_module.application_repository, "get_by_user_and_url", lambda db, uid, url: None)
+    monkeypatch.setattr(applications_module.application_repository, "get_retryable_attempt_for_job", lambda db, uid, url: None)
     monkeypatch.setattr(applications_module.profile_repository, "get_by_user_id", lambda db, uid: fake_profile)
     monkeypatch.setattr(applications_module.profile_repository, "list_documents", lambda db, pid, document_type=None: [fake_resume])
     create_calls = []
@@ -628,7 +713,7 @@ def test_start_application_skips_background_dispatch_for_browser_extension_sourc
 def test_start_application_rejects_an_invalid_source(monkeypatch):
     import app.api.applications as applications_module
 
-    monkeypatch.setattr(applications_module.application_repository, "get_by_user_and_url", lambda db, uid, url: None)
+    monkeypatch.setattr(applications_module.application_repository, "get_retryable_attempt_for_job", lambda db, uid, url: None)
     background_tasks = BackgroundTasks()
     body = _fake_start_body(source="not-a-real-source")
 
@@ -642,7 +727,7 @@ def test_start_application_rejects_an_invalid_source(monkeypatch):
 def test_report_application_status_updates_the_row_and_records_an_audit_event(monkeypatch):
     import app.api.applications as applications_module
 
-    application = _owned_application(monkeypatch, source="browser_extension")
+    _owned_application(monkeypatch, source="browser_extension")
     audit_calls = []
     monkeypatch.setattr(applications_module, "_record_audit_event", lambda *a, **kw: audit_calls.append(kw))
 

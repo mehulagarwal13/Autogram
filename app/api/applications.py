@@ -46,6 +46,7 @@ from app.models.application import (
     DuplicateCheckResponse,
     QuestionReviewRequest,
     ReportStatusRequest,
+    VerificationCodeRequest,
 )
 from app.models.db_models import Application, User, VALID_APPLICATION_SOURCES
 from app.services import (
@@ -53,8 +54,11 @@ from app.services import (
     application_question_repository,
     application_repository,
     audit_log_repository,
+    automation_ownership,
     profile_repository,
 )
+from app.services.event_bus import publish_application_event
+from automation.applications import verification_channel
 from automation.applications.application_flow_manager import (
     ApplicationFlowManager,
     close_review_session,
@@ -63,7 +67,7 @@ from automation.applications.application_flow_manager import (
 )
 from automation.ats.detector import FALLBACK_ATS, detect_ats_for_url
 from automation.ats.registry import get_adapter_class
-from automation.forms.answer_engine import ApplicationAnswerEngine
+from automation.forms.answer_engine import ApplicationAnswerEngine, is_decoy_field
 from automation.forms.vision_fallback import VisionFormAnswerer
 
 logger = logging.getLogger(__name__)
@@ -166,30 +170,121 @@ def start_application(
     db: Session = Depends(get_db),
 ):
     """Idempotent per (user, job_url) — ARCHITECTURE.md's "never double-apply"
-    rule — except a RETRYABLE_STATUSES attempt never actually succeeded, so
-    there's nothing to double-apply: it's retried on the same row instead of
-    inserting a second one. An IN_PROGRESS_STATUSES or COMPLETED_STATUSES
-    attempt is rejected with 409 rather than silently doing nothing, so a
-    caller can't mistake "no-op" for "started"."""
+    rule. A normal request (no `acknowledge_previous_submission`) behaves
+    exactly as it always has:
+
+    * an ACTIVE attempt on either path -> 409;
+    * an already-SUBMITTED job -> 409 `application_already_submitted`;
+    * a RETRYABLE_STATUSES attempt never actually submitted, so there is
+      nothing to double-apply: it is retried on the SAME row, keeping its
+      `application_id` and `AutomationRun` history.
+
+    A job can now hold SEVERAL attempts, because a deliberate re-application
+    (`acknowledge_previous_submission`, the same acknowledgement shape
+    `POST /agent/tasks` accepts) inserts a new attempt rather than overwriting
+    the previous `applied` row. "Never double-apply" is therefore enforced by
+    two things rather than one full unique constraint: the partial unique index
+    `uq_applications_active_job` for concurrency, and the lifetime check here
+    for accidental repeats. Neither guarantee was weakened — see
+    `Application.__table_args__`.
+    """
     if body.source not in VALID_APPLICATION_SOURCES:
         raise HTTPException(
             status_code=400, detail=f"Invalid source {body.source!r}. Must be one of {sorted(VALID_APPLICATION_SOURCES)}.",
         )
 
     job_url = str(body.job_url)
-    existing = application_repository.get_by_user_and_url(db, user.user_id, job_url)
 
-    if existing is not None:
-        if existing.status in IN_PROGRESS_STATUSES:
-            raise HTTPException(status_code=409, detail="Application is already in progress.")
-        if existing.status in COMPLETED_STATUSES:
-            raise HTTPException(status_code=409, detail="Application has already been completed.")
-        if existing.status not in RETRYABLE_STATUSES:
-            # No known status falls outside the three sets above, but if a
-            # new one is ever added without updating them, fail safe by
-            # leaving the row untouched rather than guessing.
-            response.status_code = 200
-            return existing
+    # Cross-path guard. This route has always protected itself against its OWN
+    # duplicates via `uq_applications_user_job_url`, but it knew nothing about
+    # the autonomous agent — so an autonomous task could already be driving a
+    # browser tab on this exact job. The advisory lock makes this check and the
+    # create/retry below atomic with respect to a concurrent
+    # `POST /agent/tasks` for the same job (a unique index cannot span the two
+    # tables). Deliberately narrow: it only reports an ACTIVE automation on the
+    # *other* path; everything about this route's own status handling below is
+    # unchanged.
+    automation_ownership.reserve_job_automation(db, user_id=user.user_id, job_url=job_url)
+    active_elsewhere = automation_ownership.find_active_automation(
+        db, user_id=user.user_id, job_url=job_url
+    )
+    if active_elsewhere is not None:
+        # ACTIVE ALWAYS WINS, on either path, and a re-application
+        # acknowledgement is not even read yet — it can never bypass this.
+        if active_elsewhere.is_autonomous:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "reason": "active_automation_exists",
+                    "message": "This job is already being automated by an autonomous agent task.",
+                    "path": active_elsewhere.path,
+                    "status": active_elsewhere.status,
+                    "task_id": active_elsewhere.task_id,
+                    "application_id": None,
+                },
+            )
+        # A deterministic attempt of this user's own is already in progress.
+        # Kept as the long-standing plain-string message this route has always
+        # returned for that case.
+        raise HTTPException(status_code=409, detail="Application is already in progress.")
+
+    # LIFETIME duplicate — now checked for BOTH paths. An autonomous task at
+    # COMPLETED creates no `Application` row at all, and a prior `applied`
+    # attempt of this route's own is no longer guaranteed to be the row a
+    # lookup returns once a job can have several attempts. So the single
+    # authority for "has this user already successfully submitted?" is the
+    # ownership boundary, for both paths.
+    submitted = automation_ownership.find_submitted_application(
+        db, user_id=user.user_id, job_url=job_url
+    )
+    reapplying_over = None
+    if submitted is not None:
+        if body.acknowledge_previous_submission is None:
+            # The normal path: an accidental duplicate, refused exactly as
+            # before.
+            where = "an autonomous agent application" if submitted.is_autonomous else "an application"
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "reason": "application_already_submitted",
+                    "message": f"You have already submitted {where} for this job.",
+                    "path": submitted.path,
+                    "submitted_at": (
+                        submitted.submitted_at.isoformat() if submitted.submitted_at else None
+                    ),
+                    "task_id": submitted.task_id,
+                    "application_id": submitted.application_id,
+                },
+            )
+        # A deliberate re-application. Reached only AFTER the active check
+        # above, so it relaxes the lifetime guard and nothing else.
+        try:
+            automation_ownership.validate_reapply_acknowledgement(
+                body.acknowledge_previous_submission, submitted
+            )
+        except automation_ownership.ReapplyAcknowledgementError:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "reason": "invalid_reapplication_request",
+                    "message": (
+                        "This re-application request doesn't match the application currently on "
+                        "file for this job. Reload and try again."
+                    ),
+                    "path": submitted.path,
+                    "task_id": submitted.task_id,
+                    "application_id": submitted.application_id,
+                },
+            ) from None
+        reapplying_over = submitted
+
+    # An attempt that never submitted, and can therefore be resumed IN PLACE.
+    # Deliberately NOT `get_by_user_and_url`: that returns the latest attempt
+    # whatever its status, which once several attempts exist could hand back an
+    # `applied` row — and retrying that would reset its `status`/`applied_date`
+    # and erase the record of the submission. This lookup can only ever return
+    # `failed`/`manual_required`/`needs_review`.
+    existing = application_repository.get_retryable_attempt_for_job(db, user.user_id, job_url)
 
     profile = profile_repository.get_by_user_id(db, user.user_id)
     if not profile:
@@ -205,7 +300,20 @@ def start_application(
             detail="No resume on file. Upload one with POST /profile/documents/upload first.",
         )
 
-    if existing is None:
+    # RETRY vs RE-APPLICATION — two different things, kept distinct:
+    #
+    #   retry            an attempt that never submitted (`failed`,
+    #                    `manual_required`, `needs_review`) is resumed IN PLACE
+    #                    on the same row, preserving its `application_id` and
+    #                    its `AutomationRun` history. Unchanged behaviour.
+    #
+    #   re-application   the user deliberately acknowledged a prior SUCCESSFUL
+    #                    submission. That always inserts a NEW attempt row, so
+    #                    the previous `applied` row — its status, `applied_date`,
+    #                    runs, questions and audit entries — survives untouched.
+    #                    Never a retry, even if some unrelated failed attempt
+    #                    also happens to be lying around for this job.
+    if existing is None or reapplying_over is not None:
         application = application_repository.create_application(
             db,
             user_id=user.user_id,
@@ -216,12 +324,28 @@ def start_application(
             source=body.source,
         )
     else:
-        # Retry: same row (same application_id/created_at/job_url_hash), so
-        # the unique constraint stays satisfied and its AutomationRun
-        # history from apply_run_result is kept.
+        # Retry: same row (same application_id/created_at/job_url_hash), so its
+        # AutomationRun history from apply_run_result is kept.
         application = application_repository.retry_application(
             db, existing, company=body.company, position=body.position,
             autopilot_enabled=body.autopilot_enabled, source=body.source,
+        )
+
+    if reapplying_over is not None:
+        # A deliberate re-application is materially different from a normal
+        # start, so it is recorded on the EXISTING append-only audit trail.
+        # Metadata only — a job hash and references; nothing sensitive.
+        _record_audit_event(
+            db, application_id=application.application_id, user_id=user.user_id,
+            event_type="reapplication_authorized", actor=user.user_id,
+            metadata={
+                "job_url_hash": automation_ownership.job_key(job_url),
+                "previous_path": reapplying_over.path,
+                "previous_task_id": reapplying_over.task_id,
+                "previous_application_id": reapplying_over.application_id,
+                "new_application_id": application.application_id,
+                "new_path": "deterministic",
+            },
         )
 
     if body.source == "server_automation":
@@ -404,6 +528,22 @@ def review_application_question(
     if question is None or question.application_id != application.application_id:
         raise HTTPException(status_code=404, detail="Question not found on this application.")
 
+    # Anti-bot decoys are not answerable, and this is the last line of defence:
+    # they are no longer recorded as questions and no longer rendered, but rows
+    # created before that fix still exist, and this route is reachable directly.
+    # Accepting an answer here would write the value into the cross-application
+    # answer cache below — auto-filling that decoy on every future application
+    # and flagging each one as a bot.
+    if is_decoy_field(question.question_text):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "This field is a hidden anti-bot check, not a question — it is meant to stay "
+                "empty. Autogram deliberately leaves it blank; filling it would make the "
+                "employer's system treat the application as automated."
+            ),
+        )
+
     try:
         question = application_question_repository.apply_review(db, question, action=body.action, answer=body.answer)
     except ValueError as e:
@@ -463,6 +603,71 @@ def approve_application(
         "failed": error or "Could not submit — the submit control could not be clicked.",
     }.get(status, "Unknown outcome.")
     return ApplicationApprovalResult(status=status, message=message)
+
+
+@router.post("/{application_id}/verification-code", response_model=ApplicationApprovalResult)
+def submit_verification_code(
+    application_id: str,
+    body: VerificationCodeRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Hand a one-time passcode to a run that is PAUSED on a verification gate.
+
+    This is the deterministic path's answer to "where do I type the OTP?".
+    Previously the only way in was the automation's own browser window, which
+    assumes the user is sitting in front of it.
+
+    SECRETS — the value reaching this handler is never persisted, never logged,
+    and never echoed back. It goes straight to the in-memory
+    `verification_channel`, where the paused run picks it up exactly once and
+    types it into the live page. The response says only whether it was accepted
+    for delivery. Note in particular that this route does NOT write to the chat
+    transcript: `chat_repository.record_user_reply` would refuse a secret-typed
+    request anyway, and the correct record of this action is the audit event
+    below, which carries no value.
+
+    Refuses unless the application is genuinely waiting on a human, so a code
+    cannot be parked against a run that is not asking for one — where it would
+    sit in memory with nothing to consume it.
+    """
+    application = _get_owned_application(db, application_id, user)
+
+    if application.status != "manual_required":
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"This application is not waiting for a verification code "
+                f"(status: {application_repository.display_status(application)})."
+            ),
+        )
+    # Only a verification gate takes a code. A CAPTCHA pause also sits in
+    # `manual_required`, and typing a code at one would be meaningless — worse,
+    # it would imply Autogram was trying to answer the CAPTCHA.
+    reason = (application.failure_reason or "").lower()
+    if not any(k in reason for k in ("passcode", "multi-factor", "verification", "one-time", "2fa")):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "This application is waiting on a different kind of human step, not a verification "
+                "code. Please complete it in the automation's browser window."
+            ),
+        )
+
+    if not verification_channel.deliver(application_id, body.code):
+        raise HTTPException(status_code=422, detail="Enter the verification code you received.")
+
+    # Metadata only — that a code was supplied, never the code itself.
+    _record_audit_event(
+        db, application_id=application_id, user_id=user.user_id,
+        event_type="verification_code_supplied", actor=user.user_id,
+        metadata={"delivered": True},
+    )
+    _emit(application_id, "HUMAN_ACTION_COMPLETED", request_type="OTP_REQUIRED")
+    return ApplicationApprovalResult(
+        status=application.status,
+        message="Code sent to the automation. It will be entered in the browser shortly.",
+    )
 
 
 @router.post("/{application_id}/reject", response_model=ApplicationResponse)
@@ -525,6 +730,37 @@ def _record_audit_event(db: Session, **kwargs) -> None:
         logger.exception("Could not record audit log event %r for application %s.", kwargs.get("event_type"), kwargs.get("application_id"))
 
 
+#: Deterministic-path status -> the live event the UI switches on. Derived from
+#: the status the run actually produced rather than guessed at the call site, so
+#: the stream can never disagree with what was persisted.
+_STATUS_EVENTS = {
+    "applied": "APPLICATION_SUBMITTED",
+    "copilot_review": "REVIEW_REQUIRED",
+    "needs_review": "REVIEW_REQUIRED",
+    "manual_required": "HUMAN_ACTION_REQUIRED",
+    "failed": "APPLICATION_FAILED",
+    "cancelled": "APPLICATION_FAILED",
+}
+
+
+def _emit(application_id: str, event_type: str, **payload) -> None:
+    """Publish a live workflow event. Never raises.
+
+    Called from the Playwright worker thread as well as from request handlers,
+    and a browser tab that is not listening must never be able to affect a real
+    job application — so every failure is swallowed. The durable record is the
+    audit log and the status column; this is only the notification that they
+    changed.
+
+    `payload` is serialized straight to a browser, so it carries display context
+    only — never a verification code, cookie, or token.
+    """
+    try:
+        publish_application_event(application_id, event_type, **payload)
+    except Exception:  # noqa: BLE001 - defensive; publish already swallows its own
+        logger.debug("Could not publish %s for application %s.", event_type, application_id, exc_info=True)
+
+
 # ------------------------------------------------------------------
 # HITL platform — callbacks invoked FROM the dedicated Playwright thread
 # ------------------------------------------------------------------
@@ -539,10 +775,72 @@ def _mark_waiting_for_human(application_id: str, reason: str) -> None:
     session = SessionLocal()
     try:
         application_repository.mark_waiting_for_human(session, application_id, reason=reason)
+        # Published AFTER the status commits, so a client that reacts by
+        # refetching always sees the state the event announced.
+        _emit(application_id, "HUMAN_ACTION_REQUIRED", reason=reason)
     except Exception:
         logger.exception("Application %s: could not persist WAITING_FOR_HUMAN status.", application_id)
     finally:
         session.close()
+
+
+def _recover_crashed_run(application_id: str) -> None:
+    """Release the job ownership a crashed `_run_application` would otherwise
+    hold forever, on a FRESH session.
+
+    Fresh because the run's own `db` is why we are here: it may be in a
+    needs-rollback state, in which case every further statement on it raises
+    too — the same reasoning `result_db` above already relies on for the
+    result write.
+
+    Only `pending` and `processing` are considered, and each maps to a
+    different outcome for a real reason (see
+    `automation_recovery.DETERMINISTIC_RECOVERY`): `pending` provably never
+    opened a browser, so it is safely `failed`; `processing` may have clicked
+    Submit, so it becomes `needs_review` and is never auto-retried.
+    `copilot_review` is deliberately NOT touched here — this process is alive,
+    so a review session it left open is still genuinely open and approvable.
+    """
+    from app.services import automation_recovery
+
+    recovery_db = SessionLocal()
+    try:
+        for from_status in ("processing", "pending"):
+            new_status = automation_recovery.try_recover_application(
+                recovery_db, application_id=application_id, from_status=from_status,
+            )
+            if new_status is not None:
+                _record_audit_event(
+                    recovery_db, application_id=application_id,
+                    user_id=_user_id_for_application(recovery_db, application_id),
+                    event_type="automation_recovered", actor="system",
+                    metadata={
+                        "reason": "run_crashed",
+                        "prior_status": from_status,
+                        "new_status": new_status,
+                        "may_have_submitted": from_status == "processing",
+                    },
+                )
+                logger.warning(
+                    "Application %s: recovered crashed run %s -> %s.",
+                    application_id, from_status, new_status,
+                )
+                _emit(
+                    application_id, _STATUS_EVENTS.get(new_status, "APPLICATION_FAILED"),
+                    status=new_status, reason="run_crashed",
+                )
+                break
+    except Exception:
+        # Never let recovery bookkeeping mask the original crash, which has
+        # already been logged with its traceback above.
+        logger.exception("Application %s: could not recover a crashed run.", application_id)
+    finally:
+        recovery_db.close()
+
+
+def _user_id_for_application(db: Session, application_id: str) -> str | None:
+    application = application_repository.get_by_id(db, application_id)
+    return application.user_id if application else None
 
 
 def _is_kill_switch_engaged(user_id: str) -> bool:
@@ -572,6 +870,7 @@ def _run_application(application_id: str, resume_document_id: str, job_descripti
             return
 
         application = application_repository.mark_processing(db, application)
+        _emit(application_id, "APPLICATION_STARTED", job_url=application.job_url)
 
         try:
             detection = detect_ats_for_url(application.job_url)
@@ -584,6 +883,7 @@ def _run_application(application_id: str, resume_document_id: str, job_descripti
 
         ats_platform = detection["ats"]
         adapter_cls = get_adapter_class(ats_platform)
+        _emit(application_id, "PAGE_ANALYZED", ats_platform=ats_platform)
 
         if adapter_cls is None and ats_platform != FALLBACK_ATS:
             # A CONFIDENTLY detected platform with no dedicated adapter
@@ -724,6 +1024,14 @@ def _run_application(application_id: str, resume_document_id: str, job_descripti
             fresh_application = application_repository.get_by_id(result_db, application_id)
             if fresh_application is not None:
                 application_repository.apply_run_result(result_db, fresh_application, result)
+                # Derived from the status that just COMMITTED, so the stream can
+                # never claim an outcome the database disagrees with.
+                _emit(
+                    application_id,
+                    _STATUS_EVENTS.get(fresh_application.status, "APPLICATION_FAILED"),
+                    status=fresh_application.status,
+                    display_status=application_repository.display_status(fresh_application),
+                )
             else:
                 logger.warning("Application %s vanished before its result could be recorded.", application_id)
         finally:
@@ -731,5 +1039,15 @@ def _run_application(application_id: str, resume_document_id: str, job_descripti
     except Exception:
         logger.exception("Background application run crashed for %s", application_id)
         db.rollback()
+        # This handler used to end here — which meant an unexpected failure
+        # anywhere after `mark_processing` left `processing` persisted with no
+        # thread behind it, and `find_active_automation` reads status alone, so
+        # the job stayed blocked with 409 forever. Reproduced against real
+        # Postgres in `automation/tests/test_crash_recovery.py`.
+        #
+        # Startup reconciliation cannot cover this case: the PROCESS is still
+        # alive and serving requests, so there is no restart coming. It has to
+        # be resolved here, at the point of failure.
+        _recover_crashed_run(application_id)
     finally:
         db.close()

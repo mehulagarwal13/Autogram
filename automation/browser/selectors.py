@@ -855,6 +855,20 @@ def find_validation_errors(page: Page) -> list[str]:
 # Each entry is (gate_name, css_selector, text_patterns). A gate fires on a
 # visible structural match OR a visible text match, so it works whether the
 # ATS marks the field up semantically or only labels it in prose.
+#: The verification-code input, named once and shared.
+#:
+#: This is BOTH how the OTP gate is detected (below) and how a human-supplied
+#: code is later typed into the page
+#: (`application_flow_manager::_try_deliver_verification_code`). Sharing one
+#: definition is the point: if detection and filling used different selectors
+#: they could disagree — Autogram would report "OTP required" and then be unable
+#: to find the very field it just detected, stranding the run with a code the
+#: user had already entered.
+VERIFICATION_CODE_INPUT_SELECTOR = (
+    "input[autocomplete='one-time-code'], input[name*='otp' i], input[id*='otp' i], "
+    "input[name*='verification_code' i], input[name*='verificationcode' i]"
+)
+
 _HUMAN_GATES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
     (
         "login or registration required",
@@ -866,8 +880,7 @@ _HUMAN_GATES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
     ),
     (
         "one-time passcode / multi-factor authentication",
-        "input[autocomplete='one-time-code'], input[name*='otp' i], input[id*='otp' i], "
-        "input[name*='verification_code' i], input[name*='verificationcode' i]",
+        VERIFICATION_CODE_INPUT_SELECTOR,
         ("one-time password", "one time passcode", "verification code",
          "two-factor", "two factor", "2fa", "authenticator app",
          "enter the code we sent", "enter the 6-digit"),

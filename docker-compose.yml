@@ -1,0 +1,66 @@
+# Local development stack for Autogram.
+#
+# SCOPE, stated honestly: this composes the API and the Vite dev server. It does
+# NOT run a Postgres container, because this project targets Neon (managed
+# Postgres with pgvector) and the schema bootstrap in `app/main.py` expects the
+# `vector` extension to be installable. Point DATABASE_URL at your Neon branch —
+# a per-developer branch is the intended workflow, and it is what CI uses too.
+#
+# BROWSER AUTOMATION IS DELIBERATELY NOT CONTAINERISED. The default
+# AUTOMATION_BROWSER_MODE=cdp attaches to the developer's OWN already-running
+# Chrome, reusing their real profile (cookies and existing LinkedIn/Workday/Gmail
+# logins) and opening each job in a new tab. That is the whole point of the
+# design: it is what lets a human watch the run, solve a CAPTCHA in place, and
+# complete an OTP without the automation ever handling credentials. A browser
+# inside a container has none of that, so `docker compose` runs the API with
+# automation pointed at the host's Chrome (see AUTOMATION_CDP_URL below), rather
+# than pretending a headless container browser is equivalent.
+#
+# Consequence worth knowing: `host.docker.internal` resolves on Docker Desktop
+# (macOS/Windows). On plain Linux you need `--add-host=host.docker.internal:host-gateway`,
+# which is why it is declared explicitly under `extra_hosts`.
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    # `env_file` rather than baking values in: no secret belongs in this file or
+    # in an image layer. Copy .env.example to .env and fill it in.
+    env_file:
+      - .env
+    environment:
+      # Chrome runs on the HOST, not in this container — see the note above.
+      AUTOMATION_CDP_URL: http://host.docker.internal:9222
+      # The container must never try to start the developer's browser for them.
+      AUTOMATION_CDP_AUTOLAUNCH: "false"
+      CORS_ORIGINS: http://localhost:5173
+    ports:
+      - "8000:8000"
+    volumes:
+      # Résumés, encrypted automation sessions, and run artefacts (screenshots,
+      # traces) must outlive the container — they are evidence of what was
+      # submitted on the user's behalf.
+      - ./storage:/app/storage
+      - ./logs:/app/logs
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+
+  frontend:
+    image: node:20-alpine
+    working_dir: /app
+    # The Vite dev server proxies /api (HTTP and WebSocket) to the API service,
+    # so the frontend needs no CORS config and no hardcoded backend URL.
+    # VITE_API_TARGET lets the proxy find the API by service name in compose
+    # while still defaulting to 127.0.0.1 for a bare `npm run dev`.
+    environment:
+      VITE_API_TARGET: http://api:8000
+    ports:
+      - "5173:5173"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    command: sh -c "npm install && npm run dev -- --host 0.0.0.0"
+    depends_on:
+      - api

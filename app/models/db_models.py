@@ -1,4 +1,4 @@
-from sqlalchemy import Boolean, Column, String, DateTime, Text, Float, Integer, ForeignKey, UniqueConstraint
+from sqlalchemy import Boolean, Column, String, DateTime, Text, Float, Integer, ForeignKey, Index, UniqueConstraint, text
 from sqlalchemy.dialects.postgresql import JSONB
 from pgvector.sqlalchemy import Vector
 from datetime import datetime, timezone
@@ -465,7 +465,39 @@ class Application(Base):
     __table_args__ = (
         # Idempotency (ARCHITECTURE.md §"Compliance & Risk"): never double-apply
         # to the same job for the same user.
-        UniqueConstraint("user_id", "job_url_hash", name="uq_applications_user_job_url"),
+        #
+        # This was a FULL `UniqueConstraint(user_id, job_url_hash)`, i.e. one
+        # row per (user, job) forever. That made a deliberate re-application
+        # impossible to represent: the only way to attempt a job twice was to
+        # reset the existing row via `retry_application`, which overwrites
+        # `status='applied'` and `applied_date` — destroying the record that
+        # the first application ever happened.
+        #
+        # It is now PARTIAL, covering only the statuses where an attempt is
+        # actively being automated. The original constraint was really doing
+        # two jobs at once; those are now split across the same two layers the
+        # autonomous path already uses, with NEITHER guarantee weakened:
+        #
+        #   1. "never two automations on one job at once" -> this index. Two
+        #      concurrent inserts still cannot both commit.
+        #   2. "never silently apply twice after success" -> the route-level
+        #      lifetime check (`automation_ownership.find_submitted_application`
+        #      in `POST /applications/start`), which refuses unless the caller
+        #      explicitly acknowledges the exact prior submission.
+        #
+        # Historical `applied` rows sit OUTSIDE the index, so every past
+        # attempt is preserved verbatim alongside the new one — which is the
+        # entire point. Retryable statuses (`failed`/`manual_required`/
+        # `needs_review`) are outside it too; those still retry in place via
+        # `retry_application`, decided by the route, exactly as before.
+        Index(
+            "uq_applications_active_job",
+            "user_id", "job_url_hash",
+            unique=True,
+            postgresql_where=text(
+                "status IN ('pending', 'processing', 'copilot_review')"
+            ),
+        ),
     )
 
     application_id = Column(String, primary_key=True)
@@ -619,14 +651,261 @@ class ApplicationAuditLog(Base):
     `app/services/audit_log_repository.py` — it exposes only `record_event`,
     never an update/delete). It is the record of "did the system submit
     something without explicit permission," and a mutable audit log defeats
-    the entire point of keeping one."""
+    the entire point of keeping one.
+
+    `application_id` / `autonomous_task_id` are mutually exclusive-ish (exactly
+    one is expected to be set per row, enforced in `audit_log_repository`, not
+    at the DB level) — this one table is shared between the deterministic
+    per-ATS path (`applications.application_id`) and the general-purpose
+    autonomous agent (`autonomous_tasks.task_id`), rather than standing up a
+    second copy-pasted audit table for the latter."""
 
     __tablename__ = "application_audit_log"
 
     log_id = Column(String, primary_key=True)
-    application_id = Column(String, ForeignKey("applications.application_id", ondelete="CASCADE"), nullable=False, index=True)
+    application_id = Column(String, ForeignKey("applications.application_id", ondelete="CASCADE"), nullable=True, index=True)
+    autonomous_task_id = Column(String, ForeignKey("autonomous_tasks.task_id", ondelete="CASCADE"), nullable=True, index=True)
     user_id = Column(String, ForeignKey("users.user_id", ondelete="CASCADE"), nullable=False, index=True)
     event_type = Column(String, nullable=False)  # e.g. autopilot_run_started, human_approved, human_rejected, kill_switch_triggered
     actor = Column(String, nullable=False)  # "system" or a user_id
     event_metadata = Column(JSONB, nullable=True)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+
+# --- Autonomous agent platform (general-purpose observe/decide/act loop) ---
+# Distinct from the `Application` / `AutomationRun` / `ApplicationQuestion`
+# tables above, which back the deterministic, per-ATS-adapter
+# `ApplicationFlowManager` path. `AutonomousTask` is the persistence for the
+# NEW general-purpose LLM-driven agent
+# (`automation/agents/autonomous/loop.py::AutonomousAgentLoop`) that has no
+# per-ATS branching at all. The two systems are intentionally independent —
+# see `AUTONOMOUS_AGENT.md` for how they coexist. This table is one row per
+# autonomous task attempt (roughly analogous to one `Application` +
+# `AutomationRun` combined, since here there is exactly one continuous run
+# per task rather than several discrete attempts).
+VALID_AUTONOMOUS_TASK_STATUSES = {
+    "CREATED", "ANALYZING_JOB", "RUNNING", "WAITING_FOR_HUMAN",
+    "WAITING_FOR_APPROVAL", "RESUMING", "COMPLETED", "FAILED", "CANCELLED",
+}
+# Statuses where the loop is not actively driving the browser right now and a
+# human (or the API) can act on the task next.
+AUTONOMOUS_TASK_PAUSED_STATUSES = frozenset({"WAITING_FOR_HUMAN", "WAITING_FOR_APPROVAL"})
+AUTONOMOUS_TASK_TERMINAL_STATUSES = frozenset({"COMPLETED", "FAILED", "CANCELLED"})
+#: Statuses where this task still owns the job: a browser tab either is, or is
+#: about to be, driving that application. Exactly the complement of the
+#: terminal set, derived rather than re-listed so a new status can never be
+#: silently omitted from the duplicate-automation guard.
+#: Used by `uq_autonomous_tasks_active_job` (below) and
+#: `app/services/automation_ownership.py`.
+AUTONOMOUS_TASK_ACTIVE_STATUSES = frozenset(
+    VALID_AUTONOMOUS_TASK_STATUSES - AUTONOMOUS_TASK_TERMINAL_STATUSES
+)
+
+
+class AutonomousTask(Base):
+    """One row per autonomous-agent job-application task. Every field the
+    task spec requires is a top-level column so the status/resume/answer/
+    approve endpoints (`app/api/autonomous_agent.py`) can each touch exactly
+    what they need without deserializing one big opaque blob:
+
+    - `candidate_profile` / `job_information`: point-in-time snapshots taken
+      at task start (`ANALYZING_JOB`) — NOT live references to
+      `CandidateProfile`/`JobRecord`, so a task already in flight is
+      unaffected by the user editing their profile mid-run.
+    - `current_browser_state`: the last `PageState` the observer produced
+      (see `automation/agents/autonomous/observer.py`) — what the status API
+      and the resume flow show/re-derive from.
+    - `action_history`: append-only list of every action the executor actually
+      dispatched (`{action_type, params, result, timestamp}`) — the audit
+      trail the "never invent, never silently submit" guarantees rely on.
+    - `human_intervention`: the CURRENT pending intervention request while
+      `current_status == "WAITING_FOR_HUMAN"`
+      (`{type, reason, message, information_required}`); cleared on resume.
+    - `confirmed_answers`: task-scoped Q&A the human supplied via
+      `POST .../answer` — used as agent context on every subsequent decision
+      step, never written back into the global profile/answer cache (default
+      posture — see `AUTONOMOUS_AGENT.md`'s no-invention section).
+    - `final_result`: evidence payload for `APPLICATION_READY_FOR_SUBMISSION`
+      / `TASK_COMPLETED` / `TASK_FAILED` decisions.
+    """
+
+    __tablename__ = "autonomous_tasks"
+    __table_args__ = (
+        # At most ONE ACTIVE autonomous task per (user, job) — the
+        # autonomous-path counterpart to `uq_applications_user_job_url`, and
+        # the reason two simultaneous `POST /agent/tasks` calls cannot both
+        # win: whichever INSERT commits second raises IntegrityError.
+        #
+        # PARTIAL (a `WHERE` clause), which is the whole point: once a task
+        # reaches COMPLETED/FAILED/CANCELLED it drops out of the index, so a
+        # retry after a failure or cancellation inserts cleanly. A plain
+        # unique constraint would have permanently barred the job after the
+        # first attempt.
+        Index(
+            "uq_autonomous_tasks_active_job",
+            "user_id", "job_url_hash",
+            unique=True,
+            postgresql_where=text(
+                "current_status NOT IN ('COMPLETED', 'FAILED', 'CANCELLED')"
+            ),
+        ),
+    )
+
+    task_id = Column(String, primary_key=True)
+    user_id = Column(String, ForeignKey("users.user_id", ondelete="CASCADE"), nullable=False, index=True)
+    job_url = Column(String, nullable=False)
+    #: sha256 of the normalized job URL, computed by the EXISTING
+    #: `app/services/application_repository.py::compute_job_url_hash` — the
+    #: same function (and therefore the same normalization: strip + lowercase,
+    #: nothing more) the deterministic path already uses for
+    #: `Application.job_url_hash`. Sharing one implementation is what lets the
+    #: two independent paths recognise each other's jobs; normalizing
+    #: differently in each would make cross-path detection silently miss.
+    job_url_hash = Column(String, nullable=False, index=True)
+    original_objective = Column(Text, nullable=False)
+
+    candidate_profile = Column(JSONB, nullable=True)
+    job_information = Column(JSONB, nullable=True)
+
+    current_status = Column(String, nullable=False, default="CREATED")  # see VALID_AUTONOMOUS_TASK_STATUSES
+    current_browser_state = Column(JSONB, nullable=True)
+    action_history = Column(JSONB, nullable=False, default=list)
+    application_progress = Column(JSONB, nullable=False, default=dict)
+    human_intervention = Column(JSONB, nullable=True)
+    confirmed_answers = Column(JSONB, nullable=False, default=dict)
+    uploaded_documents = Column(JSONB, nullable=False, default=list)
+    final_result = Column(JSONB, nullable=True)
+    error = Column(Text, nullable=True)
+
+    # Off by default (compliance: no auto-submit without explicit per-task
+    # approval — see POST .../approve). Never flipped anywhere except that
+    # one endpoint.
+    auto_submit_approved = Column(Boolean, nullable=False, default=False)
+
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+
+
+# --- Human-in-the-loop interaction requests (OTP / MFA / CAPTCHA / login / ---
+# --- ambiguous-question / confirmation pauses raised by the autonomous     ---
+# --- agent — see `automation/agents/autonomous/loop.py` and               ---
+# --- AUTONOMOUS_AGENT.md's "Human-in-the-loop" section).
+#
+# `AutonomousTask.human_intervention` (above) stays as-is: a denormalized
+# "what's pending right now" snapshot the existing status-polling endpoints
+# already read (`GET /agent/tasks/{id}`, the `/resume` and `/answer` routes).
+# This table is the durable, individually-addressable record of EVERY pause
+# a task ever had — one row per pause, never overwritten — so it can carry
+# its own id, status, and expiry independent of the task's coarser status,
+# and so `app/api/human_interaction.py` has something to address by id.
+VALID_HUMAN_REQUEST_TYPES = frozenset({
+    "OTP_REQUIRED", "LOGIN_REQUIRED", "MFA_REQUIRED", "CAPTCHA_REQUIRED",
+    "USER_CONFIRMATION_REQUIRED", "ANSWER_REQUIRED", "MANUAL_ACTION_REQUIRED",
+    "UNKNOWN_BLOCKER",
+})
+#: Request types whose response carries a transient secret (a verification
+#: code) that must NEVER be persisted to this table, `AutonomousTask`, logs,
+#: or any API response — see `automation/agents/autonomous/runner.py`'s
+#: `deliver_secret`, the only place such a value is ever held, and only
+#: in-process, and only until the automation loop consumes it once.
+SECRET_HUMAN_REQUEST_TYPES = frozenset({"OTP_REQUIRED", "MFA_REQUIRED"})
+
+VALID_HUMAN_REQUEST_STATUSES = frozenset({
+    "PENDING", "RESPONDED", "RESUMING", "RESOLVED", "EXPIRED", "CANCELLED", "FAILED",
+})
+HUMAN_REQUEST_TERMINAL_STATUSES = frozenset({"RESOLVED", "EXPIRED", "CANCELLED", "FAILED"})
+
+
+class HumanInteractionRequest(Base):
+    """One row per human-in-the-loop pause the autonomous agent ever raised
+    for a task. Deliberately has NO column that could hold a secret
+    (OTP/MFA code, password, session token) — `safe_metadata` is for
+    non-secret context only (masked destination, which field/button was
+    detected, whether the site exposes a resend action), enforced by
+    convention in `app/services/human_interaction_repository.py` and never
+    populated with a raw code anywhere in this codebase."""
+
+    __tablename__ = "human_interaction_requests"
+
+    request_id = Column(String, primary_key=True)
+    user_id = Column(String, ForeignKey("users.user_id", ondelete="CASCADE"), nullable=False, index=True)
+    task_id = Column(String, ForeignKey("autonomous_tasks.task_id", ondelete="CASCADE"), nullable=False, index=True)
+
+    request_type = Column(String, nullable=False)  # see VALID_HUMAN_REQUEST_TYPES
+    status = Column(String, nullable=False, default="PENDING")  # see VALID_HUMAN_REQUEST_STATUSES
+
+    title = Column(String, nullable=True)
+    message = Column(Text, nullable=False)
+    safe_metadata = Column(JSONB, nullable=True)
+
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    expires_at = Column(DateTime, nullable=True)
+    responded_at = Column(DateTime, nullable=True)
+    resolved_at = Column(DateTime, nullable=True)
+
+
+# --- Chat transcript (HITL conversation surface) ----------------------------
+
+#: Who produced a chat message.
+#:   agent  — Autogram itself: a question, a status note, a pause explanation.
+#:   user   — the human's reply typed into the chat panel.
+#:   system — workflow milestones rendered inline ("Application submitted").
+VALID_CHAT_ROLES = frozenset({"agent", "user", "system"})
+
+
+class ChatMessage(Base):
+    """The user-visible conversation for ONE automation attempt.
+
+    Why this exists as its own table rather than being derived from
+    `HumanInteractionRequest` or `ApplicationAuditLog`:
+
+    * `HumanInteractionRequest` is the *state machine* for a pause — one row
+      per blocker, with a status that drives resume/expiry. It deliberately
+      holds no conversational history, and a chat needs the turns BETWEEN
+      pauses too ("filling page 2 of 3", the user's free-text answer).
+    * `ApplicationAuditLog` is append-only compliance evidence, written for
+      auditors and never for display. Rendering it as chat would leak internal
+      event vocabulary into the UI and, worse, tempt someone to start writing
+      user-facing prose into the compliance trail.
+
+    Both are kept as they are; this is the presentation-layer transcript and
+    references the pause it belongs to via `human_request_id` when there is
+    one, so the frontend can render an answerable prompt inline instead of a
+    separate modal.
+
+    SECRETS: `content` is user-visible prose and is persisted, so an OTP/MFA
+    code must NEVER be written here. The response routes for
+    `SECRET_HUMAN_REQUEST_TYPES` record only that a code was submitted — see
+    `chat_repository.record_secret_submission`, which is the only sanctioned
+    way to log that turn. This mirrors the rule `HumanInteractionRequest`
+    already follows for `safe_metadata`.
+
+    Shared between both automation paths by the same convention
+    `ApplicationAuditLog` uses: exactly one of `application_id` /
+    `autonomous_task_id` is set per row, enforced in the repository rather
+    than at the DB level, so the autonomous agent does not need a second
+    copy-pasted transcript table.
+    """
+
+    __tablename__ = "chat_messages"
+
+    message_id = Column(String, primary_key=True)
+    user_id = Column(String, ForeignKey("users.user_id", ondelete="CASCADE"), nullable=False, index=True)
+    application_id = Column(String, ForeignKey("applications.application_id", ondelete="CASCADE"), nullable=True, index=True)
+    autonomous_task_id = Column(String, ForeignKey("autonomous_tasks.task_id", ondelete="CASCADE"), nullable=True, index=True)
+
+    role = Column(String, nullable=False)  # see VALID_CHAT_ROLES
+    content = Column(Text, nullable=False)
+
+    #: Set when this message IS a human-in-the-loop prompt, so the UI can render
+    #: the right control (OTP field, "CAPTCHA completed" button, free-text box)
+    #: and know whether it is still answerable.
+    human_request_id = Column(
+        String, ForeignKey("human_interaction_requests.request_id", ondelete="SET NULL"),
+        nullable=True, index=True,
+    )
+    #: Non-secret display context only — same rule as
+    #: `HumanInteractionRequest.safe_metadata`.
+    safe_metadata = Column(JSONB, nullable=True)
+
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), index=True)

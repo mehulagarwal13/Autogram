@@ -12,7 +12,10 @@ sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 from app.core.config import DATABASE_URL
 from app.core.database import Base
-from app.models import db_models
+# Imported for its SIDE EFFECT, not for a name: this is what registers every
+# table on `Base.metadata`. Without it `alembic revision --autogenerate`
+# sees an empty model set and generates a migration that DROPS the schema.
+from app.models import db_models  # noqa: F401
 
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.

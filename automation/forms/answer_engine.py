@@ -543,6 +543,42 @@ def _as_question(item: str | Question) -> Question:
     return Question(str(item))
 
 
+#: Field labels that identify an anti-bot DECOY rather than a real question.
+#:
+#: These fields are hidden from human users by CSS/positioning; a real applicant
+#: never sees them, so anything filling one is provably a bot. Autogram already
+#: leaves them empty (they carry no profile mapping and score LOW), but they
+#: were still being written to the application's question ledger and rendered in
+#: the UI as "No answer yet — needs your input."
+#:
+#: That is worse than clutter. It asks the human to do the ONE thing that
+#: guarantees the employer's anti-bot check flags the application — and it does
+#: so in the review list, right where a conscientious user is trying to be
+#: thorough.
+#:
+#: Substring matching on purpose: sites name these `honeypot`, `hp_field`,
+#: `winnie_the_pooh`, `b_email`, and so on, and the exact token is never
+#: stable. A false positive costs one genuine question being silently
+#: auto-answered instead of reviewed; a false negative invites a user to
+#: sabotage their own application.
+_DECOY_FIELD_MARKERS = (
+    "honeypot", "honey_pot", "hp_field",
+    "bot-field", "bot_field", "botfield",
+    "leave-this-blank", "leave_this_blank", "leaveblank",
+    "do-not-fill", "do_not_fill", "donotfill",
+    "spam-trap", "spam_trap", "spamtrap",
+)
+
+
+def is_decoy_field(label: str | None) -> bool:
+    """Whether `label` names an anti-bot decoy field rather than a question."""
+    if not label:
+        return False
+    normalized = label.strip().lower().replace(" ", "")
+    return any(marker.replace("-", "").replace("_", "") in normalized.replace("-", "").replace("_", "")
+               for marker in _DECOY_FIELD_MARKERS)
+
+
 class ApplicationAnswerEngine:
     """Answers one form's worth of leftover screening questions. Cheap to
     construct per run — `db`/`user_id` are optional so tests (and any
@@ -643,8 +679,19 @@ class ApplicationAnswerEngine:
         no-op unless both `db` and `application_id` were supplied, so tests
         and any caller without a live application (e.g. the standalone
         `answer()`/`answer_batch()` unit tests) are unaffected. Best-effort:
-        a broken write must never take down an otherwise-good answer."""
+        a broken write must never take down an otherwise-good answer.
+
+        Decoy fields are excluded — see `is_decoy_field`. They are not
+        questions, and surfacing one to a human is worse than noise: filling a
+        honeypot is precisely how a site identifies a submission as automated.
+        """
         if self.db is None or self.application_id is None:
+            return
+        if is_decoy_field(result.question):
+            logger.debug(
+                "Not recording %r as an application question: it looks like an anti-bot decoy.",
+                result.question,
+            )
             return
         try:
             application_question_repository.record_question(
@@ -662,6 +709,14 @@ class ApplicationAnswerEngine:
             logger.debug("Could not record question %r to the application ledger — continuing.", result.question)
 
     def _cache_save(self, question: str, answer: str, source: str, confidence: float) -> None:
+        # A decoy must never enter the per-user answer cache. The cache is
+        # REUSED across future applications, so one value stored here would be
+        # auto-typed into every honeypot Autogram meets afterwards — turning a
+        # single mistake into a permanent, silent bot-flag on every subsequent
+        # application. Observed for real: a user, told the field "needs your
+        # input", typed a 6-digit code into one.
+        if is_decoy_field(question):
+            return
         if self.db is None or self.user_id is None or not answer:
             return
         try:

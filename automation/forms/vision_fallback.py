@@ -283,7 +283,7 @@ class VisionFormAnswerer:
 
         if askable:
             asked = [item for _index, item in askable]
-            for (index, item), answer in zip(askable, self._call_llm(asked)):
+            for (index, _item), answer in zip(askable, self._call_llm(asked)):
                 results[index] = answer
 
         return [results[i] for i in range(len(fields))]

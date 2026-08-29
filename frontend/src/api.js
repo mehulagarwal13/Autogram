@@ -32,8 +32,33 @@ async function request(path, options = {}) {
     throw new Error("Session expired — please log in again.");
   }
   if (!res.ok) {
-    const detail = body?.detail || `Request failed (${res.status})`;
-    throw new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
+    const detail = body?.detail;
+    // Some endpoints return a STRUCTURED detail object so the UI can branch on
+    // a machine-readable reason (e.g. the 409 from starting automation for a
+    // job that already has an active run). Previously any non-string detail was
+    // JSON.stringify'd straight into the message, which surfaced raw JSON in a
+    // toast. Keep `.message` human-readable and hand the object to the caller
+    // as `.detail`; existing callers that only read `.message` are unaffected.
+    const isStructured = detail && typeof detail === "object";
+
+    // 5xx bodies are NEVER echoed to the user. A 4xx detail is our own
+    // deliberate, user-facing prose ("You have already applied to this job"),
+    // but a 5xx detail describes a server failure and may carry an exception
+    // string or a traceback — from a reverse proxy, or from a route that
+    // interpolated an error into `detail`. Autogram's own middleware already
+    // returns a generic "Internal server error.", so this is a second line of
+    // defence rather than the only one; it costs nothing and removes a whole
+    // class of accidental leak.
+    const serverFailed = res.status >= 500;
+    const message = serverFailed
+      ? "Something went wrong on our side. Please try again in a moment."
+      : isStructured
+        ? (detail.message || `Request failed (${res.status})`)
+        : (detail || `Request failed (${res.status})`);
+    const error = new Error(message);
+    error.status = res.status;
+    if (isStructured) error.detail = detail;
+    throw error;
   }
   return body;
 }
@@ -163,4 +188,82 @@ export const api = {
   approveApplication: (id) => request(`/applications/${id}/approve`, { method: "POST" }),
   rejectApplication: (id, reason) =>
     request(`/applications/${id}/reject${reason ? `?reason=${encodeURIComponent(reason)}` : ""}`, { method: "POST" }),
+
+  // ---------- Autonomous agent (general-purpose observe/decide/act) ----------
+  startAgentTask: (body) =>
+    request("/agent/tasks", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }),
+  listAgentTasks: () => request("/agent/tasks"),
+  getAgentTask: (id) => request(`/agent/tasks/${id}`),
+  resumeAgentTask: (id) => request(`/agent/tasks/${id}/resume`, { method: "POST" }),
+  answerAgentTask: (id, body) =>
+    request(`/agent/tasks/${id}/answer`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }),
+  approveAgentTask: (id) => request(`/agent/tasks/${id}/approve`, { method: "POST" }),
+  cancelAgentTask: (id) => request(`/agent/tasks/${id}/cancel`, { method: "POST" }),
+
+  // ---------- Human-in-the-loop requests (OTP / MFA / CAPTCHA / login / confirmation) ----------
+  getActiveHumanRequest: (taskId) => request(`/agent/tasks/${taskId}/human-request`),
+  getHumanRequest: (requestId) => request(`/human-requests/${requestId}`),
+  respondHumanRequest: (requestId, body) =>
+    request(`/human-requests/${requestId}/respond`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }),
+  cancelHumanRequest: (requestId) => request(`/human-requests/${requestId}/cancel`, { method: "POST" }),
+
+  // ---------- Chat transcript ----------
+  // `scope` is "applications" or "tasks" — one transcript surface for both
+  // automation paths, matching the backend's shared `chat_messages` table.
+  getChatTranscript: (scope, id) => request(`/chat/${scope}/${id}`),
+
+  // ---------- Verification code (deterministic path) ----------
+  // The code is sent and immediately forgotten: it is not stored in the client,
+  // not put in a URL, and the response never echoes it back. See
+  // `automation/applications/verification_channel.py` for the server side.
+  submitVerificationCode: (applicationId, code) =>
+    request(`/applications/${applicationId}/verification-code`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ code }),
+    }),
 };
+
+/**
+ * Open the live workflow event stream for one automation attempt.
+ *
+ * The token goes in the QUERY STRING because the browser WebSocket API cannot
+ * set an Authorization header — there is no option for it. The backend verifies
+ * it with exactly the same logic as every HTTP route.
+ *
+ * Returns the socket so the caller can close it; `onEvent` receives the parsed
+ * payload. KEEPALIVE frames are swallowed here rather than handed upward — they
+ * exist only to keep proxies from dropping an idle connection, and every
+ * consumer would otherwise have to remember to ignore them.
+ *
+ * This stream is an ACCELERATOR, never an authority: treat each event as a hint
+ * to refetch. Events published while disconnected are dropped and never
+ * replayed, so a consumer that trusts the socket as a complete history will be
+ * wrong. Fetch the transcript/status on open and after any reconnect.
+ */
+export function openChatStream(scope, id, onEvent, { onError } = {}) {
+  const token = auth.getToken();
+  if (!token) return null;
+  const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
+  const url = `${proto}//${window.location.host}/api/chat/${scope}/${id}/stream?token=${encodeURIComponent(token)}`;
+
+  let socket;
+  try {
+    socket = new WebSocket(url);
+  } catch {
+    onError?.();
+    return null;
+  }
+  socket.onmessage = (raw) => {
+    let message;
+    try {
+      message = JSON.parse(raw.data);
+    } catch {
+      return; // a frame we cannot parse is not worth tearing the stream down for
+    }
+    if (message.event === "KEEPALIVE") return;
+    onEvent(message);
+  };
+  socket.onerror = () => onError?.();
+  return socket;
+}

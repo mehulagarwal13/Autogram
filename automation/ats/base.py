@@ -744,8 +744,24 @@ class ATSAdapter(ABC):
 
             field = describe_field(target, label=selector, page=self.page)
             outcome = fill_field(field, value, context=self._fill_context())
+            # Mark it examined whether or not the fill SUCCEEDED. The attribute
+            # means "this adapter has already looked at this element", and a
+            # field that just exhausted its retry budget has certainly been
+            # looked at.
+            #
+            # Marking only on success meant a failed field stayed unmarked, so
+            # the later name/placeholder sweep rediscovered the SAME element
+            # under a different label and spent another full retry budget
+            # reaching the identical failure. Seen on a real American Express
+            # form: `Phone Number` failed 3 attempts, then `phoneNumber` — the
+            # same input — failed 3 more, and `Country` did likewise, adding
+            # roughly two minutes of pure duplicate work to one page.
+            #
+            # Nothing is lost by skipping the retry: the failure is already
+            # recorded in a `FieldFillResult` and surfaced to the human. What
+            # is avoided is doing it twice to reach the same answer.
+            self._mark_examined(target)
             if outcome.filled:
-                self._mark_examined(target)
                 return True, None
             last_failure = outcome.failure
 
@@ -943,8 +959,12 @@ class ATSAdapter(ABC):
 
             field = describe_field(input_locator, label=text, page=self.page, profile_attribute=attribute)
             outcome = fill_field(field, value, context=self._fill_context())
-            if outcome.filled:
-                self._mark_examined(input_locator)
+            # Marked regardless of outcome, for the same reason spelled out at
+            # `_pending_answer_engine_questions` below: the marker means "this
+            # adapter has looked at this element", so a control that exhausted
+            # its retries is not rediscovered by the name/placeholder sweep and
+            # retried to the identical failure.
+            self._mark_examined(input_locator)
             results.append(FieldFillResult(
                 field_key=text, profile_path=attribute, value_used=value,
                 confidence=0.9 if outcome.filled else 0.0, filled=outcome.filled, failure=outcome.failure,

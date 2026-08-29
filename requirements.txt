@@ -37,3 +37,7 @@ playwright            # Phase 2: browser automation engine (automation/browser/*
 # redis               # Phase 4: apply-job queue
 # celery              # Phase 4: async worker (or arq, still under evaluation)
 # langgraph           # Phase 6: AI agent orchestration layer
+
+# --- Developer tooling (not needed at runtime) ---
+ruff              # bug-focused linting; config in ruff.toml. `ruff check .`
+mypy              # type checking, scoped to the workflow modules in mypy.ini

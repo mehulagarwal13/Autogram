@@ -5,11 +5,18 @@ import {
   CheckCircle2, RotateCcw, ChevronDown, FileText,
 } from "lucide-react";
 import { api } from "../api";
+import VerificationCodePanel from "../components/VerificationCodePanel";
 import StatusBadge from "../components/StatusBadge";
 import AnswerReviewList from "../components/AnswerReviewList";
 
 const LIVE_POLL_MS = 2500;
 const ACTIVE_STATUSES = new Set(["IN_PROGRESS", "WAITING_FOR_HUMAN"]);
+
+//: Which human-gate reasons take a CODE, as opposed to a CAPTCHA or a login
+//: the user must clear in the browser themselves. Mirrors the guard in
+//: `app/api/applications.py::submit_verification_code` — if these drift, the UI
+//: would render an input whose submission the backend rejects with a 409.
+const NEEDS_VERIFICATION_CODE = /passcode|multi-factor|verification|one-time|2fa/i;
 
 export default function ApplicationDetail({ toast }) {
   const { id } = useParams();
@@ -245,8 +252,40 @@ export default function ApplicationDetail({ toast }) {
         </div>
       )}
 
-      {status === "FAILED" && application.failure_reason && (
-        <Warning title="Run failed">{application.failure_reason}</Warning>
+      {/* `failure_reason` carries the run's explanation for every non-submitted
+          outcome, not just FAILED — and for WAITING_FOR_REVIEW it is the most
+          important text on the page: that is the status the backend uses when a
+          submit click could not be confirmed, or when a crashed run's outcome
+          was never recorded, so the message is the "this may already have been
+          submitted — verify before applying again" warning. Rendering it only
+          for FAILED meant the one case where a duplicate application was
+          possible was also the one case the user was told nothing about. */}
+      {/* The verification-code entry point. Gated on the backend's OWN reason
+          text rather than on status alone: a CAPTCHA pause also sits in
+          WAITING_FOR_HUMAN, and offering a code box there would suggest
+          Autogram was trying to answer the CAPTCHA — which it never does. The
+          same keyword check guards the API route, so the UI cannot offer
+          something the backend would refuse. */}
+      {status === "WAITING_FOR_HUMAN" && NEEDS_VERIFICATION_CODE.test(application.failure_reason || "") && (
+        <VerificationCodePanel
+          applicationId={application.application_id}
+          onSubmitted={loadAll}
+          rejected={Boolean(live?.live?.verification_rejected)}
+        />
+      )}
+
+      {application.failure_reason && ["FAILED", "WAITING_FOR_REVIEW", "WAITING_FOR_HUMAN"].includes(status) && (
+        <Warning
+          title={
+            status === "FAILED"
+              ? "Run failed"
+              : status === "WAITING_FOR_REVIEW"
+                ? "Needs your verification before you apply again"
+                : "Waiting on you"
+          }
+        >
+          {application.failure_reason}
+        </Warning>
       )}
 
       {/* Answer review — needs-your-attention first */}

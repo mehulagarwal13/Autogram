@@ -377,7 +377,6 @@ SKILL_ALIASES: dict[str, str] = {
     # ======================
     "rabbitmq": "RabbitMQ",
 
-    "kafka": "Apache Kafka",
 
     # ======================
     # Operating Systems

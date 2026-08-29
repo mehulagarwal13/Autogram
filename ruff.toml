@@ -1,0 +1,60 @@
+# Ruff configuration for Autogram.
+#
+# Scoped deliberately narrowly. The regression that prompted adding a linter
+# found two real bugs a linter would have caught instantly — a `NameError` from
+# an undefined variable, and a constant declared between a decorator and its
+# function. Those are `F` (pyflakes) findings.
+#
+# So the rule set is chosen to catch BUGS, not to impose a style on ~15k lines
+# of working, heavily-tested code. Turning on the full default set here would
+# produce hundreds of unrelated findings and bury exactly the signal this exists
+# to surface. Style rules can be added later, deliberately, one at a time.
+
+target-version = "py310"
+line-length = 120
+
+exclude = [
+    "venv",
+    "alembic/versions",   # generated migration scaffolding
+    "node_modules",
+    "out",
+    "src",                # legacy/unused tree, not imported by the app
+]
+
+[lint]
+select = [
+    "F",    # pyflakes — undefined names, unused imports, f-string bugs. The
+            # category that would have caught both bugs from the last phase.
+    "E9",   # syntax errors and IndentationError — the misplaced-constant bug.
+    "B",    # bugbear — mutable default args, `except` ordering, loop-variable
+            # capture: real defects rather than formatting opinions.
+    "T20",  # print() left in application code (see per-file ignores below).
+]
+
+ignore = [
+    # Bugbear's "raise ... from err" inside except. This codebase deliberately
+    # uses bare `raise HTTPException(...) from None` in places to avoid leaking
+    # an internal traceback into an API response, and elsewhere the chaining is
+    # genuinely irrelevant. Not worth churning working error paths over.
+    "B904",
+    # "Do not perform function call in argument defaults" — this IS the FastAPI
+    # idiom. `user: User = Depends(get_current_user)` is how dependency
+    # injection is declared, and every one of the 128 hits is a route signature
+    # doing exactly that. The rule is right about plain Python and wrong about
+    # this framework; leaving it on would bury every real finding under
+    # false positives.
+    "B008",
+    # `zip(..., strict=)` — worth adopting deliberately, but flipping it on
+    # blind across existing pairwise loops risks turning a currently-tolerated
+    # length mismatch into a runtime crash on a live application run. Left for
+    # a focused pass with tests, not bundled into a linter rollout.
+    "B905",
+]
+
+[lint.per-file-ignores]
+# Tests legitimately print progress (the E2E suite prints live browser state
+# with `-s`, which is how a human follows a 14-minute real-browser run), and
+# unused imports in a test file are harmless scaffolding rather than a defect.
+"tests/**" = ["T20", "F401"]
+"automation/tests/**" = ["T20", "F401"]
+"scripts/**" = ["T20"]
