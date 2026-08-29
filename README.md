@@ -8,6 +8,44 @@ A GenAI-powered backend that takes a resume, understands it, and finds real jobs
 
 ---
 
+## Repository layout
+
+```
+Autogram/
+├── backend/            # everything Python — run the API from HERE
+│   ├── app/            #   API routes, services, models, config
+│   │   ├── api/        #     FastAPI routers
+│   │   ├── services/   #     repositories + domain services
+│   │   ├── models/     #     SQLAlchemy models + Pydantic schemas
+│   │   └── core/       #     config, auth, database, middleware
+│   ├── automation/     #   browser automation (Playwright)
+│   │   ├── applications/ #   deterministic per-ATS flow manager
+│   │   ├── agents/     #     autonomous observe/decide/act agent
+│   │   ├── ats/        #     per-ATS adapters
+│   │   ├── forms/      #     field detection, handlers, answer engine
+│   │   ├── browser/    #     browser/session management
+│   │   └── tests/      #     automation + integration tests
+│   ├── alembic/        #   database migrations
+│   ├── tests/          #   API-level tests
+│   ├── scripts/        #   operational utilities (reset_db.py)
+│   ├── storage/        #   résumés, encrypted sessions (runtime)
+│   ├── logs/           #   per-run screenshots/traces (runtime)
+│   ├── requirements.txt · pytest.ini · ruff.toml · mypy.ini · Dockerfile
+│
+├── frontend/           # React + Vite app
+│   └── src/{components,pages,__tests__}
+│
+├── worker/             # Cloudflare Worker (deploy target)
+├── extension/          # browser extension
+├── src/                # Remotion demo-video project (its own package.json)
+└── docker-compose.yml
+```
+
+**`app/` and `automation/` are siblings inside `backend/` on purpose.** Imports
+are `from app.…` / `from automation.…`, so the backend must be run with
+`backend/` as the working directory — which is why every command below starts
+there. Moving either one alone would break every import in the other.
+
 ## Tech Stack
 
 | Component | Technology | Purpose |
@@ -180,12 +218,13 @@ python -m venv venv
 venv\Scripts\activate        # Windows  (source venv/bin/activate on Linux/Mac)
 
 # 3. Dependencies
-pip install -r requirements.txt
+pip install -r backend/requirements.txt
 
 # 4. Configure keys
 copy .env.example .env       # then fill in every key (see API Keys table above)
 
 # 5. Run — tables, pgvector extension, and indexes are created automatically at startup
+cd backend
 uvicorn app.main:app --reload
 ```
 
@@ -226,20 +265,22 @@ which is easy to mistake for a pass:
 # Both conftests `setdefault` DATABASE_URL to a localhost stub, which WINS over
 # .env. Export the real URL first or every Postgres-backed test SKIPS.
 export DATABASE_URL="postgresql://...neon.tech/neondb?sslmode=require"
+cd backend
 pytest tests/ automation/tests/ -q
 
 # Real-browser end-to-end suite. Needs Chromium and a real LLM key, and must
 # run in its OWN pytest process — a session-scoped sync_playwright() from
 # another file collides with it (see automation/tests/conftest.py).
 export OPENAI_API_KEY="sk-..."
+cd backend
 pytest automation/tests/test_e2e_hitl_browser.py -v -s
 ```
 
 ### Linting and type checking
 
 ```bash
-ruff check .                      # bug-focused rules only — see ruff.toml for what is on and why
-mypy --config-file mypy.ini       # scoped to the critical workflow modules — see mypy.ini
+cd backend && ruff check .        # bug-focused rules only — see ruff.toml for what is on and why
+cd backend && mypy --config-file mypy.ini  # scoped to the critical workflow modules — see mypy.ini
 ```
 
 `ruff check . --fix` is safe for most rules, with one caveat learned the hard
