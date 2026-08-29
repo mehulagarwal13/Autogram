@@ -13,12 +13,11 @@
 target-version = "py310"
 line-length = 120
 
+# Paths are relative to this file, which lives in backend/. `venv/`,
+# `node_modules/` and the Remotion `src/` tree are all siblings of backend/ at
+# the repo root, so they are already out of scope and need no entry here.
 exclude = [
-    "venv",
     "alembic/versions",   # generated migration scaffolding
-    "node_modules",
-    "out",
-    "src",                # legacy/unused tree, not imported by the app
 ]
 
 [lint]

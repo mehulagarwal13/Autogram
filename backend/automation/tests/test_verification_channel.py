@@ -248,7 +248,7 @@ def test_the_ui_gate_and_the_api_gate_use_the_same_keywords():
     import re
     from pathlib import Path
 
-    jsx = (Path(__file__).resolve().parents[2] / "frontend" / "src" / "pages" / "ApplicationDetail.jsx").read_text(encoding="utf-8")
+    jsx = (Path(__file__).resolve().parents[3] / "frontend" / "src" / "pages" / "ApplicationDetail.jsx").read_text(encoding="utf-8")
     match = re.search(r"NEEDS_VERIFICATION_CODE\s*=\s*/([^/]+)/i", jsx)
     assert match, "the UI gate regex was renamed or removed"
     ui_keywords = set(match.group(1).split("|"))

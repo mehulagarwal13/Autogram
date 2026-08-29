@@ -32,7 +32,7 @@ from pathlib import Path
 
 import pytest
 
-FRONTEND = Path(__file__).resolve().parents[2] / "frontend"
+FRONTEND = Path(__file__).resolve().parents[3] / "frontend"
 DIST = FRONTEND / "dist"
 
 

@@ -34,7 +34,10 @@ from app.models.db_models import (
 from app.services.application_repository import DISPLAY_STATUS_MAP
 from app.services.event_bus import WORKFLOW_EVENTS
 
-FRONTEND_SRC = Path(__file__).resolve().parents[2] / "frontend" / "src"
+#: `parents[3]` is the REPO ROOT: this file sits at
+#: backend/automation/tests/, so [1]=automation, [2]=backend, [3]=root —
+#: and `frontend/` is a sibling of `backend/`, not inside it.
+FRONTEND_SRC = Path(__file__).resolve().parents[3] / "frontend" / "src"
 
 #: Anything ALL_CAPS_WITH_UNDERSCORES in a string literal or as a bare object
 #: key. Broad on purpose: the point is to catch a name the frontend uses at all,
@@ -167,6 +170,7 @@ def test_every_event_the_backend_publishes_is_in_the_declared_vocabulary():
     import re
     from pathlib import Path
 
+    # parents[2] is `backend/` — where app/ and automation/ live.
     root = Path(__file__).resolve().parents[2]
     published: set[str] = set()
     for path in list((root / "app").rglob("*.py")) + list((root / "automation").rglob("*.py")):

@@ -23,7 +23,9 @@
 services:
   api:
     build:
-      context: .
+      # The API image is built from backend/, which now owns app/,
+      # automation/, requirements.txt and the Dockerfile.
+      context: ./backend
       dockerfile: Dockerfile
     # `env_file` rather than baking values in: no secret belongs in this file or
     # in an image layer. Copy .env.example to .env and fill it in.
@@ -41,8 +43,8 @@ services:
       # Résumés, encrypted automation sessions, and run artefacts (screenshots,
       # traces) must outlive the container — they are evidence of what was
       # submitted on the user's behalf.
-      - ./storage:/app/storage
-      - ./logs:/app/logs
+      - ./backend/storage:/app/storage
+      - ./backend/logs:/app/logs
     extra_hosts:
       - "host.docker.internal:host-gateway"
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000

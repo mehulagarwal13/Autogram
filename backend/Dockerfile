@@ -1,12 +1,13 @@
 # API image for Autogram.
 #
-# Playwright's browsers are deliberately NOT installed here. The default
-# AUTOMATION_BROWSER_MODE=cdp attaches to the developer's own running Chrome on
-# the host (see docker-compose.yml), so a second browser inside the image would
-# add ~500MB and a system-dependency chain for something this container never
-# launches. If you switch to AUTOMATION_BROWSER_MODE=launch — the CI/server
-# mode — uncomment the install line below; it needs both the browser binary and
-# its OS libraries, which is what `--with-deps` handles.
+# The browser binary IS installed here (see the `playwright install` line
+# below). Local dev via docker-compose still defaults to
+# AUTOMATION_BROWSER_MODE=cdp, attaching to the developer's own running
+# Chrome on the host, so the installed browser sits unused there. But the
+# Cloudflare Containers deploy (see ../worker/wrangler.toml) runs headless
+# with AUTOMATION_BROWSER_MODE=launch — there is no developer Chrome to
+# attach to in the cloud — so the image needs its own Chromium plus the OS
+# libraries `--with-deps` pulls in.
 
 FROM python:3.10-slim
 
@@ -22,8 +23,8 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Uncomment for AUTOMATION_BROWSER_MODE=launch (headless browser in-container):
-# RUN playwright install --with-deps chromium
+# Needed for AUTOMATION_BROWSER_MODE=launch (headless browser in-container).
+RUN playwright install --with-deps chromium
 
 COPY . .
 
