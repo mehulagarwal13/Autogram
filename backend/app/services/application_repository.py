@@ -16,13 +16,19 @@ constraint (`uq_applications_user_job_url`), the same pattern
 from __future__ import annotations
 
 import hashlib
+import logging
+import shutil
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
+from app.core.config import AUTOMATION_LOGS_DIR
 from app.models.db_models import Application, AutomationRun, VALID_APPLICATION_STATUSES
+
+logger = logging.getLogger(__name__)
 
 # HITL platform — every DB status mapped to the cleaner vocabulary the
 # dashboard/API expose (`ApplicationResponse.display_status`). Purely a
@@ -65,6 +71,33 @@ def compute_job_url_hash(job_url: str) -> str:
 
 def get_by_id(db: Session, application_id: str) -> Application | None:
     return db.query(Application).filter(Application.application_id == application_id).first()
+
+
+def delete(db: Session, application: Application) -> None:
+    """Hard-deletes this application and everything scoped to it —
+    `AutomationRun`/`ApplicationQuestion`/`ApplicationAuditLog`/`ChatMessage`
+    all declare `ondelete="CASCADE"` on their `application_id` FK
+    (`app/models/db_models.py`), so the database removes them too. Callers
+    (`app/api/applications.py::delete_application`) are responsible for
+    stopping any live automation and closing any open review-session browser
+    FIRST.
+
+    Also removes `logs/<application_id>/` (screenshots, trace, error log) —
+    best-effort: unlike the scheduled retention purge
+    (`app/services/retention_service.py`, which never deletes a DB row until
+    its file is confirmed gone, to avoid ever orphaning a file with nothing
+    left tracking it), a user's explicit "delete this application" already
+    commits to removing the DB row regardless of what happens on disk, so a
+    locked/permission-denied file is logged and skipped rather than blocking
+    the deletion the user asked for."""
+    run_dir = Path(AUTOMATION_LOGS_DIR) / application.application_id
+    if run_dir.exists():
+        try:
+            shutil.rmtree(run_dir)
+        except OSError:
+            logger.warning("Could not remove %s while deleting application %s — DB row deleted anyway.", run_dir, application.application_id)
+    db.delete(application)
+    db.commit()
 
 
 #: Statuses where an attempt never actually submitted and is therefore

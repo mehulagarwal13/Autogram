@@ -90,6 +90,11 @@ AUTOMATION_HEADLESS = os.getenv("AUTOMATION_HEADLESS", "true").strip().lower() !
 AUTOMATION_SESSION_DIR = os.getenv("AUTOMATION_SESSION_DIR", "storage/automation_sessions")
 # Screenshots / traces / error logs per application run (see ARCHITECTURE.md §14).
 AUTOMATION_LOGS_DIR = os.getenv("AUTOMATION_LOGS_DIR", "logs")
+# §9 data retention — how often the purge job runs. Unlike JOB_SYNC_*, this
+# is NOT opt-in: retention windows have safe defaults (see
+# app/services/retention_repository.py) and the job always runs, so there is
+# no env var that turns it off entirely — only how often.
+RETENTION_PURGE_INTERVAL_HOURS = int(os.getenv("RETENTION_PURGE_INTERVAL_HOURS", "24"))
 # Vision fallback (automation/forms/vision_fallback.py): after every cheaper
 # pass has run, screenshot the required fields that are STILL empty and ask a
 # vision model to read them. On by default — the fields it exists for (a
