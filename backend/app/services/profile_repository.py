@@ -71,6 +71,7 @@ def profile_to_dict(profile: CandidateProfile) -> dict:
         "address": decrypt_field(profile.address_encrypted),
         "skills": profile.skills,
         "autopilot_globally_disabled": profile.autopilot_globally_disabled,
+        "default_trust_level": profile.default_trust_level,
         "created_at": profile.created_at,
         "updated_at": profile.updated_at,
     }
@@ -102,13 +103,26 @@ def update_profile(db: Session, profile: CandidateProfile, data: dict) -> Candid
     return profile
 
 
-def update_automation_settings(db: Session, profile: CandidateProfile, *, autopilot_globally_disabled: bool) -> CandidateProfile:
+def update_automation_settings(
+    db: Session, profile: CandidateProfile, *,
+    autopilot_globally_disabled: bool, default_trust_level: str | None = None,
+) -> CandidateProfile:
     """The account-level autopilot kill switch (PHASE2_ARCHITECTURE.md
-    Initiative 3) — deliberately its own function, not folded into
-    `update_profile`/`_apply_profile_fields`, so it can never be flipped as a
+    Initiative 3) plus, optionally, the §6.4 default trust level for
+    newly-seen sites — deliberately its own function, not folded into
+    `update_profile`/`_apply_profile_fields`, so neither can be flipped as a
     side effect of an unrelated `PATCH /profile` call. The only write path is
-    `PUT /profile/automation-settings`."""
+    `PUT /profile/automation-settings`.
+
+    `default_trust_level=None` (the default) leaves the stored value
+    unchanged — the request model makes this field optional for exactly that
+    reason, so the kill-switch-only caller this endpoint originally served
+    keeps working without having to also resend a trust level it doesn't
+    know about. Caller (the API route) is responsible for validating the
+    value against `VALID_TRUST_LEVELS` before calling this."""
     profile.autopilot_globally_disabled = autopilot_globally_disabled
+    if default_trust_level is not None:
+        profile.default_trust_level = default_trust_level
     profile.updated_at = datetime.now(timezone.utc)
     db.commit()
     db.refresh(profile)

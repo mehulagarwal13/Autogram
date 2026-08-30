@@ -56,6 +56,7 @@ from app.services import (
     audit_log_repository,
     automation_ownership,
     profile_repository,
+    trust_level_repository,
 )
 from app.services.event_bus import publish_application_event
 from automation.applications import verification_channel
@@ -854,6 +855,17 @@ def _is_kill_switch_engaged(user_id: str) -> bool:
         session.close()
 
 
+def _resolve_trust_level_for(user_id: str, job_url: str) -> str:
+    """§6.4 trust levels: fresh DB read every call, same reasoning as the
+    kill switch above — a trust-level change the user makes mid-run takes
+    effect on the very next decision point, not just future runs."""
+    session = SessionLocal()
+    try:
+        return trust_level_repository.resolve_trust_level(session, user_id, job_url)
+    finally:
+        session.close()
+
+
 # ------------------------------------------------------------------
 # Background task — the actual app.api -> automation handoff
 # ------------------------------------------------------------------
@@ -998,6 +1010,7 @@ def _run_application(application_id: str, resume_document_id: str, job_descripti
             vision_answerer=vision_answerer,
             on_waiting_for_human=lambda reason: _mark_waiting_for_human(application_id, reason),
             is_kill_switch_engaged=lambda: _is_kill_switch_engaged(application.user_id),
+            resolve_trust_level=lambda: _resolve_trust_level_for(application.user_id, application.job_url),
         )
         # See _run_on_dedicated_thread's docstring: Playwright's sync API
         # must run on a thread that was never touched by asyncio AND won't

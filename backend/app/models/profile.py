@@ -150,6 +150,8 @@ class ProfileResponse(BaseModel):
     # /profile payload) may change this, so a routine profile edit can never
     # accidentally flip the account-level autopilot kill switch.
     autopilot_globally_disabled: bool = False
+    #: §6.4 — same read-only-except-via-automation-settings rule as above.
+    default_trust_level: str = "FULL_MANUAL_REVIEW"
     created_at: datetime | None = None
     updated_at: datetime | None = None
 
@@ -158,12 +160,32 @@ class ProfileResponse(BaseModel):
 
 class AutomationSettingsRequest(BaseModel):
     autopilot_globally_disabled: bool
+    #: §6.4 trust levels — the level applied to a domain the FIRST time this
+    #: user's automation ever sees it. `None` (the default) means "leave it
+    #: as-is" — this field is optional so the existing single-purpose caller
+    #: (the kill-switch toggle) keeps working unchanged.
+    default_trust_level: str | None = None
 
 
 class AutomationSettingsResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     autopilot_globally_disabled: bool
+    default_trust_level: str
+
+
+# ---------- site trust levels (§6.4) ----------
+
+class SiteTrustLevelRequest(BaseModel):
+    trust_level: str
+
+
+class SiteTrustLevelResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    domain: str
+    trust_level: str
+    updated_at: datetime | None = None
 
 
 # ---------- education ----------

@@ -100,7 +100,7 @@ from automation.browser.selectors import (
 )
 from automation.forms.answer_engine import ApplicationAnswerEngine
 from automation.forms.vision_fallback import VisionFormAnswerer
-from automation.interfaces import ApplicationRunResult, CandidateProfile, ProfileDocument
+from automation.interfaces import ApplicationRunResult, CandidateProfile, ProfileDocument, VALID_TRUST_LEVELS
 
 logger = logging.getLogger(__name__)
 
@@ -292,18 +292,34 @@ class _PageProgress:
     vision_confirmed: set[str] = _dc_field(default_factory=set)
 
 
-def decide_action(confidence: float, ats_platform: str, autopilot_enabled: bool) -> str:
+def decide_action(
+    confidence: float, ats_platform: str, autopilot_enabled: bool,
+    trust_level: str = "FULL_MANUAL_REVIEW",
+) -> str:
     """The exact decision table from ARCHITECTURE.md, as a standalone,
     independently testable function:
 
     - `AUTO_SUBMIT` only when the user opted in AND the platform is public
-      (no login) AND confidence clears the high bar.
+      (no login) AND confidence clears the high bar AND — §6.4 — this job
+      posting's site is trusted for auto-submit (`trust_level ==
+      "TRUSTED_AUTO_SUBMIT"`). Trust is an ADDITIONAL required condition,
+      never a bypass of the other three: a trusted site with a low-confidence
+      fill still lands in review, exactly as an untrusted one would.
     - `NEEDS_REVIEW` when confidence is too low to trust at all.
     - `COPILOT_REVIEW` otherwise — form is filled, a human clicks submit.
+
+    `trust_level` defaults to the safe value on purpose: any caller that
+    doesn't explicitly resolve one (existing tests, a bare/legacy call site)
+    gets today's always-review behavior, never a silent opt-in to auto-submit.
+    `FULL_MANUAL_REVIEW` and `DRAFT_ONLY` currently produce identical output
+    here — see `VALID_TRUST_LEVELS`'s docstring for why that's not an
+    oversight. An unrecognized value is treated the same as
+    `FULL_MANUAL_REVIEW` (fail closed), never as `TRUSTED_AUTO_SUBMIT`.
     """
     high_confidence = confidence >= AUTO_SUBMIT_CONFIDENCE_THRESHOLD
     is_public_ats = ats_platform in PUBLIC_ATS_PLATFORMS
-    if autopilot_enabled and is_public_ats and high_confidence:
+    is_trusted = trust_level == "TRUSTED_AUTO_SUBMIT"
+    if autopilot_enabled and is_public_ats and high_confidence and is_trusted:
         return "AUTO_SUBMIT"
     if confidence < NEEDS_REVIEW_CONFIDENCE_THRESHOLD:
         return "NEEDS_REVIEW"
@@ -358,6 +374,7 @@ class ApplicationFlowManager:
         vision_answerer: VisionFormAnswerer | None = None,
         on_waiting_for_human: Callable[[str], None] | None = None,
         is_kill_switch_engaged: Callable[[], bool] | None = None,
+        resolve_trust_level: Callable[[], str] | None = None,
         human_wait_timeout_s: float = AUTOMATION_HUMAN_WAIT_TIMEOUT_S,
     ) -> None:
         self.application_id = application_id
@@ -409,6 +426,10 @@ class ApplicationFlowManager:
         # see `_kill_switch_engaged` for the fail-closed contract.
         self.on_waiting_for_human = on_waiting_for_human
         self.is_kill_switch_engaged = is_kill_switch_engaged
+        # §6.4 trust levels: resolved fresh at the decision point (not cached
+        # here), since `resolve_trust_level` may read per-site config; see
+        # `_resolve_trust_level` for the fail-safe contract.
+        self.resolve_trust_level = resolve_trust_level
         # Overridable per instance (defaults to the configured production
         # value) so tests exercising a gate that never clears — the common
         # case — don't have to burn real wall-clock time; pass a small value
@@ -788,11 +809,12 @@ class ApplicationFlowManager:
                 pages_completed=pages_processed,
             )
 
-        action = decide_action(confidence, self.ats_platform, self.autopilot_enabled)
+        trust_level = self._resolve_trust_level()
+        action = decide_action(confidence, self.ats_platform, self.autopilot_enabled, trust_level)
         self.checkpoint(f"decision_{action.lower()}")
         logger.info(
-            "application %s: decision=%s (confidence=%.4f, autopilot_enabled=%s, ats_platform=%s)",
-            self.application_id, action, confidence, self.autopilot_enabled, self.ats_platform,
+            "application %s: decision=%s (confidence=%.4f, autopilot_enabled=%s, ats_platform=%s, trust_level=%s)",
+            self.application_id, action, confidence, self.autopilot_enabled, self.ats_platform, trust_level,
         )
 
         error_log: str | None = None
@@ -1655,6 +1677,25 @@ class ApplicationFlowManager:
                 self.application_id,
             )
             return True
+
+    def _resolve_trust_level(self) -> str:
+        """Fail SAFE (not closed like the kill switch, since there's no
+        "engaged" state to fall back to): no callback, an unrecognized
+        value, or a raising callback all resolve to `FULL_MANUAL_REVIEW` —
+        the one value that can never enable auto-submit — so a broken or
+        unwired trust-level check degrades to today's always-review
+        behavior, never to a silent opt-in."""
+        if self.resolve_trust_level is None:
+            return "FULL_MANUAL_REVIEW"
+        try:
+            level = self.resolve_trust_level()
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "application %s: trust level check failed — falling back to FULL_MANUAL_REVIEW.",
+                self.application_id,
+            )
+            return "FULL_MANUAL_REVIEW"
+        return level if level in VALID_TRUST_LEVELS else "FULL_MANUAL_REVIEW"
 
     def _safe_find_next_control(self, adapter: ATSAdapter) -> Locator | None:
         try:

@@ -36,7 +36,7 @@ from app.models.application import (
     PacingConfig,
 )
 from app.models.db_models import User, confidence_level_for
-from app.services import application_repository, profile_repository
+from app.services import application_repository, profile_repository, trust_level_repository
 from automation.applications.application_flow_manager import (
     AUTO_SUBMIT_CONFIDENCE_THRESHOLD,
     NEEDS_REVIEW_CONFIDENCE_THRESHOLD,
@@ -68,7 +68,8 @@ def map_fields(
     `action` comes from `decide_action()` — the SAME function the
     server-side Playwright engine's `_run_on_page` calls — never a
     reimplementation, so the two actuators can never disagree about whether
-    a given form should auto-submit."""
+    a given form should auto-submit. Same for the §6.4 trust level it's
+    given: resolved fresh from the DB, never cached across this request."""
     application = application_repository.get_by_id(db, body.application_id)
     if application is None or application.user_id != user.user_id:
         raise HTTPException(status_code=404, detail="Application not found.")
@@ -105,7 +106,8 @@ def map_fields(
     # decide on" — 0.0, same as the Playwright engine's own empty case.
     usable = sum(1 for f in mapped if f.confidence_level in ("HIGH", "MEDIUM"))
     overall_confidence = round(usable / len(mapped), 4) if mapped else 0.0
-    action = decide_action(overall_confidence, application.ats_platform or "custom", application.autopilot_enabled)
+    trust_level = trust_level_repository.resolve_trust_level(db, user.user_id, application.job_url)
+    action = decide_action(overall_confidence, application.ats_platform or "custom", application.autopilot_enabled, trust_level)
 
     return FieldMapResponse(fields=mapped, overall_confidence=overall_confidence, action=action)
 
@@ -122,12 +124,19 @@ def decide(
     with `POST /automation/map-fields`' results for whatever was left. The
     combining is plain arithmetic (a fraction of usable fields); the actual
     submission decision is not — that always comes from this one function,
-    never reimplemented client-side."""
+    never reimplemented client-side.
+
+    §6.4: resolves this job's trust level the same way the Playwright engine
+    does (`app/api/applications.py::_resolve_trust_level_for`) — the
+    extension is a second, parallel automation surface, and its own
+    auto-submit gate must honor the same per-site trust the user set,
+    fresh from the DB every call, same as the kill switch below it."""
     application = application_repository.get_by_id(db, body.application_id)
     if application is None or application.user_id != user.user_id:
         raise HTTPException(status_code=404, detail="Application not found.")
 
-    action = decide_action(body.overall_confidence, application.ats_platform or "custom", application.autopilot_enabled)
+    trust_level = trust_level_repository.resolve_trust_level(db, user.user_id, application.job_url)
+    action = decide_action(body.overall_confidence, application.ats_platform or "custom", application.autopilot_enabled, trust_level)
     return DecideResponse(action=action, overall_confidence=body.overall_confidence)
 
 
