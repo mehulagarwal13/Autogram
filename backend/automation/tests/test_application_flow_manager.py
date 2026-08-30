@@ -487,6 +487,8 @@ def test_run_auto_submits_on_high_confidence_public_ats(requires_chromium, tmp_p
         resume_document=_resume_document(tmp_path / "resume.pdf"),
         browser_manager=_isolated_browser_manager(tmp_path),
         autopilot_enabled=True,
+        # §6.4: AUTO_SUBMIT now additionally requires a trusted site.
+        resolve_trust_level=lambda: "TRUSTED_AUTO_SUBMIT",
     )
 
     result = manager.run()
@@ -1096,6 +1098,8 @@ def test_run_reports_applied_only_when_submission_is_confirmed(requires_chromium
         resume_document=_resume_document(tmp_path / "resume.pdf"),
         browser_manager=_isolated_browser_manager(tmp_path),
         autopilot_enabled=True,
+        # §6.4: AUTO_SUBMIT now additionally requires a trusted site.
+        resolve_trust_level=lambda: "TRUSTED_AUTO_SUBMIT",
     )
 
     result = manager.run()
@@ -1124,6 +1128,8 @@ def test_run_does_not_claim_applied_when_submission_cannot_be_confirmed(requires
         resume_document=_resume_document(tmp_path / "resume.pdf"),
         browser_manager=_isolated_browser_manager(tmp_path),
         autopilot_enabled=True,
+        # §6.4: AUTO_SUBMIT now additionally requires a trusted site.
+        resolve_trust_level=lambda: "TRUSTED_AUTO_SUBMIT",
     )
 
     result = manager.run()
@@ -1470,6 +1476,8 @@ def test_run_walks_an_application_of_any_length_to_its_final_page(requires_chrom
         resume_document=_resume_document(tmp_path / "resume.pdf"),
         browser_manager=_isolated_browser_manager(tmp_path),
         autopilot_enabled=True,
+        # §6.4: AUTO_SUBMIT now additionally requires a trusted site.
+        resolve_trust_level=lambda: "TRUSTED_AUTO_SUBMIT",
     )
 
     result = manager.run()
