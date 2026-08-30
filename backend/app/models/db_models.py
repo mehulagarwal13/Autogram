@@ -54,6 +54,14 @@ VALID_QUESTION_SOURCES = {"profile", "answer_memory", "llm", "vision", "needs_us
 VALID_CONFIDENCE_LEVELS = {"HIGH", "MEDIUM", "LOW"}
 VALID_QUESTION_REVIEW_STATUSES = {"auto_filled", "pending_review", "approved", "edited", "rejected"}
 
+# §6.4 trust levels — see `SiteTrustLevel` and
+# `automation/applications/application_flow_manager.py::decide_action`.
+# FULL_MANUAL_REVIEW and DRAFT_ONLY currently produce the identical runtime
+# decision (`decide_action` never returns AUTO_SUBMIT for either) — the
+# distinction today is the label/intent a user chose, not a code branch;
+# only TRUSTED_AUTO_SUBMIT changes what the flow manager actually does.
+VALID_TRUST_LEVELS = {"FULL_MANUAL_REVIEW", "TRUSTED_AUTO_SUBMIT", "DRAFT_ONLY"}
+
 HIGH_CONFIDENCE_THRESHOLD = 0.85   # mirrors ApplicationFlowManager.AUTO_SUBMIT_CONFIDENCE_THRESHOLD
 LOW_CONFIDENCE_THRESHOLD = 0.6     # mirrors ApplicationFlowManager.NEEDS_REVIEW_CONFIDENCE_THRESHOLD
 
@@ -346,6 +354,14 @@ class CandidateProfile(Base):
     # fails CLOSED (DB unreachable == treated as engaged) — see
     # `app/api/applications.py::_is_kill_switch_engaged`.
     autopilot_globally_disabled = Column(Boolean, nullable=False, default=False)
+
+    # §6.4 trust levels — the default applied to a job posting's domain the
+    # FIRST time this user's automation ever sees it. A per-domain override
+    # (see `SiteTrustLevel` below) always wins once one exists; this is only
+    # the starting point for a domain with no override yet. Deliberately the
+    # safest value by default (`FULL_MANUAL_REVIEW`) — see
+    # `VALID_TRUST_LEVELS` for what each value does to `decide_action()`.
+    default_trust_level = Column(String, nullable=False, default="FULL_MANUAL_REVIEW")
 
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
@@ -909,3 +925,36 @@ class ChatMessage(Base):
     safe_metadata = Column(JSONB, nullable=True)
 
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), index=True)
+
+
+# --- §6.4 trust levels -------------------------------------------------------
+
+class SiteTrustLevel(Base):
+    """One row per (user, domain) the user has explicitly set a trust level
+    for — see `VALID_TRUST_LEVELS` and
+    `automation/applications/application_flow_manager.py::decide_action`.
+    `domain` is the job posting's hostname (`urlparse(job_url).hostname`,
+    e.g. `"boards.greenhouse.io"`), not a company name or the resolved ATS
+    platform — two different employers on the same ATS host share one trust
+    setting, which is deliberate: the trust decision is about the SITE
+    running the automation, not the employer.
+
+    A domain with no row here falls back to
+    `CandidateProfile.default_trust_level` — new users and newly-seen
+    domains always start at `FULL_MANUAL_REVIEW` (the safe default), and
+    nothing here is ever created automatically; only an explicit user action
+    (`PUT /profile/site-trust-levels/{domain}`) writes one.
+    """
+
+    __tablename__ = "site_trust_levels"
+    __table_args__ = (
+        UniqueConstraint("user_id", "domain", name="uq_site_trust_levels_user_domain"),
+    )
+
+    trust_id = Column(String, primary_key=True)
+    user_id = Column(String, ForeignKey("users.user_id", ondelete="CASCADE"), nullable=False, index=True)
+    domain = Column(String, nullable=False)
+    trust_level = Column(String, nullable=False, default="FULL_MANUAL_REVIEW")  # see VALID_TRUST_LEVELS
+
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))

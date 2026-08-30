@@ -133,6 +133,14 @@ export const api = {
       method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
     }),
 
+  listSiteTrustLevels: () => request("/profile/site-trust-levels"),
+  setSiteTrustLevel: (domain, trustLevel) =>
+    request(`/profile/site-trust-levels/${encodeURIComponent(domain)}`, {
+      method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ trust_level: trustLevel }),
+    }),
+  deleteSiteTrustLevel: (domain) =>
+    request(`/profile/site-trust-levels/${encodeURIComponent(domain)}`, { method: "DELETE" }),
+
   listEducation: () => request("/profile/education"),
   addEducation: (body) =>
     request("/profile/education", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }),

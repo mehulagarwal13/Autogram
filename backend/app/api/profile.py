@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import logging
 
-from fastapi import APIRouter, Body, Depends, File, HTTPException, UploadFile
+from fastapi import APIRouter, Body, Depends, File, HTTPException, Response, UploadFile
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
@@ -28,6 +28,7 @@ from app.models.db_models import (
     VALID_GENDER_VALUES,
     VALID_LANGUAGE_PROFICIENCIES,
     VALID_REMOTE_PREFERENCES,
+    VALID_TRUST_LEVELS,
     VALID_VETERAN_STATUS_VALUES,
 )
 from app.models.profile import (
@@ -45,9 +46,12 @@ from app.models.profile import (
     MAX_EXPERIENCE_BATCH,
     ProfileResponse,
     ProfileUpsertRequest,
+    SiteTrustLevelRequest,
+    SiteTrustLevelResponse,
     SkillsRequest,
 )
 from app.services import profile_repository as repo
+from app.services import trust_level_repository
 from app.services.document_storage import (
     MAX_FILE_SIZE_MB,
     compute_file_hash,
@@ -362,9 +366,51 @@ def update_automation_settings(
     """The account-level autopilot kill switch: when `autopilot_globally_disabled`
     is `True`, every autopilot run for this user hard-stops (checked fresh from
     the DB at the top of every page in `ApplicationFlowManager`'s loop, fail
-    closed) regardless of any per-application `autopilot_enabled` flag."""
+    closed) regardless of any per-application `autopilot_enabled` flag.
+
+    `default_trust_level`, if given, is the §6.4 level applied to a domain
+    the FIRST time this user's automation ever sees it — validated here
+    (never trusted from the request body unchecked) before it can reach
+    `decide_action`'s auto-submit gate."""
+    if body.default_trust_level is not None and body.default_trust_level not in VALID_TRUST_LEVELS:
+        raise HTTPException(status_code=400, detail=f"Invalid trust level. Must be one of {sorted(VALID_TRUST_LEVELS)}.")
     profile = _get_owned_profile(db, user)
-    return repo.update_automation_settings(db, profile, autopilot_globally_disabled=body.autopilot_globally_disabled)
+    return repo.update_automation_settings(
+        db, profile,
+        autopilot_globally_disabled=body.autopilot_globally_disabled,
+        default_trust_level=body.default_trust_level,
+    )
+
+
+# ---------- site trust levels (§6.4) ----------
+
+@router.get("/site-trust-levels", response_model=list[SiteTrustLevelResponse])
+def list_site_trust_levels(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Every domain this user has explicitly set a trust level for — a
+    domain with no row here still has a real, effective trust level (the
+    account's `default_trust_level`), it's just not listed individually."""
+    return trust_level_repository.list_trust_levels(db, user.user_id)
+
+
+@router.put("/site-trust-levels/{domain}", response_model=SiteTrustLevelResponse)
+def set_site_trust_level(
+    domain: str,
+    body: SiteTrustLevelRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    try:
+        return trust_level_repository.set_trust_level(db, user.user_id, domain, body.trust_level)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.delete("/site-trust-levels/{domain}", status_code=204)
+def delete_site_trust_level(domain: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Removes the override — the domain reverts to the account's
+    `default_trust_level`, not to any hardcoded value."""
+    trust_level_repository.delete_trust_level(db, user.user_id, domain)
+    return Response(status_code=204)
 
 
 # ---------- documents ----------
