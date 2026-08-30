@@ -133,6 +133,13 @@ export const api = {
       method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
     }),
 
+  getRetentionPolicy: () => request("/profile/retention-policy"),
+  updateRetentionPolicy: (body) =>
+    request("/profile/retention-policy", {
+      method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+    }),
+  purgeRetentionNow: () => request("/profile/retention-policy/purge-now", { method: "POST" }),
+
   listEducation: () => request("/profile/education"),
   addEducation: (body) =>
     request("/profile/education", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }),

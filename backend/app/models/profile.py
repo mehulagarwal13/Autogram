@@ -166,6 +166,36 @@ class AutomationSettingsResponse(BaseModel):
     autopilot_globally_disabled: bool
 
 
+# ---------- data retention (§9) ----------
+
+class RetentionPolicyRequest(BaseModel):
+    #: `None` (the default) leaves that window unchanged — a caller only
+    #: sends the field(s) they're actually updating. No `document_retention_
+    #: days` here — see `app/services/retention_service.py`'s module
+    #: docstring for why that category doesn't exist.
+    screenshot_retention_days: int | None = None
+    run_history_retention_days: int | None = None
+    hitl_request_retention_days: int | None = None
+
+
+class RetentionPolicyResponse(BaseModel):
+    screenshot_retention_days: int
+    run_history_retention_days: int
+    hitl_request_retention_days: int
+
+
+class RetentionPurgeResult(BaseModel):
+    category: str
+    records_purged: int
+    files_deleted: int
+    files_failed: int
+    error: str | None = None
+
+
+class RetentionPurgeNowResponse(BaseModel):
+    results: list[RetentionPurgeResult]
+
+
 # ---------- education ----------
 
 class EducationRequest(BaseModel):

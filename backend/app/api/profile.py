@@ -45,9 +45,13 @@ from app.models.profile import (
     MAX_EXPERIENCE_BATCH,
     ProfileResponse,
     ProfileUpsertRequest,
+    RetentionPolicyRequest,
+    RetentionPolicyResponse,
+    RetentionPurgeNowResponse,
     SkillsRequest,
 )
 from app.services import profile_repository as repo
+from app.services import retention_repository, retention_service
 from app.services.document_storage import (
     MAX_FILE_SIZE_MB,
     compute_file_hash,
@@ -365,6 +369,53 @@ def update_automation_settings(
     closed) regardless of any per-application `autopilot_enabled` flag."""
     profile = _get_owned_profile(db, user)
     return repo.update_automation_settings(db, profile, autopilot_globally_disabled=body.autopilot_globally_disabled)
+
+
+# ---------- data retention (§9) ----------
+
+def _policy_response(policy) -> RetentionPolicyResponse:
+    return RetentionPolicyResponse(
+        screenshot_retention_days=policy.screenshot_retention_days,
+        run_history_retention_days=policy.run_history_retention_days,
+        hitl_request_retention_days=policy.hitl_request_retention_days,
+    )
+
+
+@router.get("/retention-policy", response_model=RetentionPolicyResponse)
+def get_retention_policy(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """A user who has never customized this sees the global defaults, not a
+    404 — see `retention_repository.get_policy`."""
+    return _policy_response(retention_repository.get_policy(db, user.user_id))
+
+
+@router.put("/retention-policy", response_model=RetentionPolicyResponse)
+def update_retention_policy(
+    body: RetentionPolicyRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    for days, label in (
+        (body.screenshot_retention_days, "Screenshot"),
+        (body.run_history_retention_days, "Run history"),
+        (body.hitl_request_retention_days, "Verification-request"),
+    ):
+        if days is not None and days < 1:
+            raise HTTPException(status_code=400, detail=f"{label} retention must be at least 1 day.")
+    row = retention_repository.update_policy(
+        db, user.user_id,
+        screenshot_retention_days=body.screenshot_retention_days,
+        run_history_retention_days=body.run_history_retention_days,
+        hitl_request_retention_days=body.hitl_request_retention_days,
+    )
+    return _policy_response(row)
+
+
+@router.post("/retention-policy/purge-now", response_model=RetentionPurgeNowResponse)
+def purge_retention_now(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Runs this user's own retention windows immediately, scoped to their
+    own data only — the same purge logic the scheduled job runs for
+    everyone, see `app/services/retention_service.py`."""
+    return RetentionPurgeNowResponse(results=retention_service.run_purge_for_user(db, user.user_id))
 
 
 # ---------- documents ----------

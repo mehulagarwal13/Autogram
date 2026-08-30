@@ -909,3 +909,57 @@ class ChatMessage(Base):
     safe_metadata = Column(JSONB, nullable=True)
 
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), index=True)
+
+
+# --- §9 data retention --------------------------------------------------------
+
+class RetentionPolicy(Base):
+    """One row per user who has customized their retention windows — a
+    missing row means "use the global defaults" (the same values these
+    columns default to), so a user who never touches this setting is
+    indistinguishable, at the DB level, from one who explicitly confirmed
+    the defaults. See `app/services/retention_repository.py`.
+
+    There is deliberately no `document_retention_days` column — a résumé is
+    always a reference to the user's own permanent document library
+    (`ProfileDocument`), never a per-application generated file, so there is
+    nothing to purge on a schedule (see `retention_service.py`'s module
+    docstring for the full reasoning, and
+    `automation/tests/test_retention_service.py::
+    test_retention_purge_never_touches_profile_documents` for the invariant
+    guard). Add it back — with real enforcement, not just the column — if
+    per-application document generation ever exists.
+    """
+
+    __tablename__ = "retention_policies"
+
+    user_id = Column(String, ForeignKey("users.user_id", ondelete="CASCADE"), primary_key=True)
+
+    screenshot_retention_days = Column(Integer, nullable=False, default=30)
+    run_history_retention_days = Column(Integer, nullable=False, default=90)
+    hitl_request_retention_days = Column(Integer, nullable=False, default=14)
+
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+
+
+class RetentionPurgeLog(Base):
+    """Append-only record of what the retention purge job actually did, one
+    row per (run, category) — e.g. a nightly run writes up to four rows
+    (screenshots / run_history / hitl_requests / purge_log itself). This is
+    itself subject to a retention rule (`PURGE_LOG_RETENTION_DAYS` in
+    `retention_service.py`), which is why it has no FK to any user: these
+    rows describe a SYSTEM-wide job execution across every user in one pass,
+    not one user's own history (a per-user manual purge, triggered via
+    `POST /profile/retention-policy/purge-now`, still writes here the same
+    way, scoped to that one user's counts)."""
+
+    __tablename__ = "retention_purge_log"
+
+    purge_id = Column(String, primary_key=True)
+    run_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), index=True)
+    category = Column(String, nullable=False)  # "screenshots" | "run_history" | "hitl_requests" | "purge_log"
+    records_purged = Column(Integer, nullable=False, default=0)
+    files_deleted = Column(Integer, nullable=False, default=0)
+    files_failed = Column(Integer, nullable=False, default=0)
+    error = Column(Text, nullable=True)

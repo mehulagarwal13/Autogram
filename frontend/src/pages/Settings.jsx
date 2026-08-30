@@ -1,14 +1,31 @@
 import { useEffect, useState } from "react";
-import { ShieldOff, ShieldCheck, Loader2 } from "lucide-react";
+import { ShieldOff, ShieldCheck, Loader2, Clock, Trash } from "lucide-react";
 import { api } from "../api";
+
+const RETENTION_FIELDS = [
+  { key: "screenshot_retention_days", label: "Screenshots", hint: "Field-fill screenshots and vision-fallback crops." },
+  { key: "run_history_retention_days", label: "Run history", hint: "Step-by-step logs, traces, and per-run detail." },
+  { key: "hitl_request_retention_days", label: "Verification requests", hint: "Concluded OTP/CAPTCHA/login pauses. Never a code itself — those are never stored." },
+];
 
 export default function Settings({ toast }) {
   const [profile, setProfile] = useState(null);
+  const [retentionPolicy, setRetentionPolicy] = useState(null);
+  const [retentionDraft, setRetentionDraft] = useState(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
+  const [savingRetention, setSavingRetention] = useState(false);
+  const [purging, setPurging] = useState(false);
 
   useEffect(() => {
-    api.getProfile().then(setProfile).catch(() => setProfile(null)).finally(() => setLoading(false));
+    Promise.all([
+      api.getProfile().catch(() => null),
+      api.getRetentionPolicy().catch(() => null),
+    ]).then(([p, policy]) => {
+      setProfile(p);
+      setRetentionPolicy(policy);
+      setRetentionDraft(policy);
+    }).finally(() => setLoading(false));
   }, []);
 
   async function toggleKillSwitch() {
@@ -24,6 +41,39 @@ export default function Settings({ toast }) {
       toast(e.message, "error");
     } finally {
       setSaving(false);
+    }
+  }
+
+  const retentionDirty = retentionPolicy && retentionDraft && RETENTION_FIELDS.some(
+    (f) => Number(retentionDraft[f.key]) !== retentionPolicy[f.key],
+  );
+
+  async function saveRetentionPolicy() {
+    setSavingRetention(true);
+    try {
+      const body = Object.fromEntries(RETENTION_FIELDS.map((f) => [f.key, Number(retentionDraft[f.key])]));
+      const updated = await api.updateRetentionPolicy(body);
+      setRetentionPolicy(updated);
+      setRetentionDraft(updated);
+      toast("Retention windows updated.", "success");
+    } catch (e) {
+      toast(e.message, "error");
+    } finally {
+      setSavingRetention(false);
+    }
+  }
+
+  async function purgeNow() {
+    if (!window.confirm("Purge everything past your retention windows right now? This cannot be undone.")) return;
+    setPurging(true);
+    try {
+      const { results } = await api.purgeRetentionNow();
+      const total = results.reduce((sum, r) => sum + r.records_purged, 0);
+      toast(total > 0 ? `Purged ${total} record(s).` : "Nothing was past its retention window.", "success");
+    } catch (e) {
+      toast(e.message, "error");
+    } finally {
+      setPurging(false);
     }
   }
 
@@ -61,6 +111,60 @@ export default function Settings({ toast }) {
             >
               {saving ? <Loader2 size={15} className="animate-spin" /> : null}
               {disabled ? "Disabled — Re-enable" : "Enabled — Disable Autopilot"}
+            </button>
+          </div>
+        </div>
+      )}
+
+      {retentionDraft && (
+        <div className="card p-6">
+          <div className="flex items-start gap-3">
+            <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-slate-50">
+              <Clock size={18} className="text-slate-500" />
+            </div>
+            <div>
+              <p className="font-semibold text-slate-900">Data Retention</p>
+              <p className="mt-1 max-w-lg text-sm text-slate-500">
+                How long Autogram keeps screenshots, run history, and verification-request records after an
+                application or task finishes. Checked nightly — nothing still in progress is ever touched.
+              </p>
+            </div>
+          </div>
+
+          <div className="mt-4 grid gap-3 sm:grid-cols-3">
+            {RETENTION_FIELDS.map((field) => (
+              <div key={field.key}>
+                <label className="eyebrow" htmlFor={field.key}>{field.label}</label>
+                <div className="mt-1 flex items-center gap-1.5">
+                  <input
+                    id={field.key}
+                    type="number"
+                    min={1}
+                    value={retentionDraft[field.key]}
+                    onChange={(e) => setRetentionDraft((d) => ({ ...d, [field.key]: e.target.value }))}
+                    className="input !w-20"
+                  />
+                  <span className="text-xs text-slate-400">days</span>
+                </div>
+                <p className="mt-1 text-xs text-slate-400">{field.hint}</p>
+              </div>
+            ))}
+          </div>
+
+          <div className="mt-4 flex flex-wrap items-center gap-2 border-t border-slate-100 pt-4">
+            <button
+              className="btn-primary !px-3 !py-1.5 text-xs"
+              disabled={!retentionDirty || savingRetention}
+              onClick={saveRetentionPolicy}
+            >
+              {savingRetention ? <Loader2 size={13} className="animate-spin" /> : "Save windows"}
+            </button>
+            <button
+              className="btn-ghost !px-3 !py-1.5 text-xs text-red-600 hover:bg-red-50"
+              disabled={purging}
+              onClick={purgeNow}
+            >
+              <Trash size={13} /> {purging ? "Purging…" : "Purge now"}
             </button>
           </div>
         </div>
