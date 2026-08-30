@@ -1684,8 +1684,22 @@ class ApplicationFlowManager:
         value, or a raising callback all resolve to `FULL_MANUAL_REVIEW` —
         the one value that can never enable auto-submit — so a broken or
         unwired trust-level check degrades to today's always-review
-        behavior, never to a silent opt-in."""
+        behavior, never to a silent opt-in.
+
+        Deliberately optional rather than required: the one production call
+        site (`app/api/applications.py::_run_application`) always wires this;
+        every other construction site is a test exercising something else
+        entirely (OTP entry, an unresolvable blocker, ...) that never reaches
+        this method. A required parameter would force ~25 unrelated test
+        call sites to supply a value they don't care about, for no real
+        safety gain over this debug line — see `decide_action`'s own
+        docstring for why `FULL_MANUAL_REVIEW` is the correct universal
+        fallback, not just a placeholder."""
         if self.resolve_trust_level is None:
+            logger.debug(
+                "application %s: no resolve_trust_level callback provided — defaulting to FULL_MANUAL_REVIEW.",
+                self.application_id,
+            )
             return "FULL_MANUAL_REVIEW"
         try:
             level = self.resolve_trust_level()
