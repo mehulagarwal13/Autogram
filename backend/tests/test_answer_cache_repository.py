@@ -8,6 +8,8 @@ approach `tests/test_application_repository.py` uses.
 
 from unittest.mock import MagicMock
 
+import pytest
+
 from app.services.answer_cache_repository import (
     SEMANTIC_SIMILARITY_THRESHOLD,
     compute_question_hash,
@@ -130,6 +132,49 @@ def test_save_answer_degrades_to_no_embedding_when_embedding_generation_fails(mo
 
     added = db.add.call_args[0][0]
     assert added.embedding_vector is None
+    db.commit.assert_called_once()
+
+
+# ---------- save_answer: secret-prompt guard (spec §12 / non-negotiable #9) ----------
+
+@pytest.mark.parametrize("question", [
+    "Enter the verification code we sent you",
+    "What is your one-time password?",
+    "Please enter your OTP",
+    "Enter the 6-digit security code",
+    "Two-factor authentication code",
+    "Complete the CAPTCHA below",
+    "I'm not a robot",
+    "Enter your password to continue",
+])
+def test_save_answer_refuses_to_cache_a_secret_shaped_question(question):
+    """Defense-in-depth: the real OTP protection lives entirely in
+    `TaskHandle.pending_secret` and never reaches this cache — this is the
+    backstop for a misclassified secret prompt reaching `save_answer` at all."""
+    db = MagicMock()
+
+    result = save_answer(db, "user-1", question, answer="123456", source="llm", confidence=0.9)
+
+    assert result is None
+    db.add.assert_not_called()
+    db.commit.assert_not_called()
+
+
+@pytest.mark.parametrize("question", [
+    "What is your postal code?",
+    "What's your employee code?",
+    "Reference code for your application",
+    "What is your notice period?",
+])
+def test_save_answer_still_caches_an_ordinary_question_that_merely_says_code(question):
+    """The guard must not over-match on the bare word 'code' — a zip/employee/
+    reference code is an ordinary screening question, not a secret prompt."""
+    db = MagicMock()
+    db.query.return_value.filter.return_value.first.return_value = None
+
+    save_answer(db, "user-1", question, answer="12345", source="deterministic", confidence=0.9)
+
+    db.add.assert_called_once()
     db.commit.assert_called_once()
 
 

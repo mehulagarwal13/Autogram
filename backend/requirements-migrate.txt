@@ -1,0 +1,7 @@
+# Small dependency set for the GitHub Actions Alembic job. The production
+# container continues to install requirements.txt.
+alembic
+sqlalchemy
+psycopg2-binary
+pgvector
+python-dotenv

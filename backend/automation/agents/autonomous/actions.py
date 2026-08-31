@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any
+from urllib.parse import urljoin, urlsplit, urlunsplit
 
 #: The full, closed set of action verbs the LLM may use. Anything else in a
 #: decision payload is a hard validation failure in `decision.py`, not a
@@ -97,12 +98,107 @@ class ActionResult:
     detail: str
     extracted_text: str | None = None
     blocked_reason: str | None = None  # set when a safety gate refused to run this action at all
+    #: Whether the action was confirmed to have had an actual effect on the
+    #: page (spec §7/§14: "never click blindly" — a dispatched click/fill/
+    #: select/check isn't "done" until something observably changed).
+    #: Defaults True for actions that don't mutate the page (extract_text,
+    #: wait, navigate, go_back, get_page_state) and for anything blocked
+    #: before it ran, since "did it have an effect" doesn't apply to those.
+    verified: bool = True
+    #: Stable machine-readable outcome. `success` remains for compatibility;
+    #: these fields make attempted/result/postcondition three distinct facts.
+    result_code: str | None = None
+    postcondition: str | None = None
 
     def as_dict(self) -> dict:
+        attempted = self.blocked_reason is None
         return {
             "success": self.success,
             "action_type": self.action_type,
             "detail": self.detail,
             "extracted_text": self.extracted_text,
             "blocked_reason": self.blocked_reason,
+            "verified": self.verified,
+            "action_attempted": attempted,
+            "action_result": self.result_code or ("ACTION_SUCCEEDED" if self.success else "ACTION_FAILED"),
+            "postcondition_verified": bool(self.success and self.verified),
+            "postcondition": self.postcondition or self.detail,
         }
+
+
+@dataclass(frozen=True)
+class GroundingResult:
+    grounded: bool
+    reason: str | None = None
+    preferred_element_ref: int | None = None
+
+
+def _normalize_url(url: str, base_url: str = "") -> str:
+    """Comparison form only: resolve relative links and ignore fragments."""
+    try:
+        absolute = urljoin(base_url, url)
+        parts = urlsplit(absolute)
+        if parts.scheme not in ("http", "https") or not parts.netloc:
+            return ""
+        path = parts.path.rstrip("/") or "/"
+        return urlunsplit((parts.scheme.lower(), parts.netloc.lower(), path, parts.query, ""))
+    except (TypeError, ValueError):
+        return ""
+
+
+def validate_action_grounding(
+    action: AgentAction,
+    page_state,
+    *,
+    canonical_urls: tuple[str, ...] = (),
+    allowlisted_urls: tuple[str, ...] = (),
+) -> GroundingResult:
+    """Code-level grounding gate for model-proposed browser actions.
+
+    Targeted actions must use a live, enabled observer ref. Navigation targets
+    must come from an observed href or a trusted caller-provided URL set. When
+    a high-confidence Apply/Start control is on-screen it wins over navigation,
+    including navigation to an observed link: the DOM control is the action the
+    page exposed and is therefore the state-aware path.
+    """
+    elements = list(getattr(page_state, "elements", ()) or ())
+    preferred = next((
+        element for element in elements
+        if not bool(getattr(element, "disabled", False))
+        and getattr(element, "action_confidence", None) == "HIGH"
+        and getattr(element, "semantic_action", None) in ("APPLY", "START_APPLICATION")
+    ), None)
+    if preferred is not None and not (
+        action.action_type == "click" and action.element_ref == preferred.ref
+    ):
+        return GroundingResult(
+            False,
+            f"observed high-confidence {preferred.semantic_action} control should be used instead of {action.action_type}",
+            preferred_element_ref=preferred.ref,
+        )
+
+    if action.action_type in TARGETED_ACTIONS:
+        match = next((element for element in elements if element.ref == action.element_ref), None)
+        if match is None:
+            return GroundingResult(False, f"element ref {action.element_ref} was not observed")
+        if bool(getattr(match, "disabled", False)):
+            return GroundingResult(False, f"element ref {action.element_ref} is disabled")
+
+    if action.action_type != "navigate":
+        return GroundingResult(True)
+
+    base_url = getattr(page_state, "url", "") or ""
+    proposed = _normalize_url(action.url or "", base_url)
+    if not proposed:
+        return GroundingResult(False, "navigation target is not an absolute HTTP(S) URL")
+    observed = {
+        _normalize_url(element.href, base_url)
+        for element in elements if getattr(element, "href", None)
+    }
+    trusted = {
+        _normalize_url(url, base_url)
+        for url in (*canonical_urls, *allowlisted_urls) if url
+    }
+    if proposed not in observed and proposed not in trusted:
+        return GroundingResult(False, "navigation target was not observed, canonical, or allow-listed")
+    return GroundingResult(True)

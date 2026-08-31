@@ -19,13 +19,27 @@ primitive, which is what the autonomous loop needs every iteration.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 from dataclasses import dataclass, field
 
 from playwright.sync_api import Error as PlaywrightError, Page
 
+from automation.agents.autonomous.action_semantics import classify_semantic_action
+from automation.browser.selectors import REVIEW_PAGE_TEXT_PATTERNS
+
 logger = logging.getLogger(__name__)
+
+#: Plausible post-submit confirmation phrases — moved here (from
+#: `loop.py::_page_shows_confirmation`, which now imports this) so
+#: `classify_page_type` below can reuse the exact same check rather than
+#: keeping a second, driftable copy.
+CONFIRMATION_PHRASES = [
+    "application submitted", "successfully submitted", "thank you for applying",
+    "thank you for your application", "application received", "your application has been",
+    "we have received your application", "application complete",
+]
 
 #: Cap on how many interactive elements go into one PageState — a long
 #: multi-page application form can have hundreds of DOM nodes; the LLM only
@@ -44,12 +58,18 @@ MAX_TEXT_CHARS = 4000
 # `data-agent-ref` index (in DOM order) and returns a plain-data description
 # of each: tag, role/type, accessible name, current value, and whether it
 # looks required/disabled.
-_EXTRACT_ELEMENTS_JS = """
+_EXTRACT_ELEMENTS_JS = r"""
 () => {
   const SELECTOR = [
     'a[href]', 'button', 'input', 'select', 'textarea',
     '[role="button"]', '[role="link"]', '[role="checkbox"]',
     '[role="radio"]', '[role="combobox"]', '[contenteditable="true"]',
+    // 'option': the individual choices inside an OPENED custom dropdown
+    // (react-select-style, or a WAI-ARIA listbox/grid like Amex's
+    // cx-select-input). Without this, a custom dropdown's options never
+    // become element_refs at all once the trigger is clicked open, so the
+    // agent has nothing to click to actually pick a value.
+    '[role="option"]',
   ].join(',');
 
   function accessibleName(el) {
@@ -93,6 +113,22 @@ _EXTRACT_ELEMENTS_JS = """
     return style.visibility !== 'hidden' && style.display !== 'none';
   }
 
+  function textOf(el) {
+    return (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
+  }
+
+  function nearbyText(el) {
+    const container = el.closest('fieldset, [role="group"], form, section, article, .field, .form-field');
+    return container ? textOf(container).slice(0, 350) : '';
+  }
+
+  function sectionName(el) {
+    const section = el.closest('fieldset, section, [role="group"], form');
+    if (!section) return '';
+    const title = section.querySelector('legend,h1,h2,h3,h4,h5,h6,[role="heading"]');
+    return title ? textOf(title).slice(0, 160) : '';
+  }
+
   const nodes = Array.from(document.querySelectorAll(SELECTOR)).filter(isVisible);
   const out = [];
   nodes.forEach((el, idx) => {
@@ -103,11 +139,28 @@ _EXTRACT_ELEMENTS_JS = """
     if (tag === 'select') {
       options = Array.from(el.options).map(o => o.textContent.trim());
     }
+    const rect = el.getBoundingClientRect();
+    const form = el.form || el.closest('form');
     out.push({
       ref: idx,
       tag,
       type,
       name: accessibleName(el),
+      aria_label: (el.getAttribute('aria-label') || '').trim(),
+      // Distinct from `type`, which prefers the native HTML `type`
+      // ATTRIBUTE when present — a real custom combobox is very commonly an
+      // `<input type="text" role="combobox">` (react-select, MUI Autocomplete,
+      // Amex's cx-select-input), where `type` resolves to "text", not
+      // "combobox". Widget-semantics code (see `loop.py::_widget_type`) reads
+      // `role` for that reason; `type` keeps its existing meaning everywhere
+      // else (native form-control kind).
+      role: (el.getAttribute('role') || '').toLowerCase(),
+      title: (el.getAttribute('title') || '').trim(),
+      href: el.href || null,
+      position: {x: Math.round(rect.x), y: Math.round(rect.y), width: Math.round(rect.width), height: Math.round(rect.height)},
+      form: form ? {id: form.id || '', name: form.getAttribute('name') || '', action: form.action || ''} : null,
+      surrounding_text: nearbyText(el),
+      section: sectionName(el),
       // Password values are masked at the source — a raw password must never
       // reach a PageState (persisted to the DB, sent to the LLM prompt, or
       // returned via the status API). Non-secret fields keep their real value.
@@ -115,13 +168,33 @@ _EXTRACT_ELEMENTS_JS = """
       required: !!el.required || el.getAttribute('aria-required') === 'true',
       disabled: !!el.disabled,
       checked: 'checked' in el ? !!el.checked : null,
+      // Tri-state: true/false when the element actually declares
+      // aria-selected (an option inside an opened listbox/grid), null when
+      // it doesn't apply (most elements). This is the WAI-ARIA-authoritative
+      // "is this option currently committed" signal — surfaced to the LLM
+      // directly so it can see an already-selected option without guessing.
+      aria_selected: el.hasAttribute('aria-selected') ? (el.getAttribute('aria-selected') === 'true') : null,
       options,
+      selected_options: tag === 'select' ? Array.from(el.selectedOptions || []).map(o => textOf(o)) : null,
       autocomplete: (el.getAttribute('autocomplete') || '').toLowerCase(),
       inputmode: (el.getAttribute('inputmode') || '').toLowerCase(),
       maxlength: el.getAttribute('maxlength') ? parseInt(el.getAttribute('maxlength'), 10) : null,
+      validation_message: ('validationMessage' in el ? String(el.validationMessage || '') : '').slice(0, 300),
+      invalid: el.getAttribute('aria-invalid') === 'true' || ('validity' in el && !el.validity.valid),
     });
   });
-  return out.slice(0, __MAX_ELEMENTS__);
+  const headings = Array.from(document.querySelectorAll('h1,h2,h3,h4,h5,h6,[role="heading"]'))
+    .filter(isVisible).map(textOf).filter(Boolean).slice(0, 40);
+  const dialogs = Array.from(document.querySelectorAll('dialog,[role="dialog"],[role="alertdialog"]'))
+    .filter(isVisible).map(textOf).filter(Boolean).map(t => t.slice(0, 500)).slice(0, 10);
+  const validation_messages = Array.from(document.querySelectorAll(
+    '[role="alert"], [aria-live="assertive"], .error, .errors, .field-error, .validation-error, [data-error]'
+  )).filter(isVisible).map(textOf).filter(Boolean).map(t => t.slice(0, 300)).slice(0, 30);
+  const forms = Array.from(document.forms).filter(isVisible).map(form => ({
+    id: form.id || '', name: form.getAttribute('name') || '', action: form.action || '',
+    method: (form.method || 'get').toLowerCase(),
+  })).slice(0, 20);
+  return {elements: out.slice(0, __MAX_ELEMENTS__), headings, dialogs, validation_messages, forms};
 }
 """
 
@@ -140,12 +213,46 @@ class PageElement:
     autocomplete: str = ""
     inputmode: str = ""
     maxlength: int | None = None
+    aria_label: str = ""
+    #: Raw ARIA `role`, distinct from `type` (which prefers a native HTML
+    #: `type` ATTRIBUTE when present — see `_EXTRACT_ELEMENTS_JS`). A real
+    #: custom combobox is very commonly `<input type="text" role="combobox">`,
+    #: where `type` resolves to "text"; widget-semantics code that needs to
+    #: recognize a combobox/option regardless of a native type attribute reads
+    #: this field instead (see `loop.py::_widget_type`).
+    role: str = ""
+    title: str = ""
+    href: str | None = None
+    position: dict | None = None
+    form: dict | None = None
+    surrounding_text: str = ""
+    section: str = ""
+    selected_options: list[str] | None = None
+    validation_message: str = ""
+    invalid: bool = False
+    #: Tri-state WAI-ARIA `aria-selected` reading — see `_EXTRACT_ELEMENTS_JS`.
+    #: Only meaningful for `type == "option"` (an item inside an opened
+    #: listbox/grid); `None` for everything else.
+    aria_selected: bool | None = None
+    semantic_action: str | None = None
+    action_confidence: str | None = None
+    irreversible: bool = False
 
     def as_dict(self) -> dict:
         return {
             "ref": self.ref, "tag": self.tag, "type": self.type, "name": self.name,
             "value": self.value, "required": self.required, "disabled": self.disabled,
+            "enabled": not self.disabled,
             "checked": self.checked, "options": self.options,
+            "aria_label": self.aria_label, "role": self.role, "title": self.title, "href": self.href,
+            "position": self.position, "form": self.form,
+            "surrounding_text": self.surrounding_text, "section": self.section,
+            "selected_options": self.selected_options,
+            "validation_message": self.validation_message, "invalid": self.invalid,
+            "aria_selected": self.aria_selected,
+            "semantic_action": self.semantic_action,
+            "action_confidence": self.action_confidence,
+            "irreversible": self.irreversible,
         }
 
 
@@ -166,6 +273,15 @@ class PageState:
     #: step at all for that iteration (Layer 1/2 of the spec's detection
     #: strategy; the LLM is Layer 3, used only when this is None).
     blocker_hint: dict | None = None
+    page_type: str = "unknown"
+    workflow_state: str = "ANALYZING"
+    headings: list[str] = field(default_factory=list)
+    dialogs: list[str] = field(default_factory=list)
+    validation_messages: list[str] = field(default_factory=list)
+    forms: list[dict] = field(default_factory=list)
+    required_fields: list[int] = field(default_factory=list)
+    blocking_messages: list[str] = field(default_factory=list)
+    page_signature: str = ""
 
     def as_dict(self) -> dict:
         return {
@@ -174,7 +290,139 @@ class PageState:
             "visible_text": self.visible_text,
             "elements": [e.as_dict() for e in self.elements],
             "detected_ats_platform": self.detected_ats_platform,
+            "page_type": self.page_type,
+            "workflow_state": self.workflow_state,
+            "headings": self.headings,
+            "dialogs": self.dialogs,
+            "validation_messages": self.validation_messages,
+            "forms": self.forms,
+            "required_fields": self.required_fields,
+            "blocking_messages": self.blocking_messages,
+            "page_signature": self.page_signature,
         }
+
+
+@dataclass(frozen=True)
+class PageCompletion:
+    ready: bool
+    missing_required_refs: list[int] = field(default_factory=list)
+    validation_messages: list[str] = field(default_factory=list)
+    blocking_messages: list[str] = field(default_factory=list)
+
+    @property
+    def reason(self) -> str:
+        parts = []
+        if self.missing_required_refs:
+            parts.append(f"{len(self.missing_required_refs)} required field(s) are incomplete")
+        if self.validation_messages:
+            parts.append(f"{len(self.validation_messages)} validation error(s) are visible")
+        if self.blocking_messages:
+            parts.append(f"{len(self.blocking_messages)} blocking dialog/message(s) remain")
+        return "; ".join(parts) or "page is complete"
+
+
+def compute_page_completion(page_state: PageState) -> PageCompletion:
+    """Spec §17's page-completion gate: is this page actually done, or would
+    moving on (or offering it up for final-submit approval) skip a required
+    field / leave a validation error on screen?
+
+    A required text/select field counts as missing when empty; a required
+    checkbox/radio counts as missing when unchecked. Disabled controls are
+    never "missing" — a field the page itself has turned off isn't something
+    the candidate can fill."""
+    missing_refs: list[int] = []
+    for element in page_state.elements:
+        if not element.required or element.disabled:
+            continue
+        if element.type in ("checkbox", "radio"):
+            if not element.checked:
+                missing_refs.append(element.ref)
+        elif element.tag == "select":
+            if not element.value and not element.selected_options:
+                missing_refs.append(element.ref)
+        elif not (element.value or "").strip():
+            missing_refs.append(element.ref)
+
+    return PageCompletion(
+        ready=not missing_refs and not page_state.validation_messages and not page_state.dialogs,
+        missing_required_refs=missing_refs,
+        validation_messages=list(page_state.validation_messages),
+        blocking_messages=list(page_state.dialogs),
+    )
+
+
+#: Maps a deterministic Layer-1/2 blocker (`detect_blocker`, below) straight
+#: to the spec's page_type vocabulary — checked first in `classify_page_type`
+#: since it's the strongest, non-text-heuristic signal available.
+_BLOCKER_TO_PAGE_TYPE = {
+    "OTP_REQUIRED": "verification",
+    "MFA_REQUIRED": "verification",
+    "CAPTCHA_REQUIRED": "captcha",
+    "LOGIN_REQUIRED": "login",
+}
+
+
+def classify_page_type(page_state: "PageState") -> str:
+    """One of the application-state vocabulary: JOB_LISTING, application_page, login,
+    verification, captcha, review, confirmation, unknown. Built entirely from
+    signals `observe_page` already computed — no separate LLM call, and never
+    a source of truth on its own (`AutonomousTask.current_status`, driven by
+    the loop's actual control flow, remains authoritative; this is contextual
+    labeling for the LLM prompt and the status API)."""
+    if page_state.blocker_hint:
+        mapped = _BLOCKER_TO_PAGE_TYPE.get(page_state.blocker_hint.get("request_type"))
+        if mapped:
+            return mapped
+
+    haystack = f"{page_state.title} {page_state.visible_text}".lower()
+    if any(phrase in haystack for phrase in CONFIRMATION_PHRASES):
+        return "confirmation"
+    if any(phrase in haystack for phrase in REVIEW_PAGE_TEXT_PATTERNS):
+        return "review"
+
+    has_form_fields = any(
+        el.tag in ("input", "textarea", "select") or el.type == "combobox"
+        for el in page_state.elements
+    )
+    has_apply_entry = any(el.semantic_action in ("APPLY", "START_APPLICATION") for el in page_state.elements)
+    # Listing pages frequently contain search/filter/email-alert fields, so
+    # the mere presence of an input must not make them application forms. A
+    # visible apply-entry control plus ordinary job metadata is the stronger
+    # signal. None of these phrases or structures is tied to an ATS/vendor.
+    job_metadata_phrases = (
+        "job description", "responsibilities", "qualifications", "requirements",
+        "about the role", "about the job", "employment type", "job id",
+        "requisition", "salary", "compensation", "benefits", "location",
+    )
+    metadata_hits = sum(1 for phrase in job_metadata_phrases if phrase in haystack)
+    meaningful_heading = any(
+        len(" ".join(str(heading).split())) >= 5
+        for heading in page_state.headings
+    ) or len((page_state.title or "").strip()) >= 8
+    application_field_count = sum(
+        1 for el in page_state.elements
+        if el.tag in ("input", "textarea", "select") or el.type == "combobox"
+    )
+    if has_apply_entry and (meaningful_heading or metadata_hits > 0 or application_field_count < 3):
+        return "JOB_LISTING"
+
+    if has_form_fields:
+        return "application_page"
+
+    return "unknown"
+
+
+def field_identity(element: PageElement) -> str:
+    """A stable identity for one logical field, independent of its
+    DOM-order-based `ref` (which can shift across re-observations of the same
+    page — a field re-rendered after a validation error, for instance, is
+    still "the same field" a human would recognize, even if its ref index
+    moved). Used by `AutonomousTask.field_attempt_ledger` (spec §16) to
+    remember a field failed across resumes/process-restarts, which `ref`
+    alone cannot do."""
+    normalized_name = " ".join((element.name or "").split()).strip().lower()
+    key = f"{element.tag}|{normalized_name}|{element.section}"
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()[:24]
 
 
 def observe_page(page: Page, *, ats_hint: str | None = None) -> PageState:
@@ -208,11 +456,18 @@ def observe_page(page: Page, *, ats_hint: str | None = None) -> PageState:
     except PlaywrightError as e:
         logger.debug("observe_page: could not read body text: %s", e)
 
+    extraction: dict = {}
     try:
         script = _EXTRACT_ELEMENTS_JS.replace("__MAX_ELEMENTS__", str(MAX_ELEMENTS))
-        raw_elements = page.evaluate(script) or []
+        extraction = page.evaluate(script) or {}
     except PlaywrightError as e:
         logger.warning("observe_page: element extraction failed: %s", e)
+
+    # The extraction script returns ONE object — {elements, headings, dialogs,
+    # validation_messages, forms} — not a bare array. `raw_elements` must be
+    # its "elements" key, never the object itself (iterating the object
+    # would walk its string keys, not element dicts).
+    raw_elements: list[dict] = extraction.get("elements") or []
 
     elements = [
         PageElement(
@@ -221,9 +476,22 @@ def observe_page(page: Page, *, ats_hint: str | None = None) -> PageState:
             disabled=bool(el.get("disabled")), checked=el.get("checked"),
             options=el.get("options"), autocomplete=el.get("autocomplete") or "",
             inputmode=el.get("inputmode") or "", maxlength=el.get("maxlength"),
+            aria_label=el.get("aria_label") or "", role=el.get("role") or "", title=el.get("title") or "",
+            href=el.get("href"), position=el.get("position"), form=el.get("form"),
+            surrounding_text=el.get("surrounding_text") or "", section=el.get("section") or "",
+            selected_options=el.get("selected_options"),
+            validation_message=el.get("validation_message") or "",
+            invalid=bool(el.get("invalid")),
+            aria_selected=el.get("aria_selected"),
         )
         for el in raw_elements
     ]
+
+    for element in elements:
+        semantic_action, action_confidence, irreversible = classify_semantic_action(element)
+        element.semantic_action = semantic_action
+        element.action_confidence = action_confidence
+        element.irreversible = irreversible
 
     try:
         blocker_hint = detect_blocker(url, visible_text, raw_elements)
@@ -231,10 +499,16 @@ def observe_page(page: Page, *, ats_hint: str | None = None) -> PageState:
         logger.warning("observe_page: blocker detection failed: %s", e)
         blocker_hint = None
 
-    return PageState(
+    page_state = PageState(
         url=url, title=title, visible_text=visible_text, elements=elements,
         detected_ats_platform=ats_hint, blocker_hint=blocker_hint,
+        headings=extraction.get("headings") or [],
+        dialogs=extraction.get("dialogs") or [],
+        validation_messages=extraction.get("validation_messages") or [],
+        forms=extraction.get("forms") or [],
     )
+    page_state.page_type = classify_page_type(page_state)
+    return page_state
 
 
 # ---------------------------------------------------------------------------

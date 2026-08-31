@@ -39,6 +39,17 @@ const BOOL_FIELDS = [
 
 const SKILL_KEYS = ["programming_languages", "frameworks", "tools", "certifications", "technical_skills", "soft_skills"];
 
+function SectionTitle({ icon: Icon, children }) {
+  return (
+    <h2 className="mb-4 flex items-center gap-2.5 font-semibold text-slate-900">
+      <span className="flex h-7 w-7 items-center justify-center rounded-md bg-brand-50 text-brand-600">
+        <Icon size={15} />
+      </span>
+      {children}
+    </h2>
+  );
+}
+
 export default function Profile({ toast }) {
   const [profile, setProfile] = useState(null);
   const [exists, setExists] = useState(true);
@@ -142,7 +153,7 @@ export default function Profile({ toast }) {
 
       {FIELD_GROUPS.map((group) => (
         <div key={group.title} className="card p-6">
-          <h2 className="mb-4 flex items-center gap-2 font-semibold text-slate-900"><UserCircle2 size={16} className="text-brand-600" />{group.title}</h2>
+          <SectionTitle icon={UserCircle2}>{group.title}</SectionTitle>
           <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
             {group.fields.map(([key, label, type]) => (
               <label key={key} className="block">
@@ -179,7 +190,7 @@ export default function Profile({ toast }) {
 
       {/* Education */}
       <div className="card p-6">
-        <h2 className="mb-4 flex items-center gap-2 font-semibold text-slate-900"><GraduationCap size={16} className="text-brand-600" />Education</h2>
+        <SectionTitle icon={GraduationCap}>Education</SectionTitle>
         <div className="mb-4 grid gap-2 sm:grid-cols-5">
           <input className="input" placeholder="Degree" value={newEdu.degree} onChange={(e) => setNewEdu({ ...newEdu, degree: e.target.value })} />
           <input className="input" placeholder="University" value={newEdu.university} onChange={(e) => setNewEdu({ ...newEdu, university: e.target.value })} />
@@ -205,7 +216,7 @@ export default function Profile({ toast }) {
 
       {/* Experience */}
       <div className="card p-6">
-        <h2 className="mb-4 flex items-center gap-2 font-semibold text-slate-900"><Briefcase size={16} className="text-brand-600" />Work Experience</h2>
+        <SectionTitle icon={Briefcase}>Work Experience</SectionTitle>
         <div className="mb-4 grid gap-2 sm:grid-cols-5">
           <input className="input" placeholder="Company" value={newExp.company_name} onChange={(e) => setNewExp({ ...newExp, company_name: e.target.value })} />
           <input className="input" placeholder="Job title" value={newExp.job_title} onChange={(e) => setNewExp({ ...newExp, job_title: e.target.value })} />
@@ -228,7 +239,7 @@ export default function Profile({ toast }) {
 
       {/* Skills */}
       <div className="card p-6">
-        <h2 className="mb-4 flex items-center gap-2 font-semibold text-slate-900"><Sparkles size={16} className="text-brand-600" />Skills</h2>
+        <SectionTitle icon={Sparkles}>Skills</SectionTitle>
         <div className="grid gap-3 sm:grid-cols-2">
           {SKILL_KEYS.map((k) => (
             <label key={k} className="block">

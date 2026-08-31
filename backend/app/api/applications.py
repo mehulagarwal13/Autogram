@@ -56,13 +56,17 @@ from app.services import (
     audit_log_repository,
     automation_ownership,
     profile_repository,
+    trust_level_repository,
 )
 from app.services.event_bus import publish_application_event
 from automation.applications import verification_channel
 from automation.applications.application_flow_manager import (
     ApplicationFlowManager,
+    clear_live_state,
+    clear_stop_request,
     close_review_session,
     get_live_state,
+    request_stop,
     submit_open_review_session,
 )
 from automation.ats.detector import FALLBACK_ATS, detect_ats_for_url
@@ -557,6 +561,12 @@ def review_application_question(
                 answer=final_answer, source="deterministic" if body.action == "approve" else "llm",
                 confidence=1.0,
             )
+            # Spec §13: an edited/approved answer that turns out to be a
+            # stable contact/professional fact (phone, city, LinkedIn, ...)
+            # goes back into the profile too, not just this cache — so it's
+            # never re-asked on a future application. Best-effort; never
+            # raises past this point.
+            profile_repository.write_back_stable_answer(db, user.user_id, question.question_text, final_answer)
     return question
 
 
@@ -688,6 +698,95 @@ def reject_application(
         event_type="human_rejected", actor=user.user_id, metadata={"reason": reason} if reason else None,
     )
     return application
+
+
+@router.post("/{application_id}/stop", response_model=ApplicationResponse)
+def stop_application(
+    application_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """User-initiated stop of an application that is currently `pending`,
+    `processing`, or `copilot_review` (§25 non-negotiable: never leave the
+    user unable to act on their own automation).
+
+    `copilot_review` already has a browser parked open with nothing left to
+    run — closing it and cancelling is immediate and complete, same as
+    `reject_application`.
+
+    `pending`/`processing` may have a live background thread (see
+    `_run_on_dedicated_thread` in `_run_application`). Python cannot force-
+    kill that thread, so this does two things rather than one: (1) sets
+    `application_flow_manager.STOP_REQUESTED`, which the run's own per-page
+    loop checks at the same point it already checks the account-level kill
+    switch — this is what actually stops a run that's progressing normally,
+    within one page; and (2) writes `status="cancelled"` immediately, so the
+    UI unblocks (and a new attempt is possible) even if the thread is
+    currently stuck somewhere that check can't reach (e.g. mid browser-
+    launch). If the old run eventually does finish, `_run_application`'s
+    completion handler refuses to overwrite this cancelled status."""
+    application = _get_owned_application(db, application_id, user)
+    if application.status not in IN_PROGRESS_STATUSES:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Application is '{application.status}', not in progress — nothing to stop.",
+        )
+
+    if application.status == "copilot_review":
+        close_review_session(application.application_id)
+    else:
+        request_stop(application.application_id)
+
+    application = application_repository.mark_cancelled(
+        db, application, reason="Stopped by the user before the automation finished.",
+    )
+    _record_audit_event(
+        db, application_id=application.application_id, user_id=user.user_id,
+        event_type="user_stopped", actor=user.user_id, metadata=None,
+    )
+    _emit(
+        application_id, _STATUS_EVENTS.get(application.status, "APPLICATION_FAILED"),
+        status=application.status, display_status=application_repository.display_status(application),
+    )
+    return application
+
+
+@router.delete("/{application_id}", status_code=204)
+def delete_application(
+    application_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Permanently removes this application and its full history (runs,
+    screening-question ledger, audit log, chat transcript — all
+    `ondelete="CASCADE"` on `application_id`, see
+    `application_repository.delete`). If it's still in progress, stops it
+    first (same effect as `POST /{id}/stop`) rather than deleting the row out
+    from under a live browser thread."""
+    application = _get_owned_application(db, application_id, user)
+    if application.status in IN_PROGRESS_STATUSES:
+        if application.status == "copilot_review":
+            close_review_session(application.application_id)
+        else:
+            request_stop(application.application_id)
+    else:
+        # Defensive, not load-bearing: a terminal status should never have a
+        # parked review browser, but closing one that doesn't exist is a
+        # documented no-op, and a leaked tab would otherwise become
+        # unreachable the instant this row is gone (`_get_owned_application`
+        # 404s on every route that could otherwise reach it).
+        close_review_session(application.application_id)
+
+    clear_live_state(application.application_id)
+    clear_stop_request(application.application_id)
+    # Not `_record_audit_event`: `application_audit_log` rows CASCADE-delete
+    # with their parent application (see `application_repository.delete`), so
+    # a DB audit entry for the deletion itself would be destroyed in the same
+    # transaction that creates it — a plain server log line is the only trace
+    # of this action that can actually outlive the row it describes.
+    logger.info("Application %s deleted by user %s (was status=%s).", application_id, user.user_id, application.status)
+    application_repository.delete(db, application)
+    return Response(status_code=204)
 
 
 @router.post("/{application_id}/report-status", response_model=ApplicationResponse)
@@ -854,6 +953,17 @@ def _is_kill_switch_engaged(user_id: str) -> bool:
         session.close()
 
 
+def _resolve_trust_level_for(user_id: str, job_url: str) -> str:
+    """§6.4 trust levels: fresh DB read every call, same reasoning as the
+    kill switch above — a trust-level change the user makes mid-run takes
+    effect on the very next decision point, not just future runs."""
+    session = SessionLocal()
+    try:
+        return trust_level_repository.resolve_trust_level(session, user_id, job_url)
+    finally:
+        session.close()
+
+
 # ------------------------------------------------------------------
 # Background task — the actual app.api -> automation handoff
 # ------------------------------------------------------------------
@@ -998,6 +1108,7 @@ def _run_application(application_id: str, resume_document_id: str, job_descripti
             vision_answerer=vision_answerer,
             on_waiting_for_human=lambda reason: _mark_waiting_for_human(application_id, reason),
             is_kill_switch_engaged=lambda: _is_kill_switch_engaged(application.user_id),
+            resolve_trust_level=lambda: _resolve_trust_level_for(application.user_id, application.job_url),
         )
         # See _run_on_dedicated_thread's docstring: Playwright's sync API
         # must run on a thread that was never touched by asyncio AND won't
@@ -1022,7 +1133,22 @@ def _run_application(application_id: str, resume_document_id: str, job_descripti
         result_db = SessionLocal()
         try:
             fresh_application = application_repository.get_by_id(result_db, application_id)
-            if fresh_application is not None:
+            if fresh_application is None:
+                logger.warning("Application %s vanished before its result could be recorded.", application_id)
+            elif fresh_application.status == "cancelled":
+                # POST /{id}/stop already wrote "cancelled" the moment the user
+                # asked to stop, specifically so the UI unblocks immediately
+                # without waiting for a run that may be stuck deep inside one
+                # browser call (see STOP_REQUESTED's docstring — the per-page
+                # check above can't catch that case). This run's own result,
+                # arriving after the fact, must not silently resurrect it —
+                # the user's explicit stop is the final word.
+                logger.info(
+                    "Application %s was stopped by the user while this run was still finishing — "
+                    "keeping status=cancelled instead of applying the run's own result (%s).",
+                    application_id, result.status,
+                )
+            else:
                 application_repository.apply_run_result(result_db, fresh_application, result)
                 # Derived from the status that just COMMITTED, so the stream can
                 # never claim an outcome the database disagrees with.
@@ -1032,10 +1158,9 @@ def _run_application(application_id: str, resume_document_id: str, job_descripti
                     status=fresh_application.status,
                     display_status=application_repository.display_status(fresh_application),
                 )
-            else:
-                logger.warning("Application %s vanished before its result could be recorded.", application_id)
         finally:
             result_db.close()
+            clear_stop_request(application_id)
     except Exception:
         logger.exception("Background application run crashed for %s", application_id)
         db.rollback()

@@ -34,9 +34,23 @@ import re
 
 from playwright.sync_api import Error as PlaywrightError, Page
 
+from automation.agents.autonomous.action_semantics import (
+    SUBMIT_BUTTON_PATTERNS,
+    is_submit_control_name,
+)
 from automation.agents.autonomous.actions import ActionResult, AgentAction
+from automation.agents.autonomous.combobox_verify import verify_combobox_commit
+from automation.agents.autonomous.observer import observe_page
+from automation.agents.autonomous.page_validation import detect_error_page
+from automation.applications.page_navigator import capture_page_signature, wait_for_page_settled
 from automation.utils.element_actions import safe_click
 from automation.utils.human_input import human_type
+
+#: How long to let a click settle before re-reading the page's structural
+#: signature to check for an effect (spec §7). Short and bounded: this runs
+#: on every mutating action inside an 80-iteration-per-resume loop, not once
+#: per page navigation like `page_navigator.py`'s own (much longer) wait.
+_CLICK_VERIFY_SETTLE_MS = 2000
 
 logger = logging.getLogger(__name__)
 
@@ -61,11 +75,12 @@ _SENSITIVE_RE = re.compile("|".join(SENSITIVE_FIELD_PATTERNS), re.IGNORECASE)
 
 #: Keyword patterns marking a control as a FINAL submission action, as
 #: opposed to "Next" / "Save and continue" on an intermediate page.
-SUBMIT_BUTTON_PATTERNS = [
-    r"^submit\b", r"submit\s*application", r"\bapply\s*now\b",
-    r"finish\s*application", r"complete\s*application", r"send\s*application",
-]
-_SUBMIT_RE = re.compile("|".join(SUBMIT_BUTTON_PATTERNS), re.IGNORECASE)
+#: `SUBMIT_BUTTON_PATTERNS`/`is_submit_control_name` are imported from
+#: `action_semantics.py` (the single source for this list — see that
+#: module's docstring) rather than defined here, but kept accessible as
+#: `executor.SUBMIT_BUTTON_PATTERNS`/`executor.is_submit_control_name` via
+#: the import above, since existing call sites and tests reference them
+#: at this path.
 
 #: Third safety net, independent of the LLM's own judgment and of
 #: `observer.py::detect_blocker` — that deterministic detector is the
@@ -116,10 +131,6 @@ def normalize_upload_path(path: str | None) -> str:
         return os.path.normcase(str(path))
 
 
-def is_submit_control_name(name: str) -> bool:
-    return bool(_SUBMIT_RE.search(name or ""))
-
-
 def _locator_for_ref(page: Page, element_ref: int):
     return page.locator(f'[data-agent-ref="{element_ref}"]')
 
@@ -147,10 +158,14 @@ class ActionExecutor:
         self.allowed_upload_paths = {
             normalize_upload_path(p) for p in (allowed_upload_paths or []) if p
         }
+        self._current_element_type: str | None = None
+        self._current_semantic_action: str | None = None
 
     def execute(
         self, action: AgentAction, *,
-        element_name: str | None = None, is_sourced: bool = False, verification_code_write: bool = False,
+        element_name: str | None = None, element_type: str | None = None,
+        element_semantic_action: str | None = None,
+        is_sourced: bool = False, verification_code_write: bool = False,
     ) -> ActionResult:
         """`element_name` is the accessible name the observer recorded for
         `action.element_ref` (the caller — `loop.py` — looks it up from the
@@ -158,6 +173,14 @@ class ActionExecutor:
         extraction). `is_sourced=True` means the value being written is
         already confirmed to come from the resume/profile/a previously
         confirmed answer — required for the sensitive-field gate to pass.
+
+        `element_type` is that same element's `PageElement.type` — used only
+        to pick the right committed-state verification for a custom dropdown
+        (`type == "combobox"`) or one of its options (`type == "option"`);
+        see `_do_fill`/`_do_click` below. Reset on every call (this executor
+        may be reused across more than one `.execute()` — see
+        `loop.py::_try_consume_pending_secret`), so a stale value from a
+        previous action can never leak into this one.
 
         `verification_code_write=True` is the ONLY way past the
         verification-code gate below — set ONLY by
@@ -167,6 +190,8 @@ class ActionExecutor:
         same-process caller can write a verification code while every other
         caller — in particular, anything driven by an LLM `decide_next_step`
         decision — categorically cannot."""
+        self._current_element_type = element_type
+        self._current_semantic_action = element_semantic_action
         try:
             if action.action_type in ("fill", "select") and element_name and not verification_code_write:
                 if is_verification_code_field_name(element_name):
@@ -197,23 +222,150 @@ class ActionExecutor:
                 return ActionResult(False, action.action_type, "No handler for this action type.", blocked_reason="unimplemented")
             return dispatch(action)
         except PlaywrightError as e:
-            return ActionResult(False, action.action_type, f"Playwright error: {e}")
+            return ActionResult(False, action.action_type, f"Playwright error: {e}", verified=False)
 
     # ------------------------------------------------------------------
 
     def _do_navigate(self, action: AgentAction) -> ActionResult:
-        self.page.goto(action.url, wait_until="domcontentloaded", timeout=30000)
-        return ActionResult(True, "navigate", f"Navigated to {action.url}")
+        before = self._safe_signature()
+        response = self.page.goto(action.url, wait_until="domcontentloaded", timeout=30000)
+        try:
+            wait_for_page_settled(self.page, timeout_ms=10_000)
+        except Exception:  # noqa: BLE001
+            pass
+        status = getattr(response, "status", None)
+        error = detect_error_page(self.page, response_status=status)
+        if error is not None:
+            return ActionResult(
+                False, "navigate", f"Navigation failed: {error.detail}", verified=False,
+                result_code="NAVIGATION_FAILED", postcondition=error.code,
+            )
+        after = self._safe_signature()
+        changed = before is None or after is None or after.differs_from(before)
+        if not changed:
+            return ActionResult(
+                False, "navigate", "Navigation completed but produced no page state change",
+                verified=False, result_code="NO_STATE_CHANGE", postcondition="NO_STATE_CHANGE",
+            )
+        return ActionResult(
+            True, "navigate", f"Navigated to {self.page.url}", verified=True,
+            result_code="NAVIGATION_SUCCESS", postcondition="destination loaded without error indicators",
+        )
 
     def _do_click(self, action: AgentAction) -> ActionResult:
         locator = _locator_for_ref(self.page, action.element_ref)
+        before = self._safe_signature()
         ok = safe_click(locator, self.page)
-        return ActionResult(ok, "click", f"Clicked element ref {action.element_ref}" if ok else "Click did not succeed")
+        if not ok:
+            return ActionResult(False, "click", "Click did not succeed", verified=False)
+        try:
+            wait_for_page_settled(self.page, timeout_ms=_CLICK_VERIFY_SETTLE_MS)
+        except Exception:  # noqa: BLE001 - a settle-wait failing must never block reporting the click
+            pass
+        after = self._safe_signature()
+        changed = before is not None and after is not None and after.differs_from(before)
+        verified = changed
+        detail = (
+            f"Clicked element ref {action.element_ref}" if changed
+            else f"Clicked element ref {action.element_ref}, but nothing on the page changed"
+        )
+        if self._current_element_type == "option":
+            # spec §15/§20: a popup closing is itself a real structural
+            # change that must NOT, by itself, count as "the option was
+            # committed" — false-positive verification is worse than
+            # false-negative. The option's own aria-selected/aria-checked
+            # state (WAI-ARIA listbox/grid pattern) is the authority here,
+            # and overrides a signature-only "changed" reading in either
+            # direction when it gives a conclusive answer.
+            option_selected = self._verify_option_selected(locator)
+            if option_selected is False:
+                verified = False
+                detail += " (the option does not report itself as selected)"
+            elif option_selected is True:
+                verified = True
+        error = detect_error_page(self.page)
+        if error is not None:
+            return ActionResult(
+                False, "click", f"Click reached an error page: {error.detail}", verified=False,
+                result_code="ERROR_PAGE", postcondition=error.code,
+            )
+        if self._current_semantic_action in ("APPLY", "START_APPLICATION"):
+            destination = observe_page(self.page)
+            entered_application = destination.page_type in (
+                "application_page", "login", "verification", "captcha", "review",
+            )
+            if not entered_application:
+                return ActionResult(
+                    False, "click",
+                    f"Clicked application-entry control, but no application state was detected "
+                    f"(page_type={destination.page_type})",
+                    verified=False,
+                    result_code="NO_STATE_CHANGE" if not changed else "POSTCONDITION_FAILED",
+                    postcondition="application page or application gate not detected",
+                )
+            return ActionResult(
+                True, "click", f"Clicked application-entry control and detected {destination.page_type}",
+                verified=True, result_code="ACTION_SUCCEEDED",
+                postcondition=f"application entry verified as {destination.page_type}",
+            )
+        if not verified:
+            return ActionResult(
+                False, "click", detail, verified=False,
+                result_code="NO_STATE_CHANGE", postcondition="NO_STATE_CHANGE",
+            )
+        return ActionResult(
+            True, "click", detail, verified=True,
+            result_code="ACTION_SUCCEEDED", postcondition="page signature changed",
+        )
+
+    def _verify_option_selected(self, locator) -> bool | None:
+        """`aria-selected`/`aria-checked` on a clicked `role="option"`
+        element, tri-state: `True`/`False` when the attribute is present,
+        `None` when it isn't (or couldn't be read) — inconclusive, not a
+        pass or a fail, so the caller falls back to the page-signature diff
+        instead of treating silence as either."""
+        try:
+            value = locator.get_attribute("aria-selected")
+        except Exception:  # noqa: BLE001 - an inconclusive read must never crash the click
+            return None
+        if value is None:
+            try:
+                value = locator.get_attribute("aria-checked")
+            except Exception:  # noqa: BLE001
+                return None
+        if value is None:
+            return None
+        return value == "true"
+
+    def _safe_signature(self):
+        """`capture_page_signature`, degrading to `None` (never raising) on
+        any failure — a page this can't read yet (mid-navigation, or in a
+        test double that doesn't implement every real-Playwright method) must
+        never crash the action itself; it just can't be verified this time."""
+        try:
+            return capture_page_signature(self.page)
+        except Exception:  # noqa: BLE001
+            return None
 
     def _do_fill(self, action: AgentAction) -> ActionResult:
         locator = _locator_for_ref(self.page, action.element_ref)
         human_type(locator, action.value or "", self.page)
-        return ActionResult(True, "fill", f"Filled element ref {action.element_ref} with {len(action.value or '')} chars")
+        detail = f"Filled element ref {action.element_ref} with {len(action.value or '')} chars"
+        if self._current_element_type == "combobox":
+            # A custom dropdown's committed value doesn't necessarily show up
+            # in its own `input_value()` — reuse the same multi-signal
+            # algorithm the deterministic engine already proved out (spec
+            # §15). Inconclusive (`None`) falls back to the plain text check
+            # rather than being treated as either a pass or a fail.
+            committed, observed = verify_combobox_commit(locator, self.page, action.value or "")
+            verified = committed if committed is not None else self._verify_text_committed(locator, action.value or "")
+            if not verified:
+                detail += f" (could not confirm the value stuck; last observed: {observed!r})" if observed else " (could not confirm the value stuck)"
+            return ActionResult(True, "fill", detail, verified=verified)
+        verified = self._verify_text_committed(locator, action.value or "")
+        if not verified:
+            detail += " (could not confirm the value stuck)"
+        return ActionResult(True, "fill", detail, verified=verified)
 
     def _do_select(self, action: AgentAction) -> ActionResult:
         locator = _locator_for_ref(self.page, action.element_ref)
@@ -221,17 +373,62 @@ class ActionExecutor:
             locator.select_option(label=action.value)
         except PlaywrightError:
             locator.select_option(value=action.value)
-        return ActionResult(True, "select", f"Selected {action.value!r} on element ref {action.element_ref}")
+        verified = self._verify_select_committed(locator, action.value)
+        detail = f"Selected {action.value!r} on element ref {action.element_ref}"
+        if not verified:
+            detail += " (could not confirm the option is actually selected)"
+        return ActionResult(True, "select", detail, verified=verified)
 
     def _do_check(self, action: AgentAction) -> ActionResult:
         locator = _locator_for_ref(self.page, action.element_ref)
         locator.check(timeout=3000)
-        return ActionResult(True, "check", f"Checked element ref {action.element_ref}")
+        verified = self._verify_checked_state(locator, expected=True)
+        return ActionResult(True, "check", f"Checked element ref {action.element_ref}", verified=verified)
 
     def _do_uncheck(self, action: AgentAction) -> ActionResult:
         locator = _locator_for_ref(self.page, action.element_ref)
         locator.uncheck(timeout=3000)
-        return ActionResult(True, "uncheck", f"Unchecked element ref {action.element_ref}")
+        verified = self._verify_checked_state(locator, expected=False)
+        return ActionResult(True, "uncheck", f"Unchecked element ref {action.element_ref}", verified=verified)
+
+    # ------------------------------------------------------------------
+    # Committed-state verification — same "fill then verify" division of
+    # responsibility `automation/forms/field_handlers.py::fill_field()` uses
+    # for the deterministic path, simplified to one element per ref rather
+    # than a per-widget-type handler hierarchy. A verification read that
+    # itself fails (detached node, transient re-render) reports `False`
+    # rather than raising — an inconclusive check must never crash the loop.
+
+    def _verify_text_committed(self, locator, intended: str) -> bool:
+        if not intended.strip():
+            return True  # clearing a field has no non-empty value to confirm
+        try:
+            actual = locator.input_value(timeout=1000)
+        except Exception:  # noqa: BLE001 - not every widget/test-double supports input_value
+            try:
+                actual = locator.inner_text(timeout=1000)
+            except Exception:  # noqa: BLE001
+                return False
+        actual = (actual or "").strip()
+        return bool(actual) and (actual == intended.strip() or intended.strip() in actual)
+
+    def _verify_select_committed(self, locator, intended: str | None) -> bool:
+        if not intended:
+            return True
+        try:
+            selected = locator.evaluate(
+                "el => Array.from(el.selectedOptions || []).map(o => (o.textContent || '').trim())"
+            )
+        except Exception:  # noqa: BLE001
+            return False
+        needle = str(intended).strip().lower()
+        return any(needle == (s or "").strip().lower() or needle in (s or "").lower() for s in (selected or []))
+
+    def _verify_checked_state(self, locator, *, expected: bool) -> bool:
+        try:
+            return bool(locator.is_checked(timeout=1000)) == expected
+        except Exception:  # noqa: BLE001
+            return False
 
     def _do_scroll(self, action: AgentAction) -> ActionResult:
         amount = action.amount or 600
@@ -274,8 +471,15 @@ class ActionExecutor:
         return ActionResult(True, "wait", f"Waited {action.wait_ms or 1000}ms")
 
     def _do_go_back(self, action: AgentAction) -> ActionResult:
-        self.page.go_back(wait_until="domcontentloaded", timeout=15000)
-        return ActionResult(True, "go_back", "Navigated back")
+        before = self._safe_signature()
+        response = self.page.go_back(wait_until="domcontentloaded", timeout=15000)
+        error = detect_error_page(self.page, response_status=getattr(response, "status", None))
+        after = self._safe_signature()
+        if error is not None:
+            return ActionResult(False, "go_back", error.detail, verified=False, result_code="NAVIGATION_FAILED")
+        if before is not None and after is not None and not after.differs_from(before):
+            return ActionResult(False, "go_back", "Back navigation produced no state change", verified=False, result_code="NO_STATE_CHANGE")
+        return ActionResult(True, "go_back", "Navigated back", verified=True, result_code="NAVIGATION_SUCCESS")
 
     def _do_get_page_state(self, action: AgentAction) -> ActionResult:
         # No-op executor-side: `loop.py` always re-observes after every

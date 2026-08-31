@@ -58,9 +58,12 @@ from automation.applications.application_flow_manager import (
     NEEDS_REVIEW_CONFIDENCE_THRESHOLD,
     PUBLIC_ATS_PLATFORMS,
     REVIEW_STATUSES,
+    clear_stop_request,
     close_review_session,
     decide_action,
+    is_stop_requested,
     list_open_review_sessions,
+    request_stop,
     should_keep_browser_open,
     submit_and_confirm,
     submit_open_review_session,
@@ -73,18 +76,18 @@ from automation.applications.application_flow_manager import (
 
 def test_decide_action_auto_submits_when_all_conditions_met():
     assert "greenhouse" in PUBLIC_ATS_PLATFORMS
-    action = decide_action(confidence=0.95, ats_platform="greenhouse", autopilot_enabled=True)
+    action = decide_action(confidence=0.95, ats_platform="greenhouse", autopilot_enabled=True, trust_level="TRUSTED_AUTO_SUBMIT")
     assert action == "AUTO_SUBMIT"
 
 
 def test_decide_action_requires_autopilot_opt_in():
-    action = decide_action(confidence=0.95, ats_platform="greenhouse", autopilot_enabled=False)
+    action = decide_action(confidence=0.95, ats_platform="greenhouse", autopilot_enabled=False, trust_level="TRUSTED_AUTO_SUBMIT")
     assert action == "COPILOT_REVIEW"
 
 
 def test_decide_action_requires_a_public_ats():
     assert "workday" not in PUBLIC_ATS_PLATFORMS
-    action = decide_action(confidence=0.95, ats_platform="workday", autopilot_enabled=True)
+    action = decide_action(confidence=0.95, ats_platform="workday", autopilot_enabled=True, trust_level="TRUSTED_AUTO_SUBMIT")
     assert action == "COPILOT_REVIEW"
 
 
@@ -93,8 +96,57 @@ def test_decide_action_needs_review_below_the_low_threshold():
         confidence=NEEDS_REVIEW_CONFIDENCE_THRESHOLD - 0.01,
         ats_platform="greenhouse",
         autopilot_enabled=True,
+        trust_level="TRUSTED_AUTO_SUBMIT",
     )
     assert action == "NEEDS_REVIEW"
+
+
+# ---------------------------------------------------------------------------
+# §6.4 trust levels — an ADDITIONAL required condition for AUTO_SUBMIT, never
+# a bypass of the other three (autopilot/platform/confidence).
+# ---------------------------------------------------------------------------
+
+def test_decide_action_defaults_to_full_manual_review_when_trust_level_is_omitted():
+    """Every pre-existing call site (and any new one that forgets to resolve
+    a trust level) must get today's always-review behavior, not a silent
+    opt-in to auto-submit."""
+    action = decide_action(confidence=0.95, ats_platform="greenhouse", autopilot_enabled=True)
+    assert action == "COPILOT_REVIEW"
+
+
+def test_decide_action_full_manual_review_never_auto_submits_even_at_perfect_confidence():
+    action = decide_action(confidence=1.0, ats_platform="greenhouse", autopilot_enabled=True, trust_level="FULL_MANUAL_REVIEW")
+    assert action == "COPILOT_REVIEW"
+
+
+def test_decide_action_draft_only_never_auto_submits_even_at_perfect_confidence():
+    action = decide_action(confidence=1.0, ats_platform="greenhouse", autopilot_enabled=True, trust_level="DRAFT_ONLY")
+    assert action == "COPILOT_REVIEW"
+
+
+def test_decide_action_trusted_auto_submit_still_respects_confidence():
+    """Trust is additive, not a bypass — a trusted site with a low-confidence
+    fill still lands in review, exactly as an untrusted one would."""
+    action = decide_action(
+        confidence=NEEDS_REVIEW_CONFIDENCE_THRESHOLD - 0.01,
+        ats_platform="greenhouse", autopilot_enabled=True, trust_level="TRUSTED_AUTO_SUBMIT",
+    )
+    assert action == "NEEDS_REVIEW"
+
+
+def test_decide_action_trusted_auto_submit_still_respects_the_platform_allowlist():
+    action = decide_action(confidence=0.95, ats_platform="workday", autopilot_enabled=True, trust_level="TRUSTED_AUTO_SUBMIT")
+    assert action == "COPILOT_REVIEW"
+
+
+def test_decide_action_trusted_auto_submit_still_respects_autopilot_opt_in():
+    action = decide_action(confidence=0.95, ats_platform="greenhouse", autopilot_enabled=False, trust_level="TRUSTED_AUTO_SUBMIT")
+    assert action == "COPILOT_REVIEW"
+
+
+def test_decide_action_treats_an_unrecognized_trust_level_as_full_manual_review():
+    action = decide_action(confidence=0.95, ats_platform="greenhouse", autopilot_enabled=True, trust_level="totally-made-up")
+    assert action == "COPILOT_REVIEW"
 
 
 # ---------------------------------------------------------------------------
@@ -438,6 +490,8 @@ def test_run_auto_submits_on_high_confidence_public_ats(requires_chromium, tmp_p
         resume_document=_resume_document(tmp_path / "resume.pdf"),
         browser_manager=_isolated_browser_manager(tmp_path),
         autopilot_enabled=True,
+        # §6.4: AUTO_SUBMIT now additionally requires a trusted site.
+        resolve_trust_level=lambda: "TRUSTED_AUTO_SUBMIT",
     )
 
     result = manager.run()
@@ -608,6 +662,92 @@ def test_kill_switch_check_that_raises_fails_closed(requires_chromium, tmp_path)
 
     assert result.status == "manual_required"
     assert adapter_cls.calls["fill_personal_information"] == 0
+
+
+def test_user_requested_stop_returns_cancelled_before_the_first_page(requires_chromium, tmp_path):
+    """`POST /applications/{id}/stop` (spec: the user must always be able to
+    stop their own automation) sets `STOP_REQUESTED` for one specific
+    application_id — checked at the exact same per-page point as the
+    account-level kill switch above, but reported as `cancelled` (the user
+    chose to stop; nothing needs fixing) rather than `manual_required`
+    (something needs the user's attention)."""
+    application_id = "app-stop-1"
+    request_stop(application_id)
+    try:
+        adapter_cls = _make_fake_adapter_cls(_HIGH_CONFIDENCE_RESULTS)
+        manager = ApplicationFlowManager(
+            application_id=application_id,
+            user_id="user-1",
+            job_url=_NO_CAPTCHA_NO_NEXT_HTML,
+            ats_platform="greenhouse",
+            adapter_cls=adapter_cls,
+            profile=_profile(),
+            resume_document=_resume_document(tmp_path / "resume.pdf"),
+            browser_manager=_isolated_browser_manager(tmp_path),
+            autopilot_enabled=True,
+        )
+
+        result = manager.run()
+
+        assert result.status == "cancelled"
+        assert adapter_cls.calls["fill_personal_information"] == 0
+        assert "stop_requested" in manager.steps_completed
+    finally:
+        clear_stop_request(application_id)
+
+
+def test_stop_request_registry_is_scoped_to_one_application_id():
+    """A stop requested for one application must never affect another —
+    unlike the account-level kill switch, which is deliberately global."""
+    request_stop("app-stop-scope-a")
+    try:
+        assert is_stop_requested("app-stop-scope-a") is True
+        assert is_stop_requested("app-stop-scope-b") is False
+    finally:
+        clear_stop_request("app-stop-scope-a")
+    assert is_stop_requested("app-stop-scope-a") is False
+
+
+# ---------------------------------------------------------------------------
+# §6.4 trust levels — ApplicationFlowManager._resolve_trust_level's fail-safe
+# contract. No browser involved: constructing an instance (unlike calling
+# `.run()`) never launches one, so `requires_chromium` isn't needed here —
+# same reasoning `test_browser_attach.py`'s docstring already gives for its
+# own construction-only tests.
+# ---------------------------------------------------------------------------
+
+def _manager_for_trust_level_tests(tmp_path, **overrides) -> ApplicationFlowManager:
+    kwargs = dict(
+        application_id="app-trust-1", user_id="user-1", job_url="https://boards.greenhouse.io/acme/jobs/1",
+        ats_platform="greenhouse", adapter_cls=None, profile=_profile(),
+        resume_document=_resume_document(tmp_path / "resume.pdf"),
+        browser_manager=BrowserManager(user_id="user-1", ats_platform="greenhouse", browser_mode="launch"),
+    )
+    kwargs.update(overrides)
+    return ApplicationFlowManager(**kwargs)
+
+
+def test_resolve_trust_level_defaults_to_full_manual_review_with_no_callback(tmp_path):
+    manager = _manager_for_trust_level_tests(tmp_path)
+    assert manager._resolve_trust_level() == "FULL_MANUAL_REVIEW"
+
+
+def test_resolve_trust_level_returns_whatever_the_callback_resolves(tmp_path):
+    manager = _manager_for_trust_level_tests(tmp_path, resolve_trust_level=lambda: "TRUSTED_AUTO_SUBMIT")
+    assert manager._resolve_trust_level() == "TRUSTED_AUTO_SUBMIT"
+
+
+def test_resolve_trust_level_fails_safe_when_the_callback_raises(tmp_path):
+    def _broken():
+        raise RuntimeError("DB unreachable")
+
+    manager = _manager_for_trust_level_tests(tmp_path, resolve_trust_level=_broken)
+    assert manager._resolve_trust_level() == "FULL_MANUAL_REVIEW"
+
+
+def test_resolve_trust_level_fails_safe_on_an_unrecognized_value(tmp_path):
+    manager = _manager_for_trust_level_tests(tmp_path, resolve_trust_level=lambda: "not-a-real-level")
+    assert manager._resolve_trust_level() == "FULL_MANUAL_REVIEW"
 
 
 _LISTING_PAGE_NO_APPLY_HTML = "data:text/html,<html><body><p>Just a plain description page.</p></body></html>"
@@ -1005,6 +1145,8 @@ def test_run_reports_applied_only_when_submission_is_confirmed(requires_chromium
         resume_document=_resume_document(tmp_path / "resume.pdf"),
         browser_manager=_isolated_browser_manager(tmp_path),
         autopilot_enabled=True,
+        # §6.4: AUTO_SUBMIT now additionally requires a trusted site.
+        resolve_trust_level=lambda: "TRUSTED_AUTO_SUBMIT",
     )
 
     result = manager.run()
@@ -1033,6 +1175,8 @@ def test_run_does_not_claim_applied_when_submission_cannot_be_confirmed(requires
         resume_document=_resume_document(tmp_path / "resume.pdf"),
         browser_manager=_isolated_browser_manager(tmp_path),
         autopilot_enabled=True,
+        # §6.4: AUTO_SUBMIT now additionally requires a trusted site.
+        resolve_trust_level=lambda: "TRUSTED_AUTO_SUBMIT",
     )
 
     result = manager.run()
@@ -1379,6 +1523,8 @@ def test_run_walks_an_application_of_any_length_to_its_final_page(requires_chrom
         resume_document=_resume_document(tmp_path / "resume.pdf"),
         browser_manager=_isolated_browser_manager(tmp_path),
         autopilot_enabled=True,
+        # §6.4: AUTO_SUBMIT now additionally requires a trusted site.
+        resolve_trust_level=lambda: "TRUSTED_AUTO_SUBMIT",
     )
 
     result = manager.run()

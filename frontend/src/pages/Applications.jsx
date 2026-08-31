@@ -1,14 +1,21 @@
 import { useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
-import { LayoutDashboard, Loader2, ArrowRight, Search } from "lucide-react";
+import { LayoutDashboard, ArrowRight, Search, Square, Trash2 } from "lucide-react";
 import { api } from "../api";
 import StatusBadge, { STATUS_LABELS } from "../components/StatusBadge";
+import { SkeletonLine } from "../components/Skeleton";
+
+//: `display_status` values a user can actually stop — mirrors the backend's
+//: `IN_PROGRESS_STATUSES` (`pending`/`processing`/`copilot_review`) through
+//: `DISPLAY_STATUS_MAP` (`app/services/application_repository.py`).
+const STOPPABLE_STATUSES = new Set(["READY", "IN_PROGRESS", "READY_TO_SUBMIT"]);
 
 export default function Applications({ toast }) {
   const [applications, setApplications] = useState([]);
   const [loading, setLoading] = useState(true);
   const [statusFilter, setStatusFilter] = useState("");
   const [search, setSearch] = useState("");
+  const [busyId, setBusyId] = useState(null);
 
   useEffect(() => {
     api.listApplications()
@@ -16,6 +23,34 @@ export default function Applications({ toast }) {
       .catch((e) => toast(e.message, "error"))
       .finally(() => setLoading(false));
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  async function stop(applicationId) {
+    if (!window.confirm("Stop this application? It will be marked cancelled and can be retried later.")) return;
+    setBusyId(applicationId);
+    try {
+      const updated = await api.stopApplication(applicationId);
+      setApplications((prev) => prev.map((a) => (a.application_id === applicationId ? updated : a)));
+      toast("Application stopped.", "success");
+    } catch (e) {
+      toast(e.message, "error");
+    } finally {
+      setBusyId(null);
+    }
+  }
+
+  async function remove(applicationId) {
+    if (!window.confirm("Delete this application? This permanently removes its history and cannot be undone.")) return;
+    setBusyId(applicationId);
+    try {
+      await api.deleteApplication(applicationId);
+      setApplications((prev) => prev.filter((a) => a.application_id !== applicationId));
+      toast("Application deleted.", "success");
+    } catch (e) {
+      toast(e.message, "error");
+    } finally {
+      setBusyId(null);
+    }
+  }
 
   const statusCounts = useMemo(() => {
     const counts = {};
@@ -32,15 +67,13 @@ export default function Applications({ toast }) {
     });
   }, [applications, statusFilter, search]);
 
-  if (loading) {
-    return <div className="flex justify-center py-20"><Loader2 size={26} className="animate-spin text-brand-600" /></div>;
-  }
-
   return (
     <div className="animate-fade-up space-y-5">
       <div>
         <h1 className="page-title">Applications</h1>
-        <p className="page-subtitle">Every application the automation has ever touched — {applications.length} total.</p>
+        <p className="page-subtitle">
+          {loading ? "Loading your application history…" : `Every application the automation has ever touched — ${applications.length} total.`}
+        </p>
       </div>
 
       <div className="card overflow-hidden">
@@ -48,7 +81,7 @@ export default function Applications({ toast }) {
           <div className="relative flex-1">
             <Search size={15} className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
             <input className="input !pl-9" placeholder="Search by company or position..."
-              value={search} onChange={(e) => setSearch(e.target.value)} />
+              value={search} onChange={(e) => setSearch(e.target.value)} disabled={loading} />
           </div>
           <div className="flex flex-wrap gap-1 overflow-x-auto rounded-lg bg-slate-100 p-1">
             <button onClick={() => setStatusFilter("")}
@@ -66,7 +99,19 @@ export default function Applications({ toast }) {
           </div>
         </div>
 
-        {filtered.length === 0 ? (
+        {loading ? (
+          <div className="divide-y divide-slate-100">
+            {Array.from({ length: 6 }).map((_, i) => (
+              <div key={i} className="grid grid-cols-5 items-center gap-4 px-5 py-3.5">
+                <SkeletonLine width="w-24" />
+                <SkeletonLine width="w-32" />
+                <SkeletonLine width="w-16" />
+                <SkeletonLine width="w-10" />
+                <SkeletonLine width="w-20" />
+              </div>
+            ))}
+          </div>
+        ) : filtered.length === 0 ? (
           <div className="flex flex-col items-center p-12 text-center">
             <LayoutDashboard size={30} className="mb-3 text-slate-300" />
             <p className="font-medium text-slate-700">
@@ -103,11 +148,25 @@ export default function Applications({ toast }) {
                     <td className="px-5 py-3 text-xs text-slate-500">
                       {a.updated_at ? new Date(a.updated_at).toLocaleString() : "—"}
                     </td>
-                    <td className="px-5 py-3 text-right">
-                      <Link to={`/applications/${a.application_id}`}
-                        className="btn-ghost !px-3 !py-1.5 text-xs">
-                        View <ArrowRight size={13} />
-                      </Link>
+                    <td className="px-5 py-3">
+                      <div className="flex items-center justify-end gap-1.5">
+                        {STOPPABLE_STATUSES.has(a.display_status) && (
+                          <button onClick={() => stop(a.application_id)} disabled={busyId === a.application_id}
+                            title="Stop this application"
+                            className="btn-ghost !px-2.5 !py-1.5 text-xs text-amber-700 hover:bg-amber-50 disabled:opacity-50">
+                            <Square size={13} />
+                          </button>
+                        )}
+                        <button onClick={() => remove(a.application_id)} disabled={busyId === a.application_id}
+                          title="Delete this application"
+                          className="btn-ghost !px-2.5 !py-1.5 text-xs text-red-600 hover:bg-red-50 disabled:opacity-50">
+                          <Trash2 size={13} />
+                        </button>
+                        <Link to={`/applications/${a.application_id}`}
+                          className="btn-ghost !px-3 !py-1.5 text-xs">
+                          View <ArrowRight size={13} />
+                        </Link>
+                      </div>
                     </td>
                   </tr>
                 ))}

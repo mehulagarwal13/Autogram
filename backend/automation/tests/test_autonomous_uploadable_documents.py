@@ -115,8 +115,10 @@ def test_uploadable_paths_is_empty_when_nothing_was_offered():
 def test_refused_upload_pauses_for_manual_action_instead_of_failing(monkeypatch):
     """With no uploadable document, an `upload_file` the LLM proposes is
     refused by the allowlist — and the loop must raise an honest
-    MANUAL_ACTION_REQUIRED pause asking the human to attach the file, not
-    fail the task and not keep guessing at paths."""
+    FILE_UPLOAD_REQUIRED pause asking the human to attach the file, not
+    fail the task and not keep guessing at paths (spec §29: a missing
+    document gets its own request type rather than the generic
+    MANUAL_ACTION_REQUIRED bucket)."""
     task = FakeTask()
     task.uploaded_documents = []  # nothing offered — the pre-fix default
     handle = TaskHandle(resume_event=threading.Event(), cancel_requested=threading.Event())
@@ -138,7 +140,7 @@ def test_refused_upload_pauses_for_manual_action_instead_of_failing(monkeypatch)
 
     assert still_going is False
     assert task.current_status == "WAITING_FOR_HUMAN"
-    assert task.human_intervention["request_type"] == "MANUAL_ACTION_REQUIRED"
+    assert task.human_intervention["request_type"] == "FILE_UPLOAD_REQUIRED"
     # The refused action is recorded as unsuccessful, with the reason.
     assert task.action_history[-1]["success"] is False
     assert task.action_history[-1]["blocked_reason"] == "upload_path_not_allowed"

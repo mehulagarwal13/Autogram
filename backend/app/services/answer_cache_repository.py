@@ -22,6 +22,7 @@ follow-up this module's docstring used to call out as a "natural" future step
 from __future__ import annotations
 
 import hashlib
+import logging
 import re
 import uuid
 from datetime import datetime, timezone
@@ -31,8 +32,33 @@ from sqlalchemy.orm import Session
 from app.models.db_models import AnswerCacheEntry
 from app.services.embedding_service import generate_embedding
 
+logger = logging.getLogger(__name__)
+
 _WHITESPACE = re.compile(r"\s+")
 _PUNCTUATION = re.compile(r"[^\w\s]")
+
+# Defense-in-depth (spec §12 / non-negotiable #9: never store an OTP or a
+# password). The REAL protection is architectural — a verification code only
+# ever lives in `TaskHandle.pending_secret` (in-process, cleared on read) and
+# never reaches this cache at all. This is the belt-and-suspenders backstop
+# for the residual case: a screening QUESTION whose own text happens to look
+# like a secret prompt (e.g. a misclassified "Enter the code we sent you")
+# must never be written here even if some future caller mistakenly tried.
+# Deliberately self-contained rather than importing
+# `automation/agents/autonomous/observer.py`'s page-text patterns: this
+# module guards a cached question string, not page text, and `app/services`
+# does not depend on `automation/` (the dependency runs the other way).
+_SECRET_PROMPT_RE = re.compile(
+    r"one[-\s]?time\s*(password|code|pass)|verification\s*code|security\s*code|"
+    r"authenticat(?:or|ion)\s*code|two[-\s]?factor|2fa\b|\botp\b|\bmfa\b|"
+    r"captcha|i'?m\s*not\s*a\s*robot|"
+    r"\bpassword\b|\bpasscode\b",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_secret_prompt(question: str) -> bool:
+    return bool(_SECRET_PROMPT_RE.search(question or ""))
 
 # Cosine similarity floor for treating two DIFFERENTLY-worded questions as
 # "the same question" — high enough that only genuine paraphrases hit (not
@@ -71,7 +97,7 @@ def save_answer(
     answer: str,
     source: str,
     confidence: float,
-) -> AnswerCacheEntry:
+) -> AnswerCacheEntry | None:
     """Upsert, not insert-only — a later run answering the same question
     with fresher profile data (or a corrected LLM answer) should overwrite
     the stale cached one instead of piling up duplicate rows for the same
@@ -81,7 +107,20 @@ def save_answer(
     differently-worded question can find it via `find_similar_answer`. A
     failed embedding call degrades to exact-match-only for this row rather
     than blocking the save — losing the semantic hit is a minor cost saving
-    missed, not a correctness problem."""
+    missed, not a correctness problem.
+
+    Returns `None`, writing nothing, when `question` reads as an OTP/MFA/
+    CAPTCHA/password prompt (see `_looks_like_secret_prompt`) — see spec
+    non-negotiable #9. Callers that don't already handle a secret specially
+    (this cache is never in the OTP code path itself) still get this backstop
+    for free."""
+    if _looks_like_secret_prompt(question):
+        logger.warning(
+            "answer_cache_repository.save_answer: refused to cache a question that reads as a "
+            "secret/verification prompt for user %s.", user_id,
+        )
+        return None
+
     question_hash = compute_question_hash(question)
     try:
         embedding = generate_embedding(question)

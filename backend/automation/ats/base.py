@@ -845,6 +845,29 @@ class ATSAdapter(ABC):
             logger.debug("Could not resolve a nested input for a label (%s).", e)
         return None
 
+    @staticmethod
+    def _label_target_is_visible(input_locator: Locator, label: Locator) -> bool:
+        """Whether a label's control is currently actionable on this step.
+
+        ATS sites such as Oracle HCM visually hide native radio inputs and
+        render the associated ``<label>`` as the clickable circle.  In that
+        shape the input's own Playwright visibility is false even though the
+        field is on screen.  The label itself must be visible for the radio
+        exception, which keeps controls retained in inactive wizard sections
+        correctly excluded until their section becomes active.
+        """
+        try:
+            if input_locator.is_visible():
+                return True
+            tag_name = input_locator.evaluate("el => el.tagName.toLowerCase()")
+            input_type = (
+                (input_locator.get_attribute("type") or "text").lower()
+                if tag_name == "input" else ""
+            )
+            return input_type == "radio" and label.is_visible()
+        except PlaywrightError:
+            return False
+
     def _fill_known_questions(self) -> list[FieldFillResult]:
         """Generic, cross-ATS sweep of the page: every `<label>`'s text
         first (Phase 5 — `FieldMapper`), then every UNLABELED control whose
@@ -931,11 +954,7 @@ class ATSAdapter(ABC):
                 # therefore ApplicationFlowManager's confidence score).
                 continue
 
-            try:
-                is_visible = input_locator.is_visible()
-            except PlaywrightError as e:
-                logger.debug("Could not check visibility for matched question %r (%s): %s", text, attribute, e)
-                is_visible = False
+            is_visible = self._label_target_is_visible(input_locator, label)
 
             if not is_visible:
                 # Not on the page the user is looking at — so neither scored nor
@@ -1012,6 +1031,22 @@ class ATSAdapter(ABC):
     el => {
       const groupName = el.name;
       const isMember = n => n.tagName === 'INPUT' && n.type === 'radio' && n.name === groupName;
+
+      // Prefer the widget's accessible group name. Oracle HCM exposes the
+      // real question here while each input's own aria-labelledby names only
+      // its Yes/No option.
+      const radioGroup = el.closest('[role="radiogroup"]');
+      if (radioGroup) {
+        const labelledBy = (radioGroup.getAttribute('aria-labelledby') || '').trim();
+        for (const id of labelledBy.split(/\\s+/).filter(Boolean)) {
+          const label = document.getElementById(id);
+          const text = (label && label.textContent || '').replace(/\\s+/g, ' ').trim();
+          if (text.length >= 10 && text.length <= 2000) return text;
+        }
+        const ariaLabel = (radioGroup.getAttribute('aria-label') || '').replace(/\\s+/g, ' ').trim();
+        if (ariaLabel.length >= 10 && ariaLabel.length <= 2000) return ariaLabel;
+      }
+
       let cur = el;
       for (let i = 0; i < 6 && cur.parentElement; i++) {
         cur = cur.parentElement;
@@ -1027,9 +1062,12 @@ class ATSAdapter(ABC):
           }
           if (wraps || (pointsAt && isMember(pointsAt))) l.remove();
         });
+        // A failed Next click can mount validation text immediately beside
+        // the options. It is feedback, never the question being asked.
+        clone.querySelectorAll('[role="alert"], .input-row__validation').forEach(n => n.remove());
         clone.querySelectorAll('input, textarea, select, button').forEach(n => n.remove());
         const text = (clone.textContent || '').replace(/\\s+/g, ' ').trim();
-        if (text.length >= 10 && text.length <= 400) return text;
+        if (text.length >= 10 && text.length <= 2000) return text;
       }
       return '';
     }
@@ -1092,8 +1130,6 @@ class ATSAdapter(ABC):
             return
 
         try:
-            if not input_locator.is_visible():
-                return
             tag_name = input_locator.evaluate("el => el.tagName.toLowerCase()")
             if tag_name not in ("input", "textarea", "select"):
                 return
@@ -1104,6 +1140,9 @@ class ATSAdapter(ABC):
                     return
         except PlaywrightError as e:
             logger.debug("Could not inspect the control for question %r (%s) — skipping.", text, e)
+            return
+
+        if not self._label_target_is_visible(input_locator, label):
             return
 
         if input_type == "radio":

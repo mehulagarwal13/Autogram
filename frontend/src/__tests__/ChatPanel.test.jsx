@@ -66,6 +66,34 @@ describe("transcript rendering", () => {
     expect(container.textContent).not.toMatch(/\d{4,}/);
   });
 
+  it("renders a vision-assisted screenshot when the agent attaches one", async () => {
+    // Attached only when the agent fell back to a screenshot before pausing
+    // (spec §19/§21/§24) — a small inline data URI, no separate fetch.
+    vi.spyOn(api, "getChatTranscript").mockResolvedValue([
+      message({
+        role: "agent",
+        content: "I'm not sure how to proceed here.",
+        safe_metadata: { request_type: "UNKNOWN_BLOCKER", screenshot_data_uri: "data:image/jpeg;base64,Zm9v" },
+      }),
+    ]);
+
+    render(<ChatPanel scope="tasks" resourceId="t1" />);
+
+    const img = await screen.findByAltText(/what autogram saw/i);
+    expect(img).toHaveAttribute("src", "data:image/jpeg;base64,Zm9v");
+  });
+
+  it("renders no image when a message has no screenshot attached", async () => {
+    vi.spyOn(api, "getChatTranscript").mockResolvedValue([
+      message({ role: "agent", content: "Please sign in to continue.", safe_metadata: { request_type: "LOGIN_REQUIRED" } }),
+    ]);
+
+    render(<ChatPanel scope="tasks" resourceId="t1" />);
+
+    await screen.findByText("Please sign in to continue.");
+    expect(screen.queryByRole("img")).toBeNull();
+  });
+
   it("explains an empty transcript instead of showing a blank panel", async () => {
     vi.spyOn(api, "getChatTranscript").mockResolvedValue([]);
     render(<ChatPanel scope="tasks" resourceId="t1" />);

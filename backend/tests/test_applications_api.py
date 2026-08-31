@@ -15,12 +15,14 @@ from app.api.applications import (
     _pick_resume_document_id,
     approve_application,
     check_duplicate_application,
+    delete_application,
     get_applications_overview,
     list_applications_needing_review,
     reject_application,
     report_application_status,
     review_application_question,
     start_application,
+    stop_application,
 )
 
 
@@ -676,6 +678,117 @@ def test_reject_application_closes_the_review_session_and_cancels(monkeypatch):
     assert close_calls == ["app-1"]
     assert result.status == "cancelled"
     assert result.failure_reason == "Changed my mind"
+
+
+# ---------------------------------------------------------------------------
+# Stop / delete — user-initiated (spec: never leave the user unable to act on
+# their own automation, and always able to remove a record they own).
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("terminal_status", ["applied", "failed", "needs_review", "cancelled"])
+def test_stop_application_refuses_a_status_that_is_not_in_progress(monkeypatch, terminal_status):
+    _owned_application(monkeypatch, status=terminal_status)
+
+    with pytest.raises(HTTPException) as exc_info:
+        stop_application("app-1", user=MagicMock(user_id="user-1"), db=MagicMock())
+    assert exc_info.value.status_code == 409
+
+
+def test_stop_application_on_processing_signals_the_run_and_cancels(monkeypatch):
+    import app.api.applications as applications_module
+
+    application = _owned_application(monkeypatch, status="processing")
+    stop_calls = []
+    close_calls = []
+    monkeypatch.setattr(applications_module, "request_stop", lambda aid: stop_calls.append(aid))
+    monkeypatch.setattr(applications_module, "close_review_session", lambda aid: close_calls.append(aid))
+    monkeypatch.setattr(
+        applications_module.application_repository, "mark_cancelled",
+        lambda db, app, reason=None: (setattr(app, "status", "cancelled"), setattr(app, "failure_reason", reason), app)[-1],
+    )
+
+    result = stop_application("app-1", user=MagicMock(user_id="user-1"), db=MagicMock())
+
+    assert stop_calls == ["app-1"]
+    assert close_calls == [], "processing has no open review-session browser to close"
+    assert result.status == "cancelled"
+    assert application.status == "cancelled"
+
+
+def test_stop_application_on_copilot_review_closes_the_browser_instead_of_signalling(monkeypatch):
+    import app.api.applications as applications_module
+
+    _owned_application(monkeypatch, status="copilot_review")
+    stop_calls = []
+    close_calls = []
+    monkeypatch.setattr(applications_module, "request_stop", lambda aid: stop_calls.append(aid))
+    monkeypatch.setattr(applications_module, "close_review_session", lambda aid: close_calls.append(aid))
+    monkeypatch.setattr(
+        applications_module.application_repository, "mark_cancelled",
+        lambda db, app, reason=None: (setattr(app, "status", "cancelled"), app)[-1],
+    )
+
+    result = stop_application("app-1", user=MagicMock(user_id="user-1"), db=MagicMock())
+
+    assert close_calls == ["app-1"]
+    assert stop_calls == [], "a parked review session has no live thread to signal"
+    assert result.status == "cancelled"
+
+
+def test_delete_application_removes_the_row(monkeypatch):
+    import app.api.applications as applications_module
+
+    application = _owned_application(monkeypatch, status="failed")
+    delete_calls = []
+    monkeypatch.setattr(applications_module.application_repository, "delete", lambda db, app: delete_calls.append(app))
+    monkeypatch.setattr(applications_module, "close_review_session", lambda aid: None)
+
+    response = delete_application("app-1", user=MagicMock(user_id="user-1"), db=MagicMock())
+
+    assert delete_calls == [application]
+    assert response.status_code == 204
+
+
+def test_delete_application_stops_an_in_progress_run_before_deleting(monkeypatch):
+    import app.api.applications as applications_module
+
+    _owned_application(monkeypatch, status="processing")
+    stop_calls = []
+    monkeypatch.setattr(applications_module, "request_stop", lambda aid: stop_calls.append(aid))
+    monkeypatch.setattr(applications_module.application_repository, "delete", lambda db, app: None)
+
+    delete_application("app-1", user=MagicMock(user_id="user-1"), db=MagicMock())
+
+    assert stop_calls == ["app-1"]
+
+
+def test_delete_application_closes_a_parked_review_session_before_deleting(monkeypatch):
+    import app.api.applications as applications_module
+
+    _owned_application(monkeypatch, status="copilot_review")
+    close_calls = []
+    monkeypatch.setattr(applications_module, "close_review_session", lambda aid: close_calls.append(aid))
+    monkeypatch.setattr(applications_module.application_repository, "delete", lambda db, app: None)
+
+    delete_application("app-1", user=MagicMock(user_id="user-1"), db=MagicMock())
+
+    assert close_calls == ["app-1"]
+
+
+def test_delete_application_closes_a_review_session_defensively_even_on_a_terminal_status(monkeypatch):
+    """`close_review_session` is a documented no-op when nothing is parked —
+    called unconditionally on a non-in-progress status too, since a leaked
+    tab would otherwise become unreachable the instant the row is gone."""
+    import app.api.applications as applications_module
+
+    _owned_application(monkeypatch, status="applied")
+    close_calls = []
+    monkeypatch.setattr(applications_module, "close_review_session", lambda aid: close_calls.append(aid))
+    monkeypatch.setattr(applications_module.application_repository, "delete", lambda db, app: None)
+
+    delete_application("app-1", user=MagicMock(user_id="user-1"), db=MagicMock())
+
+    assert close_calls == ["app-1"]
 
 
 # ---------------------------------------------------------------------------

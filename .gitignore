@@ -1,5 +1,14 @@
-# Environment variables
+# Environment variables and local Worker secrets
 .env
+.env.*
+**/.env
+**/.env.*
+!**/.env.example
+.dev.vars
+**/.dev.vars
+!**/.dev.vars.example
+.wrangler/
+**/.wrangler/
 
 # Extension dev signing key (controls the stable chrome-extension:// ID) + build output/deps
 extension/dev-key.pem
@@ -24,6 +33,10 @@ Thumbs.db
 # automation/browser/chrome_attach.py) — hundreds of MB of Chrome's own binary
 # state, and it holds the user's live login cookies. Never commit it.
 storage/chrome_profile/
+storage/
+logs/
+backend/storage/
+backend/logs/
 
 # Playwright artifacts
 trace.zip
@@ -35,5 +48,8 @@ playwright-report/
 # Root-level Remotion demo-video project (src/, remotion.config.ts, tsconfig.json)
 node_modules/
 package-lock.json
+!frontend/package-lock.json
+!extension/package-lock.json
+!worker/package-lock.json
 out/
 .remotion/

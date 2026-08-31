@@ -72,26 +72,28 @@ export default function ApplyFromLink({ toast }) {
   }
 
   return (
-    <div className={`relative overflow-hidden rounded-xl border-2 border-brand-200 bg-brand-50/60 p-6 sm:p-7 ${busy ? "card-active" : ""}`}>
-      <div className="flex flex-col gap-5 sm:flex-row sm:items-center">
-        <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-xl bg-brand-600 shadow-sm">
+    <div className={`relative overflow-hidden rounded-2xl border border-white/10 bg-[#11182a] p-6 shadow-[0_20px_55px_-24px_rgba(15,23,42,0.55)] sm:p-7 ${busy ? "card-active" : ""}`}>
+      <div className="pointer-events-none absolute -right-24 -top-28 h-72 w-72 rounded-full bg-brand-500/20 blur-3xl" />
+      <div className="pointer-events-none absolute inset-0 opacity-[0.06]" style={{ backgroundImage: "radial-gradient(circle at 1px 1px, white 1px, transparent 0)", backgroundSize: "24px 24px" }} />
+      <div className="relative flex flex-col gap-5 sm:flex-row sm:items-center">
+        <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-2xl bg-brand-gradient shadow-lg shadow-brand-950/30 ring-1 ring-white/20">
           <Rocket size={22} className="text-white" />
         </div>
         <div className="flex-1">
-          <span className="badge badge-brand mb-1.5">
-            <Zap size={11} /> Quick Action
+          <span className="mb-1.5 inline-flex items-center gap-1.5 rounded-full bg-cyan-400/10 px-2.5 py-1 text-[10px] font-bold uppercase tracking-[0.12em] text-cyan-300 ring-1 ring-cyan-300/10">
+            <Zap size={11} /> Agent launchpad
           </span>
-          <h2 className="text-lg font-semibold text-slate-900">Apply from a job link</h2>
-          <p className="mt-1 max-w-2xl text-sm text-slate-600">
+          <h2 className="text-xl font-semibold tracking-tight text-white">Turn any job link into an application</h2>
+          <p className="mt-1 max-w-2xl text-sm leading-relaxed text-slate-400">
             Paste any job posting URL — the automation opens it, detects the ATS platform, fills the
             application from your profile, and hands it back to you for a final review before submitting.
           </p>
         </div>
       </div>
 
-      <div className="mt-5 flex flex-col gap-3 sm:flex-row">
+      <div className="relative mt-5 flex flex-col gap-2 rounded-2xl bg-white p-1.5 shadow-xl shadow-black/20 sm:flex-row">
         <input
-          className="input flex-1 !bg-white !py-3"
+          className="min-w-0 flex-1 rounded-xl border-0 bg-transparent px-3.5 py-3 text-sm text-slate-900 outline-none placeholder:text-slate-400 focus:ring-0"
           type="url"
           placeholder="https://company.com/careers/software-engineer"
           value={jobUrl}
@@ -105,14 +107,14 @@ export default function ApplyFromLink({ toast }) {
             MouseEvent silently sent as `acknowledge_previous_submission`. The
             server rejects it, but a normal start must never even look like an
             override attempt. */}
-        <button className="btn-primary shrink-0 !py-3 sm:w-auto" onClick={() => startApplication()} disabled={busy}>
+        <button className="btn-primary shrink-0 !rounded-xl !px-5 !py-3 sm:w-auto" onClick={() => startApplication()} disabled={busy}>
           {busy ? <Loader2 size={16} className="animate-spin" /> : <Link2 size={16} />}
           {busy ? "Starting..." : "Start Application"}
         </button>
       </div>
 
       {conflict && (
-        <div className="mt-4 rounded-lg border border-amber-200 bg-amber-50 p-3.5">
+        <div className="relative mt-4 rounded-xl border border-amber-200 bg-amber-50 p-3.5">
           <div className="flex items-start gap-2.5">
             <ShieldAlert size={16} className="mt-0.5 shrink-0 text-amber-600" />
             <div className="flex-1">

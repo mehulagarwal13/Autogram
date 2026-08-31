@@ -147,6 +147,10 @@ function Message({ message }) {
   // A redacted verification code is styled distinctly so the transcript makes
   // it obvious that Autogram stored the FACT of a code, never the code itself.
   const redacted = Boolean(meta?.secret_redacted);
+  // Attached only when the agent fell back to a vision-assisted screenshot
+  // before pausing (spec §19/§21/§24) — a small inline data URI, no separate
+  // fetch or storage endpoint needed.
+  const screenshot = meta?.screenshot_data_uri;
 
   return (
     <div className={`flex gap-2.5 ${isUser ? "flex-row-reverse" : ""}`}>
@@ -170,6 +174,13 @@ function Message({ message }) {
           {redacted && <ShieldAlert size={12} className="mr-1 inline-block align-[-2px]" />}
           {content}
         </div>
+        {screenshot && (
+          <img
+            src={screenshot}
+            alt="What Autogram saw in the browser when it needed help"
+            className="mt-1.5 max-w-[320px] rounded-lg border border-slate-200 shadow-sm"
+          />
+        )}
         {createdAt && (
           <p className="mt-0.5 text-[10px] text-slate-400">
             {new Date(createdAt).toLocaleTimeString()}

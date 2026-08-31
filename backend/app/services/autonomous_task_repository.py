@@ -71,6 +71,7 @@ def create_task(
         action_history=[],
         application_progress={},
         confirmed_answers={},
+        field_attempt_ledger={},
         # The `upload_file` allowlist for this task — see
         # `app/api/autonomous_agent.py::_build_uploadable_documents`.
         uploaded_documents=uploaded_documents or [],
@@ -143,6 +144,21 @@ def append_action(db: Session, task: AutonomousTask, action_record: dict) -> Aut
     history = list(task.action_history or [])
     history.append(action_record)
     task.action_history = history
+    task.updated_at = datetime.now(timezone.utc)
+    db.commit()
+    db.refresh(task)
+    return task
+
+
+def record_field_attempt(db: Session, task: AutonomousTask, field_identity: str, entry: dict) -> AutonomousTask:
+    """Upserts one field's entry in `field_attempt_ledger` (spec §16) —
+    reassigns the whole dict (same pattern `append_action` uses for
+    `action_history`) so SQLAlchemy's JSONB change-tracking, which does not
+    see in-place mutation of a mutable Python object, reliably flags the
+    column dirty."""
+    ledger = dict(task.field_attempt_ledger or {})
+    ledger[field_identity] = entry
+    task.field_attempt_ledger = ledger
     task.updated_at = datetime.now(timezone.utc)
     db.commit()
     db.refresh(task)

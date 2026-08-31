@@ -1,29 +1,17 @@
 # Cloudflare deployment config for Autogram.
 #
-# One Worker is the single front door for the whole app: it serves the built
-# frontend (frontend/dist) as static assets, and proxies everything under
-# /api/* to the backend Container (built from the root Dockerfile). Serving
-# both from one Worker on one hostname keeps the frontend's same-origin
-# assumptions working with zero frontend code changes - frontend/src/api.js
-# calls relative "/api/..." paths and builds its WebSocket URL from
-# window.location.host, so it needs the backend to live on the same origin.
-name = "autogram"
+# Backend-only Worker and Cloudflare Container. The frontend is a separate
+# Cloudflare Pages project and calls this service through VITE_API_URL.
+name = "autogram-api"
 main = "index.js"
 compatibility_date = "2026-08-01"
-
-[assets]
-directory = "../frontend/dist"
-binding = "ASSETS"
-# frontend uses react-router-dom client-side routing - a direct link or
-# refresh on a non-root path must fall back to index.html, not 404.
-not_found_handling = "single-page-application"
 
 [[containers]]
 class_name = "Backend"
 image = "../backend/Dockerfile"
 # Hard architectural requirement, not a cost knob: the backend keeps
 # automation task state, open review-session browsers, and WebSocket
-# subscribers in this ONE process's memory (see the root Dockerfile's CMD
+# subscribers in this ONE process's memory (see backend/Dockerfile's CMD
 # comment, and README.md's "SINGLE WORKER ONLY" section). A second instance
 # would silently drop requests routed to an instance that doesn't own a
 # given task, session, or socket.
@@ -41,8 +29,11 @@ new_sqlite_classes = ["Backend"]
 # sensitive (DATABASE_URL, OPENAI_API_KEY, JWT_SECRET, ENCRYPTION_KEY,
 # ADZUNA_APP_ID, ADZUNA_APP_KEY, API_KEY) is set with
 # `npx wrangler secret put <NAME>` instead - see ../DEPLOYMENT.md - and read
-# automatically via the `env` import in index.js. No CORS_ORIGINS is set here
-# on purpose: frontend and backend share an origin under this Worker, so no
-# CORS headers are needed at all.
+# automatically via the `env` import in index.js. CORS_ORIGINS and optional
+# CORS_ORIGIN_REGEX are environment-specific Worker secrets as well.
 [vars]
 AUTOMATION_BROWSER_MODE = "launch"
+AUTOMATION_HEADLESS = "true"
+# Local container disk preserves current behavior but is ephemeral. See
+# DEPLOYMENT.md before changing this to "s3" for Cloudflare R2.
+STORAGE_BACKEND = "local"

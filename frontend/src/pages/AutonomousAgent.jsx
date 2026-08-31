@@ -119,7 +119,7 @@ function StartForm({ toast, onStarted }) {
   return (
     <div className="card mx-auto max-w-xl p-6">
       <div className="mb-4 flex items-center gap-2.5">
-        <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-brand-600">
+        <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-brand-gradient shadow-xs">
           <Bot size={18} className="text-white" />
         </div>
         <div>

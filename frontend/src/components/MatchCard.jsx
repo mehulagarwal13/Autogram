@@ -23,7 +23,7 @@ export default function MatchCard({ match, onStatus, onApply, applying }) {
   const isDismissed = match.status === "dismissed";
 
   return (
-    <div className={`card p-5 transition-shadow hover:shadow-popover ${isDismissed ? "opacity-50" : ""}`}>
+    <div className={`card card-hover p-5 ${isDismissed ? "opacity-50" : ""}`}>
       <div className="flex items-start gap-4">
         <ScoreRing value={match.blended_score} label="match" />
 

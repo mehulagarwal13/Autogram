@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import {
   ArrowLeft, Building2, ExternalLink, Loader2, AlertTriangle, ShieldAlert,
-  CheckCircle2, RotateCcw, ChevronDown, FileText,
+  CheckCircle2, RotateCcw, ChevronDown, FileText, Square, Trash2,
 } from "lucide-react";
 import { api } from "../api";
 import VerificationCodePanel from "../components/VerificationCodePanel";
@@ -114,6 +114,33 @@ export default function ApplicationDetail({ toast }) {
     }
   }
 
+  async function stop() {
+    if (!window.confirm("Stop this application? It will be marked cancelled and can be retried later.")) return;
+    setBusy(true);
+    try {
+      await api.stopApplication(id);
+      toast("Application stopped.", "info");
+      await loadAll();
+    } catch (e) {
+      toast(e.message, "error");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function remove() {
+    if (!window.confirm("Delete this application? This permanently removes its history and cannot be undone.")) return;
+    setBusy(true);
+    try {
+      await api.deleteApplication(id);
+      toast("Application deleted.", "success");
+      navigate("/applications");
+    } catch (e) {
+      toast(e.message, "error");
+      setBusy(false);
+    }
+  }
+
   async function retry() {
     if (!application) return;
     setBusy(true);
@@ -156,7 +183,13 @@ export default function ApplicationDetail({ toast }) {
               {application.ats_platform && <span className="badge badge-neutral">{application.ats_platform}</span>}
             </p>
           </div>
-          <StatusBadge status={status} />
+          <div className="flex items-center gap-2">
+            <StatusBadge status={status} />
+            <button onClick={remove} disabled={busy} title="Delete this application"
+              className="btn-ghost !px-2.5 !py-1.5 text-xs text-red-600 hover:bg-red-50">
+              <Trash2 size={13} />
+            </button>
+          </div>
         </div>
         <a href={application.job_url} target="_blank" rel="noreferrer"
           className="mt-3 inline-flex items-center gap-1 text-xs text-brand-600 hover:underline">
@@ -191,9 +224,14 @@ export default function ApplicationDetail({ toast }) {
       {/* Live automation view */}
       {isActive && (
         <div className="card p-6">
-          <h2 className="mb-3 flex items-center gap-2 font-semibold text-slate-900">
-            <Loader2 size={16} className="animate-spin text-brand-600" /> Live Automation
-          </h2>
+          <div className="mb-3 flex items-center justify-between gap-3">
+            <h2 className="flex items-center gap-2 font-semibold text-slate-900">
+              <Loader2 size={16} className="animate-spin text-brand-600" /> Live Automation
+            </h2>
+            <button className="btn-ghost !px-3 !py-1.5 text-xs text-amber-700 hover:bg-amber-50" disabled={busy} onClick={stop}>
+              <Square size={13} /> Stop
+            </button>
+          </div>
           <div className="progress-track"><div className="progress-indeterminate" /></div>
           <div className="mt-3 grid grid-cols-2 gap-3 text-sm sm:grid-cols-4">
             <div>

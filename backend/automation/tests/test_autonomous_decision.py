@@ -107,3 +107,28 @@ def test_system_prompt_is_used_verbatim():
     assert SYSTEM_PROMPT.startswith("You are Autogram's autonomous job application agent.")
     assert "Never claim that the application was successfully submitted" in SYSTEM_PROMPT
     assert "EXECUTE_ACTION, REQUEST_HUMAN_INTERVENTION, APPLICATION_READY_FOR_SUBMISSION, TASK_COMPLETED, or TASK_FAILED" in SYSTEM_PROMPT
+
+
+def test_prompt_presents_observed_apply_action_and_grounding_rules():
+    apply = PageElement(
+        ref=12, tag="button", type="button", name="Apply Now", value=None,
+        required=False, disabled=False, checked=None, options=None,
+        semantic_action="APPLY", action_confidence="HIGH",
+    )
+    state = PageState(
+        url="https://example.com/jobs/123", title="Engineer", visible_text="Job description",
+        elements=[apply], page_type="JOB_LISTING",
+    )
+    payload = {"decision": "EXECUTE_ACTION", "action": {"action_type": "click", "element_ref": 12}}
+    with patch(
+        "automation.agents.autonomous.decision.generate_answer",
+        return_value=json.dumps(payload),
+    ) as generate:
+        _decide(page_state=state)
+
+    prompt = generate.call_args.kwargs["prompt"]
+    assert '"observed_actions"' in prompt
+    assert '"element_ref": 12' in prompt
+    assert '"semantic_action": "APPLY"' in prompt
+    assert '"enabled": true' in prompt
+    assert "Never construct /apply" in prompt

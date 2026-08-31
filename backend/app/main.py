@@ -4,9 +4,9 @@ from fastapi import FastAPI, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
 
-from app.api import applications, auth, automation, autonomous_agent, chat, human_interaction, resumes, jobs, profile
+from app.api import applications, auth, automation, autonomous_agent, chat, human_interaction, metrics, resumes, jobs, profile
 from app.core.auth import get_current_user
-from app.core.config import CORS_ORIGINS
+from app.core.config import CORS_ORIGINS, CORS_ORIGIN_REGEX
 from app.core.database import Base, SessionLocal, engine
 from app.core.middleware import register_middleware
 from app.core.pgvector_setup import ensure_pgvector_extension, ensure_vector_schema
@@ -66,10 +66,11 @@ app = FastAPI(title="AI Job Application Agent", version="1.0.0")
 
 register_middleware(app)          # rate limiting, request logging, error safety net
 
-if CORS_ORIGINS:
+if CORS_ORIGINS or CORS_ORIGIN_REGEX:
     app.add_middleware(
         CORSMiddleware,
         allow_origins=CORS_ORIGINS,
+        allow_origin_regex=CORS_ORIGIN_REGEX,
         allow_methods=["*"],
         allow_headers=["*"],
     )
@@ -83,6 +84,7 @@ app.include_router(automation.router)  # browser-extension field mapping; endpoi
 app.include_router(autonomous_agent.router)  # general-purpose autonomous agent; endpoints take the user dependency individually
 app.include_router(chat.router)  # HITL chat transcript + live WebSocket event stream
 app.include_router(human_interaction.router)  # HITL OTP/MFA/CAPTCHA/login requests; endpoints take the user dependency individually
+app.include_router(metrics.router)  # cross-engine success-metrics summary; endpoints take the user dependency individually
 app.include_router(jobs.router, dependencies=[Depends(get_current_user)])
 
 

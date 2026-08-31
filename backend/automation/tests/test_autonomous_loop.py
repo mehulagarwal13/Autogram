@@ -22,9 +22,9 @@ os.environ.setdefault("AUTOMATION_HUMAN_PACING", "0")
 
 import automation.agents.autonomous.loop as loop_mod
 from automation.agents.autonomous.actions import AgentAction
-from automation.agents.autonomous.decision import Decision
+from automation.agents.autonomous.decision import Decision, DecisionError
 from automation.agents.autonomous.loop import AutonomousAgentLoop, TaskHandle
-from automation.agents.autonomous.observer import PageElement, PageState
+from automation.agents.autonomous.observer import PageElement, PageState, field_identity
 
 
 # ---------------------------------------------------------------------------
@@ -39,6 +39,7 @@ class FakeTask:
     original_objective: str = "Apply for the job."
     candidate_profile: dict = field(default_factory=lambda: {"profile": {"work_authorized": True}})
     confirmed_answers: dict = field(default_factory=dict)
+    field_attempt_ledger: dict = field(default_factory=dict)
     action_history: list = field(default_factory=list)
     uploaded_documents: list = field(default_factory=list)
     auto_submit_approved: bool = False
@@ -68,6 +69,12 @@ class FakeTaskRepo:
     def request_human_intervention(self, db, task, intervention):
         task.human_intervention = intervention
         task.current_status = "WAITING_FOR_HUMAN"
+        return task
+
+    def record_field_attempt(self, db, task, field_identity, entry):
+        ledger = dict(task.field_attempt_ledger or {})
+        ledger[field_identity] = entry
+        task.field_attempt_ledger = ledger
         return task
 
     def record_confirmed_answer(self, db, task, question, answer):
@@ -204,6 +211,31 @@ class FakeHumanInteractionRepo:
         return req
 
 
+class FakeChatRepo:
+    """Captures agent messages so a test can assert on what the chat panel
+    would actually render — the real `chat_repository` needs a live SQLAlchemy
+    session, which `DictDb` isn't, and `_pause_for_human` deliberately
+    swallows that failure (a transcript write must never abort a live
+    application) — so without this fake, the write silently no-ops in every
+    other test in this file, which is fine for them but hides the one thing
+    the vision-screenshot tests need to check."""
+
+    def __init__(self):
+        self.messages: list[dict] = []
+
+    def record_agent_message(self, db, *, user_id, autonomous_task_id, content, human_request_id=None, safe_metadata=None):
+        self.messages.append({
+            "content": content, "human_request_id": human_request_id,
+            "safe_metadata": safe_metadata or {},
+        })
+
+    def record_system_message(self, db, *, user_id, autonomous_task_id, content, safe_metadata=None):
+        self.messages.append({
+            "content": content, "human_request_id": None,
+            "safe_metadata": safe_metadata or {},
+        })
+
+
 class FakeAuditLogRepo:
     def __init__(self):
         self.events = []
@@ -277,7 +309,9 @@ def test_execute_action_is_dispatched_and_logged(monkeypatch):
     decision = Decision(decision_type="EXECUTE_ACTION", action=AgentAction(action_type="fill", element_ref=0, value="Jane"))
 
     fake_db = DictDb(task=task)
+    chat_repo = FakeChatRepo()
     monkeypatch.setattr(loop_mod, "task_repo", FakeTaskRepo())
+    monkeypatch.setattr(loop_mod, "chat_repository", chat_repo)
     monkeypatch.setattr(loop_mod, "automation_db_session", _fake_db_session_factory(fake_db))
     monkeypatch.setattr(loop_mod, "BrowserManager", FakeBrowserManager)
     monkeypatch.setattr(loop_mod, "ATSDetector", FakeDetector)
@@ -289,6 +323,27 @@ def test_execute_action_is_dispatched_and_logged(monkeypatch):
     assert handle.page.locator('[data-agent-ref="0"]').filled_with == "Jane"
     assert task.action_history[-1]["action_type"] == "fill"
     assert task.action_history[-1]["success"] is True
+    assert chat_repo.messages[-1]["safe_metadata"]["event"] == "ACTION_RESULT"
+
+
+def test_task_start_and_failure_are_written_to_durable_chat_milestones(monkeypatch):
+    task = FakeTask()
+    handle = TaskHandle(resume_event=threading.Event(), cancel_requested=threading.Event())
+    loop = AutonomousAgentLoop(task.task_id, handle)
+    chat_repo = FakeChatRepo()
+    _install_fakes(monkeypatch, task, {
+        "page_states": [_page_state(text="Job description")],
+        "decisions": [Decision(decision_type="TASK_FAILED", evidence="Application entry unavailable.")],
+    })
+    monkeypatch.setattr(loop_mod, "chat_repository", chat_repo)
+    monkeypatch.setattr(loop_mod, "publish_task_event", lambda *a, **kw: None)
+
+    loop.run()
+
+    assert task.current_status == "FAILED"
+    assert len(chat_repo.messages) == 2
+    assert chat_repo.messages[0]["safe_metadata"]["event"] == "APPLICATION_STARTED"
+    assert chat_repo.messages[1]["safe_metadata"]["event"] == "APPLICATION_FAILED"
 
 
 # ---------------------------------------------------------------------------
@@ -462,6 +517,7 @@ def test_llm_decided_verification_code_fill_is_refused_redacted_and_pauses(monke
     still_going = loop._handle_execute_action(fake_db, task, page_state, decision)
 
     assert still_going is False
+    assert task.current_status == "WAITING_FOR_HUMAN"
     assert handle.page.locator('[data-agent-ref="3"]').filled_with is None  # never written
     assert task.current_status == "WAITING_FOR_HUMAN"
     assert task.human_intervention["request_type"] == "OTP_REQUIRED"
@@ -554,6 +610,292 @@ def test_pause_for_ambiguous_question_then_answer_resumes(monkeypatch):
 
     assert task.current_status == "COMPLETED"
     assert task.confirmed_answers["desired_start_date"] == "Immediately"
+
+
+# ---------------------------------------------------------------------------
+# 5. Spec §17: the completion gate before ready-for-approval
+# ---------------------------------------------------------------------------
+
+def test_submit_blocked_pending_approval_on_an_incomplete_page_escalates_instead_of_marking_ready(monkeypatch):
+    """`submit_requires_approval` (the executor refused the click because
+    `auto_submit_approved` is False) must not, by itself, mean "offer it up
+    for approval" — `compute_page_completion` is checked first, and a still-
+    missing required field must escalate to a human instead."""
+    task = FakeTask(auto_submit_approved=False)
+    handle = TaskHandle(resume_event=threading.Event(), cancel_requested=threading.Event())
+    loop = AutonomousAgentLoop(task.task_id, handle)
+
+    fake_db = DictDb(task=task)
+    monkeypatch.setattr(loop_mod, "task_repo", FakeTaskRepo())
+    monkeypatch.setattr(loop_mod, "human_interaction_repo", FakeHumanInteractionRepo())
+    monkeypatch.setattr(loop_mod, "audit_log_repo", FakeAuditLogRepo())
+    monkeypatch.setattr(loop_mod, "BrowserManager", FakeBrowserManager)
+    loop._ensure_browser(task)
+
+    required_empty = PageElement(ref=1, tag="input", type="text", name="Phone Number", value="",
+                                  required=True, disabled=False, checked=None, options=None)
+    submit_btn = _element(5, "Submit Application")
+    page_state = _page_state(elements=[required_empty, submit_btn])
+    decision = Decision(decision_type="EXECUTE_ACTION", action=AgentAction(action_type="click", element_ref=5))
+
+    still_going = loop._handle_execute_action(fake_db, task, page_state, decision)
+
+    assert still_going is False
+    assert task.current_status == "WAITING_FOR_HUMAN", "must not skip straight to WAITING_FOR_APPROVAL"
+    assert task.human_intervention["type"] == "UNKNOWN_BLOCKER"
+    assert handle.page.locator('[data-agent-ref="5"]').clicked is False
+
+
+def test_submit_blocked_pending_approval_on_a_complete_page_marks_ready_for_approval(monkeypatch):
+    """The counterpart: once the page really is complete, the same refused
+    click DOES mark the task ready for a human to approve."""
+    task = FakeTask(auto_submit_approved=False)
+    handle = TaskHandle(resume_event=threading.Event(), cancel_requested=threading.Event())
+    loop = AutonomousAgentLoop(task.task_id, handle)
+
+    fake_db = DictDb(task=task)
+    monkeypatch.setattr(loop_mod, "task_repo", FakeTaskRepo())
+    monkeypatch.setattr(loop_mod, "human_interaction_repo", FakeHumanInteractionRepo())
+    monkeypatch.setattr(loop_mod, "audit_log_repo", FakeAuditLogRepo())
+    monkeypatch.setattr(loop_mod, "BrowserManager", FakeBrowserManager)
+    loop._ensure_browser(task)
+
+    filled = PageElement(ref=1, tag="input", type="text", name="Phone Number", value="555-1234",
+                          required=True, disabled=False, checked=None, options=None)
+    submit_btn = _element(5, "Submit Application")
+    page_state = _page_state(elements=[filled, submit_btn])
+    decision = Decision(decision_type="EXECUTE_ACTION", action=AgentAction(action_type="click", element_ref=5))
+
+    still_going = loop._handle_execute_action(fake_db, task, page_state, decision)
+
+    assert still_going is False
+    assert task.current_status == "WAITING_FOR_APPROVAL"
+
+
+# ---------------------------------------------------------------------------
+# 6. Spec §16: the verification-streak escalation (in-memory, same-process)
+# ---------------------------------------------------------------------------
+
+def test_three_consecutive_unverified_attempts_on_the_same_ref_escalate(monkeypatch):
+    task = FakeTask()
+    handle = TaskHandle(resume_event=threading.Event(), cancel_requested=threading.Event())
+    loop = AutonomousAgentLoop(task.task_id, handle)
+
+    fake_db = DictDb(task=task)
+    monkeypatch.setattr(loop_mod, "task_repo", FakeTaskRepo())
+    monkeypatch.setattr(loop_mod, "human_interaction_repo", FakeHumanInteractionRepo())
+    monkeypatch.setattr(loop_mod, "audit_log_repo", FakeAuditLogRepo())
+    monkeypatch.setattr(loop_mod, "BrowserManager", FakeBrowserManager)
+    loop._ensure_browser(task)
+
+    # A FakePage has no real DOM to diff, so `capture_page_signature` always
+    # comes back unreadable and every click reports `verified=False` — the
+    # exact "nothing observably changed" case the streak counter is for. No
+    # `screenshot` method on FakePage means the new vision-assisted retry
+    # (Workstream 2) safely no-ops via AttributeError, so this test exercises
+    # ONLY the streak logic, unaffected by that addition.
+    page_state = _page_state(elements=[_element(0, "Mystery Button")])
+    decision = Decision(decision_type="EXECUTE_ACTION", action=AgentAction(action_type="click", element_ref=0))
+
+    assert loop._handle_execute_action(fake_db, task, page_state, decision) is True
+    assert loop._handle_execute_action(fake_db, task, page_state, decision) is True
+    still_going = loop._handle_execute_action(fake_db, task, page_state, decision)
+
+    assert still_going is False
+    assert task.current_status == "WAITING_FOR_HUMAN"
+    assert task.human_intervention["type"] == "UNKNOWN_BLOCKER"
+    assert "Mystery Button" in task.human_intervention["reason"]
+
+
+def test_ungrounded_navigation_is_rejected_before_browser_dispatch(monkeypatch):
+    task = FakeTask(job_url="https://example.com/jobs/123")
+    handle = TaskHandle(resume_event=threading.Event(), cancel_requested=threading.Event())
+    loop = AutonomousAgentLoop(task.task_id, handle)
+    fake_db = DictDb(task=task)
+    monkeypatch.setattr(loop_mod, "task_repo", FakeTaskRepo())
+    monkeypatch.setattr(loop_mod, "human_interaction_repo", FakeHumanInteractionRepo())
+    monkeypatch.setattr(loop_mod, "audit_log_repo", FakeAuditLogRepo())
+    monkeypatch.setattr(loop_mod, "publish_task_event", lambda *a, **kw: None)
+    monkeypatch.setattr(loop_mod, "BrowserManager", FakeBrowserManager)
+    loop._ensure_browser(task)
+
+    apply = PageElement(
+        ref=12, tag="button", type="button", name="Apply Now", value=None,
+        required=False, disabled=False, checked=None, options=None,
+        semantic_action="APPLY", action_confidence="HIGH",
+    )
+    state = PageState(
+        url=task.job_url, title="Engineer", visible_text="Job description",
+        elements=[apply], page_type="JOB_LISTING",
+    )
+    decision = Decision(
+        decision_type="EXECUTE_ACTION",
+        action=AgentAction(action_type="navigate", url="https://example.com/jobs/123/apply"),
+    )
+
+    keep_going = loop._handle_execute_action(fake_db, task, state, decision)
+
+    assert keep_going is False
+    assert handle.page.url == task.job_url
+    assert task.action_history[-1]["action_result"] == "ACTION_REJECTED"
+    assert task.action_history[-1]["action_attempted"] is False
+    assert task.current_status == "WAITING_FOR_HUMAN"
+
+
+# ---------------------------------------------------------------------------
+# 7. Spec §16: the persisted field-attempt ledger (survives a resume/restart)
+# ---------------------------------------------------------------------------
+
+def test_a_field_already_marked_failed_in_the_ledger_is_never_retried(monkeypatch):
+    task = FakeTask()
+    handle = TaskHandle(resume_event=threading.Event(), cancel_requested=threading.Event())
+    loop = AutonomousAgentLoop(task.task_id, handle)
+
+    fake_db = DictDb(task=task)
+    monkeypatch.setattr(loop_mod, "task_repo", FakeTaskRepo())
+    monkeypatch.setattr(loop_mod, "human_interaction_repo", FakeHumanInteractionRepo())
+    monkeypatch.setattr(loop_mod, "audit_log_repo", FakeAuditLogRepo())
+    monkeypatch.setattr(loop_mod, "BrowserManager", FakeBrowserManager)
+    loop._ensure_browser(task)
+
+    element = _element(0, "Cursed Field")
+    # As if this exact field failed 3 times in an EARLIER resume/process —
+    # `TaskHandle.unverified_streak` would have been reset to 0 by then, so
+    # only the persisted ledger remembers this.
+    task.field_attempt_ledger = {field_identity(element): {"status": "failed", "attempts": 3, "last_action_type": "fill"}}
+
+    page_state = _page_state(elements=[element])
+    decision = Decision(decision_type="EXECUTE_ACTION", action=AgentAction(action_type="fill", element_ref=0, value="x"))
+
+    still_going = loop._handle_execute_action(fake_db, task, page_state, decision)
+
+    assert still_going is False
+    assert handle.page.locator('[data-agent-ref="0"]').filled_with is None, "must never even attempt the field"
+    assert task.current_status == "WAITING_FOR_HUMAN"
+    assert task.human_intervention["type"] == "UNKNOWN_BLOCKER"
+    assert not task.action_history, "a refused-before-dispatch field must not appear in action_history"
+
+
+def test_a_field_that_fails_three_times_is_marked_failed_in_the_persisted_ledger(monkeypatch):
+    task = FakeTask()
+    handle = TaskHandle(resume_event=threading.Event(), cancel_requested=threading.Event())
+    loop = AutonomousAgentLoop(task.task_id, handle)
+
+    fake_db = DictDb(task=task)
+    monkeypatch.setattr(loop_mod, "task_repo", FakeTaskRepo())
+    monkeypatch.setattr(loop_mod, "human_interaction_repo", FakeHumanInteractionRepo())
+    monkeypatch.setattr(loop_mod, "audit_log_repo", FakeAuditLogRepo())
+    monkeypatch.setattr(loop_mod, "BrowserManager", FakeBrowserManager)
+    loop._ensure_browser(task)
+
+    element = _element(0, "Mystery Button")
+    page_state = _page_state(elements=[element])
+    decision = Decision(decision_type="EXECUTE_ACTION", action=AgentAction(action_type="click", element_ref=0))
+
+    loop._handle_execute_action(fake_db, task, page_state, decision)
+    loop._handle_execute_action(fake_db, task, page_state, decision)
+    loop._handle_execute_action(fake_db, task, page_state, decision)
+
+    entry = task.field_attempt_ledger[field_identity(element)]
+    assert entry["status"] == "failed"
+    assert entry["attempts"] == 3
+
+
+# ---------------------------------------------------------------------------
+# 8. Spec §19-20: the vision-assisted retry before pausing
+# ---------------------------------------------------------------------------
+
+def test_escalate_with_vision_executes_a_vision_proposed_action_without_pausing(monkeypatch):
+    task = FakeTask()
+    handle = TaskHandle(resume_event=threading.Event(), cancel_requested=threading.Event())
+    loop = AutonomousAgentLoop(task.task_id, handle)
+
+    fake_db = DictDb(task=task)
+    monkeypatch.setattr(loop_mod, "task_repo", FakeTaskRepo())
+    monkeypatch.setattr(loop_mod, "human_interaction_repo", FakeHumanInteractionRepo())
+    monkeypatch.setattr(loop_mod, "audit_log_repo", FakeAuditLogRepo())
+    monkeypatch.setattr(loop_mod, "BrowserManager", FakeBrowserManager)
+    loop._ensure_browser(task)
+    # Only THIS test's page gets a working `screenshot()` — deliberately not
+    # added to the shared `FakePage`, so every other test keeps exercising
+    # the "no screenshot available" fallback (see the streak test above).
+    handle.page.screenshot = lambda **kwargs: b"fake-jpeg-bytes"
+
+    seen_screenshots = []
+
+    def fake_decide(**kwargs):
+        seen_screenshots.append(kwargs.get("screenshot"))
+        return Decision(decision_type="EXECUTE_ACTION", action=AgentAction(action_type="fill", element_ref=0, value="Jane"))
+
+    monkeypatch.setattr(loop_mod, "decide_next_step", fake_decide)
+
+    page_state = _page_state(elements=[_element(0, "First name")])
+    keep_going = loop._escalate_with_vision(
+        fake_db, task, page_state, {"type": "UNKNOWN_BLOCKER", "message": "fallback"}, detection_layer="test",
+    )
+
+    assert keep_going is True
+    assert handle.page.locator('[data-agent-ref="0"]').filled_with == "Jane"
+    assert seen_screenshots == [b"fake-jpeg-bytes"]
+    assert task.current_status != "WAITING_FOR_HUMAN"
+    assert any(e["event_type"] == "vision_assisted_action" for e in loop_mod.audit_log_repo.events)
+
+
+def test_escalate_with_vision_falls_back_and_attaches_the_screenshot_to_chat(monkeypatch):
+    task = FakeTask()
+    handle = TaskHandle(resume_event=threading.Event(), cancel_requested=threading.Event())
+    loop = AutonomousAgentLoop(task.task_id, handle)
+
+    fake_db = DictDb(task=task)
+    chat_repo = FakeChatRepo()
+    monkeypatch.setattr(loop_mod, "task_repo", FakeTaskRepo())
+    monkeypatch.setattr(loop_mod, "human_interaction_repo", FakeHumanInteractionRepo())
+    monkeypatch.setattr(loop_mod, "audit_log_repo", FakeAuditLogRepo())
+    monkeypatch.setattr(loop_mod, "chat_repository", chat_repo)
+    monkeypatch.setattr(loop_mod, "publish_task_event", lambda *a, **kw: None)
+    monkeypatch.setattr(loop_mod, "BrowserManager", FakeBrowserManager)
+    loop._ensure_browser(task)
+    handle.page.screenshot = lambda **kwargs: b"fake-jpeg-bytes"
+
+    def fake_decide(**kwargs):
+        raise DecisionError("the model returned nothing usable")
+
+    monkeypatch.setattr(loop_mod, "decide_next_step", fake_decide)
+
+    fallback = {"type": "UNKNOWN_BLOCKER", "message": "Autogram is stuck."}
+    keep_going = loop._escalate_with_vision(fake_db, task, _page_state(), fallback, detection_layer="test")
+
+    assert keep_going is False
+    assert task.current_status == "WAITING_FOR_HUMAN"
+    assert chat_repo.messages, "the pause must still write to the chat transcript"
+    data_uri = chat_repo.messages[-1]["safe_metadata"].get("screenshot_data_uri")
+    assert data_uri is not None
+    assert data_uri.startswith("data:image/jpeg;base64,")
+
+
+def test_escalate_with_vision_never_attaches_a_screenshot_when_capture_fails(monkeypatch):
+    """No `screenshot` method on the fake page (the normal case for every
+    other test in this file) must fall back cleanly with no screenshot
+    anywhere — never crash, never fabricate one."""
+    task = FakeTask()
+    handle = TaskHandle(resume_event=threading.Event(), cancel_requested=threading.Event())
+    loop = AutonomousAgentLoop(task.task_id, handle)
+
+    fake_db = DictDb(task=task)
+    chat_repo = FakeChatRepo()
+    monkeypatch.setattr(loop_mod, "task_repo", FakeTaskRepo())
+    monkeypatch.setattr(loop_mod, "human_interaction_repo", FakeHumanInteractionRepo())
+    monkeypatch.setattr(loop_mod, "audit_log_repo", FakeAuditLogRepo())
+    monkeypatch.setattr(loop_mod, "chat_repository", chat_repo)
+    monkeypatch.setattr(loop_mod, "publish_task_event", lambda *a, **kw: None)
+    monkeypatch.setattr(loop_mod, "BrowserManager", FakeBrowserManager)
+    loop._ensure_browser(task)
+
+    fallback = {"type": "UNKNOWN_BLOCKER", "message": "Autogram is stuck."}
+    keep_going = loop._escalate_with_vision(fake_db, task, _page_state(), fallback, detection_layer="test")
+
+    assert keep_going is False
+    assert "screenshot_data_uri" not in chat_repo.messages[-1]["safe_metadata"]
 
 
 def test_task_completed_is_downgraded_without_confirmation_text(monkeypatch):

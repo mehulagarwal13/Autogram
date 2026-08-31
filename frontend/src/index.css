@@ -4,20 +4,59 @@
 
 :root {
   color-scheme: light;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
 }
 
 body {
-  @apply bg-slate-50 text-slate-900 antialiased;
+  @apply text-slate-900 antialiased;
   min-height: 100vh;
+  margin: 0;
+  background: #f5f7fb;
+  font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+}
+
+button, input, select, textarea { font: inherit; }
+button, a { -webkit-tap-highlight-color: transparent; }
+
+.app-shell {
+  background:
+    radial-gradient(circle at 94% 4%, rgba(99, 102, 241, 0.055), transparent 25rem),
+    #f5f7fb;
+}
+
+.sidebar {
+  background:
+    radial-gradient(circle at 30% 0%, rgba(99, 102, 241, 0.16), transparent 20rem),
+    #0c1222;
+  box-shadow: 16px 0 40px rgba(15, 23, 42, 0.05);
+}
+
+.topbar {
+  border-bottom: 1px solid rgba(226, 232, 240, 0.88);
+  background: rgba(255, 255, 255, 0.82);
+  backdrop-filter: blur(18px);
+}
+
+.brand-mark {
+  @apply flex h-9 w-9 shrink-0 items-center justify-center rounded-xl;
+  background: linear-gradient(135deg, #818cf8 0%, #5b5bd6 48%, #4338ca 100%);
+  box-shadow: 0 8px 22px rgba(79, 70, 229, 0.28), inset 0 1px 0 rgba(255,255,255,.24);
 }
 
 /* ---------- Surfaces ---------- */
 .card {
-  @apply rounded-xl border border-slate-200 bg-white shadow-card;
+  @apply rounded-2xl border border-slate-200/80 bg-white shadow-card;
+}
+
+/* Interactive card: a deliberate, subtle lift on hover — used for anything
+   clickable (quick links, match cards), never for static content cards. */
+.card-hover {
+  @apply transition-all duration-200 ease-out hover:-translate-y-0.5 hover:border-slate-300 hover:shadow-popover;
 }
 
 .card-header {
-  @apply flex items-center justify-between border-b border-slate-200 px-5 py-4;
+  @apply flex items-center justify-between border-b border-slate-100 px-5 py-4;
 }
 
 /* Subtle "in progress" affordance — a calm pulse, not a rainbow border */
@@ -35,7 +74,7 @@ body {
 }
 
 .page-title {
-  @apply text-xl font-semibold tracking-tight text-slate-900;
+  @apply text-2xl font-semibold tracking-[-0.035em] text-slate-950;
 }
 
 .page-subtitle {
@@ -44,15 +83,22 @@ body {
 
 /* ---------- Buttons ---------- */
 .btn-primary {
-  @apply inline-flex items-center justify-center gap-2 rounded-lg bg-brand-600 px-4 py-2.5 text-sm font-medium text-white shadow-sm transition-colors duration-150 hover:bg-brand-700 active:bg-brand-800 disabled:cursor-not-allowed disabled:opacity-50;
+  @apply inline-flex items-center justify-center gap-2 rounded-xl bg-brand-600 px-4 py-2.5 text-sm font-semibold text-white shadow-xs transition-all duration-150 hover:-translate-y-px hover:bg-brand-700 hover:shadow-md active:translate-y-0 active:scale-[0.98] active:bg-brand-800 disabled:cursor-not-allowed disabled:transform-none disabled:opacity-50;
 }
 
 .btn-danger {
-  @apply inline-flex items-center justify-center gap-2 rounded-lg bg-red-600 px-4 py-2.5 text-sm font-medium text-white shadow-sm transition-colors duration-150 hover:bg-red-700 active:bg-red-800 disabled:cursor-not-allowed disabled:opacity-50;
+  @apply inline-flex items-center justify-center gap-2 rounded-lg bg-red-600 px-4 py-2.5 text-sm font-medium text-white shadow-xs transition-all duration-150 hover:bg-red-700 active:scale-[0.98] active:bg-red-800 disabled:cursor-not-allowed disabled:active:scale-100 disabled:opacity-50;
+}
+
+/* Filled-neutral tier — a step down from primary, a step up from ghost.
+   Used for a secondary-but-still-solid action sitting next to a primary one
+   (e.g. "Cancel" beside "Approve & Submit"). */
+.btn-secondary {
+  @apply inline-flex items-center justify-center gap-2 rounded-xl bg-slate-100 px-4 py-2.5 text-sm font-medium text-slate-700 transition-colors duration-150 hover:bg-slate-200 active:bg-slate-300 disabled:cursor-not-allowed disabled:opacity-50;
 }
 
 .btn-ghost {
-  @apply inline-flex items-center justify-center gap-2 rounded-lg border border-slate-300 bg-white px-4 py-2.5 text-sm font-medium text-slate-700 transition-colors duration-150 hover:bg-slate-50 active:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-50;
+  @apply inline-flex items-center justify-center gap-2 rounded-xl border border-slate-200 bg-white px-4 py-2.5 text-sm font-medium text-slate-700 shadow-xs transition-colors duration-150 hover:border-slate-300 hover:bg-slate-50 active:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-50;
 }
 
 .btn-icon {
@@ -61,7 +107,7 @@ body {
 
 /* ---------- Forms ---------- */
 .input {
-  @apply w-full rounded-lg border border-slate-300 bg-white px-3.5 py-2.5 text-sm text-slate-900 placeholder-slate-400 outline-none transition-colors duration-150 focus:border-brand-500 focus:ring-2 focus:ring-brand-500/15;
+  @apply w-full rounded-xl border border-slate-200 bg-white px-3.5 py-2.5 text-sm text-slate-900 shadow-xs placeholder-slate-400 outline-none transition-all duration-150 focus:border-brand-400 focus:ring-4 focus:ring-brand-500/10;
 }
 
 .field-label {
@@ -105,7 +151,22 @@ body {
   animation: indeterminate 1.3s ease-in-out infinite;
 }
 
+/* ---------- Skeleton loaders ---------- */
+/* Used instead of a spinner wherever the eventual layout is known ahead of
+   time (KPI tiles, list rows) — a shape that resolves into content reads as
+   faster and less jarring than a spinner that's replaced by something
+   differently shaped. */
+.skeleton {
+  @apply animate-shimmer rounded-md bg-slate-100 bg-[length:200%_100%];
+  background-image: linear-gradient(90deg, rgb(241 245 249) 25%, rgb(226 232 240) 37%, rgb(241 245 249) 63%);
+}
+
 /* ---------- Animations ---------- */
+@keyframes toastShrink {
+  from { width: 100%; }
+  to { width: 0%; }
+}
+
 .animate-fade-up { animation: fadeUp 0.25s ease both; }
 @keyframes fadeUp {
   from { opacity: 0; transform: translateY(6px); }
@@ -123,3 +184,14 @@ body {
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: rgb(203 213 225); border-radius: 8px; }
 ::-webkit-scrollbar-thumb:hover { background: rgb(148 163 184); }
+
+::selection { background: rgb(224 231 255); color: rgb(49 46 129); }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    scroll-behavior: auto !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

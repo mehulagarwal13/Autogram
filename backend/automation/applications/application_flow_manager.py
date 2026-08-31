@@ -100,7 +100,7 @@ from automation.browser.selectors import (
 )
 from automation.forms.answer_engine import ApplicationAnswerEngine
 from automation.forms.vision_fallback import VisionFormAnswerer
-from automation.interfaces import ApplicationRunResult, CandidateProfile, ProfileDocument
+from automation.interfaces import ApplicationRunResult, CandidateProfile, ProfileDocument, VALID_TRUST_LEVELS
 
 logger = logging.getLogger(__name__)
 
@@ -126,6 +126,32 @@ def clear_live_state(application_id: str) -> None:
 
 def get_live_state(application_id: str) -> dict | None:
     return LIVE_RUN_STATE.get(application_id)
+
+
+#: Per-application "the user asked this one specific run to stop", distinct
+#: from `is_kill_switch_engaged` (an account-level, every-application flag).
+#: Same "module-level dict, cleared on completion" pattern as `LIVE_RUN_STATE`
+#: above. Checked at the same per-page cadence `_kill_switch_engaged()`
+#: already uses — see `_run_on_page`'s loop — so this is additive to an
+#: existing, proven polling point rather than a new one. A run that's blocked
+#: deep inside a single browser call (not between pages) won't notice this
+#: until it next reaches the top of the loop; `POST /applications/{id}/stop`
+#: does not rely on it alone for that reason — it also writes `status=
+#: "cancelled"` immediately, and `_run_application`'s completion handler
+#: refuses to overwrite an already-cancelled status once the run does return.
+STOP_REQUESTED: dict[str, bool] = {}
+
+
+def request_stop(application_id: str) -> None:
+    STOP_REQUESTED[application_id] = True
+
+
+def clear_stop_request(application_id: str) -> None:
+    STOP_REQUESTED.pop(application_id, None)
+
+
+def is_stop_requested(application_id: str) -> bool:
+    return STOP_REQUESTED.get(application_id, False)
 
 
 class _RunLogCapture(logging.Handler):
@@ -292,18 +318,34 @@ class _PageProgress:
     vision_confirmed: set[str] = _dc_field(default_factory=set)
 
 
-def decide_action(confidence: float, ats_platform: str, autopilot_enabled: bool) -> str:
+def decide_action(
+    confidence: float, ats_platform: str, autopilot_enabled: bool,
+    trust_level: str = "FULL_MANUAL_REVIEW",
+) -> str:
     """The exact decision table from ARCHITECTURE.md, as a standalone,
     independently testable function:
 
     - `AUTO_SUBMIT` only when the user opted in AND the platform is public
-      (no login) AND confidence clears the high bar.
+      (no login) AND confidence clears the high bar AND — §6.4 — this job
+      posting's site is trusted for auto-submit (`trust_level ==
+      "TRUSTED_AUTO_SUBMIT"`). Trust is an ADDITIONAL required condition,
+      never a bypass of the other three: a trusted site with a low-confidence
+      fill still lands in review, exactly as an untrusted one would.
     - `NEEDS_REVIEW` when confidence is too low to trust at all.
     - `COPILOT_REVIEW` otherwise — form is filled, a human clicks submit.
+
+    `trust_level` defaults to the safe value on purpose: any caller that
+    doesn't explicitly resolve one (existing tests, a bare/legacy call site)
+    gets today's always-review behavior, never a silent opt-in to auto-submit.
+    `FULL_MANUAL_REVIEW` and `DRAFT_ONLY` currently produce identical output
+    here — see `VALID_TRUST_LEVELS`'s docstring for why that's not an
+    oversight. An unrecognized value is treated the same as
+    `FULL_MANUAL_REVIEW` (fail closed), never as `TRUSTED_AUTO_SUBMIT`.
     """
     high_confidence = confidence >= AUTO_SUBMIT_CONFIDENCE_THRESHOLD
     is_public_ats = ats_platform in PUBLIC_ATS_PLATFORMS
-    if autopilot_enabled and is_public_ats and high_confidence:
+    is_trusted = trust_level == "TRUSTED_AUTO_SUBMIT"
+    if autopilot_enabled and is_public_ats and high_confidence and is_trusted:
         return "AUTO_SUBMIT"
     if confidence < NEEDS_REVIEW_CONFIDENCE_THRESHOLD:
         return "NEEDS_REVIEW"
@@ -358,6 +400,7 @@ class ApplicationFlowManager:
         vision_answerer: VisionFormAnswerer | None = None,
         on_waiting_for_human: Callable[[str], None] | None = None,
         is_kill_switch_engaged: Callable[[], bool] | None = None,
+        resolve_trust_level: Callable[[], str] | None = None,
         human_wait_timeout_s: float = AUTOMATION_HUMAN_WAIT_TIMEOUT_S,
     ) -> None:
         self.application_id = application_id
@@ -409,6 +452,14 @@ class ApplicationFlowManager:
         # see `_kill_switch_engaged` for the fail-closed contract.
         self.on_waiting_for_human = on_waiting_for_human
         self.is_kill_switch_engaged = is_kill_switch_engaged
+        # §6.4 trust levels: resolved once, right before `decide_action`
+        # (see `_resolve_trust_level`) rather than per-page like the kill
+        # switch — a trust-level change mid-run only matters at the one
+        # moment it's actually read. `None` (the default, e.g. every
+        # existing test/call site written before this existed) resolves to
+        # "FULL_MANUAL_REVIEW" — the always-review behavior nothing here
+        # changes unless a caller deliberately wires this up.
+        self.resolve_trust_level = resolve_trust_level
         # Overridable per instance (defaults to the configured production
         # value) so tests exercising a gate that never clears — the common
         # case — don't have to burn real wall-clock time; pass a small value
@@ -651,6 +702,23 @@ class ApplicationFlowManager:
         # the final page, a human-only gate appeared, navigation could not be
         # proven, the safety backstop tripped, or the kill switch engaged.
         for page_index in range(self.MAX_PAGES):
+            if is_stop_requested(self.application_id):
+                reason = (
+                    f"Stopped by the user before page {page_index + 1}. No further pages were attempted."
+                )
+                logger.info("application %s: %s", self.application_id, reason)
+                self.checkpoint("stop_requested", page_number=page_index + 1)
+                return ApplicationRunResult(
+                    application_id=self.application_id,
+                    status="cancelled",
+                    ats_platform=self.ats_platform,
+                    detected_ats_platform=self.detected_ats_platform,
+                    confidence=self._aggregate_confidence(all_results),
+                    screenshot_paths=self._safe_screenshot(page),
+                    error_log=self._safe_write_error_log(reason),
+                    pages_completed=page_index,
+                )
+
             if self._kill_switch_engaged():
                 reason = (
                     "The account-level autopilot kill switch is engaged — stopping before "
@@ -788,11 +856,12 @@ class ApplicationFlowManager:
                 pages_completed=pages_processed,
             )
 
-        action = decide_action(confidence, self.ats_platform, self.autopilot_enabled)
+        trust_level = self._resolve_trust_level()
+        action = decide_action(confidence, self.ats_platform, self.autopilot_enabled, trust_level)
         self.checkpoint(f"decision_{action.lower()}")
         logger.info(
-            "application %s: decision=%s (confidence=%.4f, autopilot_enabled=%s, ats_platform=%s)",
-            self.application_id, action, confidence, self.autopilot_enabled, self.ats_platform,
+            "application %s: decision=%s (confidence=%.4f, autopilot_enabled=%s, ats_platform=%s, trust_level=%s)",
+            self.application_id, action, confidence, self.autopilot_enabled, self.ats_platform, trust_level,
         )
 
         error_log: str | None = None
@@ -1655,6 +1724,39 @@ class ApplicationFlowManager:
                 self.application_id,
             )
             return True
+
+    def _resolve_trust_level(self) -> str:
+        """Fail SAFE (not closed like the kill switch, since there's no
+        "engaged" state to fall back to): no callback, an unrecognized
+        value, or a raising callback all resolve to `FULL_MANUAL_REVIEW` —
+        the one value that can never enable auto-submit — so a broken or
+        unwired trust-level check degrades to today's always-review
+        behavior, never to a silent opt-in.
+
+        Deliberately optional rather than required: the one production call
+        site (`app/api/applications.py::_run_application`) always wires this;
+        every other construction site is a test exercising something else
+        entirely (OTP entry, an unresolvable blocker, ...) that never reaches
+        this method. A required parameter would force ~25 unrelated test
+        call sites to supply a value they don't care about, for no real
+        safety gain over this debug line — see `decide_action`'s own
+        docstring for why `FULL_MANUAL_REVIEW` is the correct universal
+        fallback, not just a placeholder."""
+        if self.resolve_trust_level is None:
+            logger.debug(
+                "application %s: no resolve_trust_level callback provided — defaulting to FULL_MANUAL_REVIEW.",
+                self.application_id,
+            )
+            return "FULL_MANUAL_REVIEW"
+        try:
+            level = self.resolve_trust_level()
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "application %s: trust level check failed — falling back to FULL_MANUAL_REVIEW.",
+                self.application_id,
+            )
+            return "FULL_MANUAL_REVIEW"
+        return level if level in VALID_TRUST_LEVELS else "FULL_MANUAL_REVIEW"
 
     def _safe_find_next_control(self, adapter: ATSAdapter) -> Locator | None:
         try:

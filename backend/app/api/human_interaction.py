@@ -45,6 +45,7 @@ from app.services import audit_log_repository
 from app.services import chat_repository
 from app.services import autonomous_task_repository as task_repo
 from app.services import human_interaction_repository as human_interaction_repo
+from app.services import profile_repository
 from app.services.event_bus import publish_task_event
 from automation.agents.autonomous.runner import (
     deliver_secret,
@@ -322,6 +323,10 @@ def respond_to_human_request(
     else:  # USER_PROVIDED_VALUE — `value` was validated before the claims
         question = (req.safe_metadata or {}).get("information_required") or req.title or req.message
         task_repo.record_confirmed_answer(db, task, question, value)
+        # Spec §13: same write-back as the deterministic path's answer
+        # review — a stable contact/professional fact goes into the profile
+        # too, not just this task's confirmed_answers. Best-effort.
+        profile_repository.write_back_stable_answer(db, user.user_id, question, value)
         if not signal_resume(task.task_id):
             start_task_background(task.task_id)
         human_interaction_repo.mark_resolved(db, req)

@@ -79,7 +79,7 @@ def test_is_sensitive_field_name_matches_known_categories():
 
 def test_is_submit_control_name_matches_final_submit_only():
     assert is_submit_control_name("Submit Application")
-    assert is_submit_control_name("Apply Now")
+    assert not is_submit_control_name("Apply Now")
     assert not is_submit_control_name("Next")
     assert not is_submit_control_name("Save and continue")
 
@@ -118,19 +118,22 @@ def test_click_on_submit_button_without_approval_is_blocked():
     assert page.locator('[data-agent-ref="1"]').clicked is False
 
 
-def test_click_on_submit_button_with_approval_succeeds():
+def test_click_on_submit_button_with_approval_is_dispatched_but_needs_a_postcondition():
     page = FakePage()
     action = AgentAction(action_type="click", element_ref=1)
     result = _executor(page, auto_submit_approved=True).execute(action, element_name="Submit Application")
-    assert result.success
+    assert not result.success
+    assert result.result_code == "NO_STATE_CHANGE"
     assert page.locator('[data-agent-ref="1"]').clicked is True
 
 
-def test_click_on_non_submit_button_never_needs_approval():
+def test_click_on_non_submit_button_is_not_blocked_but_same_page_is_a_failure():
     page = FakePage()
     action = AgentAction(action_type="click", element_ref=2)
     result = _executor(page, auto_submit_approved=False).execute(action, element_name="Next")
-    assert result.success
+    assert not result.success
+    assert result.blocked_reason is None
+    assert result.result_code == "NO_STATE_CHANGE"
 
 
 # ---------------------------------------------------------------------------

@@ -35,7 +35,7 @@ Autogram/
 ├── frontend/           # React + Vite app
 │   └── src/{components,pages,__tests__}
 │
-├── worker/             # Cloudflare Worker (deploy target)
+├── worker/             # backend-only Cloudflare Container routing adapter
 ├── extension/          # browser extension
 ├── src/                # Remotion demo-video project (its own package.json)
 └── docker-compose.yml
@@ -60,11 +60,28 @@ there. Moving either one alone would break every import in the other.
 | Scheduler | APScheduler | Optional automatic job sync (opt-in via `JOB_SYNC_QUERIES`) |
 | File parsing | pdfplumber (PDF), python-docx (DOCX) | Text extraction |
 
+## Deployment
+
+Production is split into two independent Cloudflare projects sourced from the
+same GitHub repository:
+
+- `frontend/` is a Vite SPA deployed by Cloudflare Pages (`npm run build`,
+  output `dist`). `VITE_API_URL` selects the backend origin at build time.
+- `backend/` runs as one Cloudflare Container behind the backend-only Worker in
+  `worker/`. A path-filtered GitHub Action applies migrations and deploys it.
+
+The backend is containerized because Playwright/Chromium, CPython native
+packages, background threads, and process-local automation sessions are not
+compatible with a native Worker rewrite. See [DEPLOYMENT.md](./DEPLOYMENT.md)
+for Pages settings, secrets, preview behavior, rollout checks, and rollback.
+
 ---
 
 ## API Keys — what each one does
 
-All keys live in `.env` (never commit it — see `.env.example` for the template). `app/core/config.py` loads them at startup and **fails fast** with a clear error if any is missing.
+All keys live in `backend/.env` for local development (never commit it — see
+`backend/.env.example`). `app/core/config.py` loads them at startup and **fails
+fast** with a clear error if any is missing.
 
 | Key | Where to get it | Used by | What it powers |
 |---|---|---|---|
@@ -207,7 +224,7 @@ Interactive docs: `http://localhost:8000/docs` (Swagger, auto-generated).
 
 ---
 
-## Setup & Run
+## Local development
 
 ```bash
 # 1. Clone and enter
@@ -221,14 +238,27 @@ venv\Scripts\activate        # Windows  (source venv/bin/activate on Linux/Mac)
 pip install -r backend/requirements.txt
 
 # 4. Configure keys
-copy .env.example .env       # then fill in every key (see API Keys table above)
+copy backend\.env.example backend\.env
 
 # 5. Run — tables, pgvector extension, and indexes are created automatically at startup
 cd backend
+alembic upgrade head
 uvicorn app.main:app --reload
 ```
 
-> Note: the files in `alembic/versions/` describe the old (pre-hardening) schema. On a fresh Neon database the app bootstraps the current schema itself. When you next need a migration, delete the old version files and autogenerate a new baseline: `alembic revision --autogenerate -m "baseline"`.
+In a second terminal, run the frontend. Keep `VITE_API_URL` blank locally so
+Vite proxies `/api` and WebSockets to the backend:
+
+```bash
+cd frontend
+npm install
+copy .env.example .env.local
+npm run dev
+```
+
+> Alembic migrations are the production schema source of truth. Create a new
+> revision for every schema change and keep deployed migrations immutable;
+> never delete the version history from a live project.
 
 > ### ⚠️ Production deployment: SINGLE WORKER ONLY
 >

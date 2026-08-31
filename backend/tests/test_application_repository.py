@@ -15,6 +15,7 @@ from app.models.db_models import Application
 from app.services.application_repository import (
     apply_run_result,
     compute_job_url_hash,
+    delete,
 )
 
 
@@ -171,3 +172,45 @@ def test_apply_run_result_falls_back_to_ats_platform_when_detected_platform_is_u
     apply_run_result(db, application, result)
 
     assert application.detected_ats_platform == "greenhouse"
+
+
+# ---------- delete ----------
+
+def test_delete_removes_the_row_and_commits():
+    """Cascading child rows (AutomationRun/ApplicationQuestion/
+    ApplicationAuditLog/ChatMessage) are the database's job (`ondelete=
+    "CASCADE"` on each FK) — this only needs to prove the application row
+    itself is handed to `db.delete` and the transaction is committed."""
+    application = _blank_application(status="failed")
+    db = MagicMock()
+
+    delete(db, application)
+
+    db.delete.assert_called_once_with(application)
+    db.commit.assert_called_once()
+
+
+def test_delete_removes_the_on_disk_log_directory(monkeypatch, tmp_path):
+    import app.services.application_repository as repo_module
+
+    monkeypatch.setattr(repo_module, "AUTOMATION_LOGS_DIR", str(tmp_path))
+    application = _blank_application(status="failed", application_id="app-with-logs")
+    run_dir = tmp_path / "app-with-logs"
+    run_dir.mkdir()
+    (run_dir / "screenshot1.png").write_bytes(b"fake")
+    (run_dir / "trace.zip").write_bytes(b"fake")
+
+    delete(MagicMock(), application)
+
+    assert not run_dir.exists()
+
+
+def test_delete_does_not_raise_when_there_is_no_log_directory(monkeypatch, tmp_path):
+    """The common case — most applications never hit a code path that writes
+    a screenshot/trace at all."""
+    import app.services.application_repository as repo_module
+
+    monkeypatch.setattr(repo_module, "AUTOMATION_LOGS_DIR", str(tmp_path))
+    application = _blank_application(status="failed", application_id="app-with-no-logs")
+
+    delete(MagicMock(), application)  # must not raise

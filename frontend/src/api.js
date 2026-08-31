@@ -3,6 +3,16 @@
 
 const TOKEN_KEY = "ajagent_token";
 
+// Production uses a separate backend origin (Cloudflare Worker/Container).
+// Local development intentionally falls back to /api so Vite can proxy to
+// FastAPI without requiring CORS. VITE_API_URL is public build configuration,
+// never a secret, and should not end with a slash.
+const API_BASE_URL = (import.meta.env.VITE_API_URL || "/api").replace(/\/+$/, "");
+
+function apiUrl(path) {
+  return `${API_BASE_URL}${path.startsWith("/") ? path : `/${path}`}`;
+}
+
 export const auth = {
   getToken: () => localStorage.getItem(TOKEN_KEY),
   setToken: (t) => localStorage.setItem(TOKEN_KEY, t),
@@ -19,7 +29,7 @@ async function request(path, options = {}) {
   const token = auth.getToken();
   if (token) headers.Authorization = `Bearer ${token}`;
 
-  const res = await fetch(`/api${path}`, { ...options, headers });
+  const res = await fetch(apiUrl(path), { ...options, headers });
   let body = null;
   try {
     body = await res.json();
@@ -132,6 +142,20 @@ export const api = {
     request("/profile/automation-settings", {
       method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
     }),
+  listSiteTrustLevels: () => request("/profile/site-trust-levels"),
+  setSiteTrustLevel: (domain, trustLevel) =>
+    request(`/profile/site-trust-levels/${encodeURIComponent(domain)}`, {
+      method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ trust_level: trustLevel }),
+    }),
+  deleteSiteTrustLevel: (domain) =>
+    request(`/profile/site-trust-levels/${encodeURIComponent(domain)}`, { method: "DELETE" }),
+
+  getRetentionPolicy: () => request("/profile/retention-policy"),
+  updateRetentionPolicy: (body) =>
+    request("/profile/retention-policy", {
+      method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+    }),
+  purgeRetentionNow: () => request("/profile/retention-policy/purge-now", { method: "POST" }),
 
   listEducation: () => request("/profile/education"),
   addEducation: (body) =>
@@ -188,6 +212,8 @@ export const api = {
   approveApplication: (id) => request(`/applications/${id}/approve`, { method: "POST" }),
   rejectApplication: (id, reason) =>
     request(`/applications/${id}/reject${reason ? `?reason=${encodeURIComponent(reason)}` : ""}`, { method: "POST" }),
+  stopApplication: (id) => request(`/applications/${id}/stop`, { method: "POST" }),
+  deleteApplication: (id) => request(`/applications/${id}`, { method: "DELETE" }),
 
   // ---------- Autonomous agent (general-purpose observe/decide/act) ----------
   startAgentTask: (body) =>
@@ -222,6 +248,9 @@ export const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ code }),
     }),
+
+  // ---------- Success metrics (both automation paths) ----------
+  getMetricsSummary: () => request("/metrics/summary"),
 };
 
 /**
@@ -244,12 +273,13 @@ export const api = {
 export function openChatStream(scope, id, onEvent, { onError } = {}) {
   const token = auth.getToken();
   if (!token) return null;
-  const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
-  const url = `${proto}//${window.location.host}/api/chat/${scope}/${id}/stream?token=${encodeURIComponent(token)}`;
+  const url = new URL(apiUrl(`/chat/${scope}/${id}/stream`), window.location.origin);
+  url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+  url.searchParams.set("token", token);
 
   let socket;
   try {
-    socket = new WebSocket(url);
+    socket = new WebSocket(url.toString());
   } catch {
     onError?.();
     return null;

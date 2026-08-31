@@ -58,6 +58,7 @@ def test_map_fields_returns_one_result_per_field_in_order(monkeypatch):
         lambda db, aid: MagicMock(application_id="app-1", user_id="user-1"),
     )
     monkeypatch.setattr(automation_module.profile_repository, "get_by_user_id", lambda db, uid: MagicMock())
+    monkeypatch.setattr(automation_module.trust_level_repository, "resolve_trust_level", lambda db, uid, url: "FULL_MANUAL_REVIEW")
 
     captured = {}
 
@@ -123,14 +124,34 @@ def test_decide_calls_the_real_decide_action_with_this_applications_platform_and
 
     application = MagicMock(application_id="app-1", user_id="user-1", ats_platform="greenhouse", autopilot_enabled=True)
     monkeypatch.setattr(automation_module.application_repository, "get_by_id", lambda db, aid: application)
+    # §6.4: AUTO_SUBMIT additionally requires this job's site to be trusted —
+    # real trust-level resolution is covered by test_trust_level_repository.py;
+    # this test only needs decide() to actually consult and pass it through.
+    monkeypatch.setattr(automation_module.trust_level_repository, "resolve_trust_level", lambda db, uid, url: "TRUSTED_AUTO_SUBMIT")
 
     body = DecideRequest(application_id="app-1", overall_confidence=0.95)
     response = decide(body, user=MagicMock(user_id="user-1"), db=MagicMock())
 
-    # confidence 0.95 + public ATS (greenhouse) + autopilot on -> AUTO_SUBMIT,
-    # straight from the real decide_action(), never reimplemented here.
+    # confidence 0.95 + public ATS (greenhouse) + autopilot on + trusted site
+    # -> AUTO_SUBMIT, straight from the real decide_action(), never
+    # reimplemented here.
     assert response.action == "AUTO_SUBMIT"
     assert response.overall_confidence == 0.95
+
+
+def test_decide_never_auto_submits_on_an_untrusted_site_even_with_autopilot_on(monkeypatch):
+    """The new §6.4 condition, isolated: same setup as the test above except
+    the site's trust level, which alone is enough to block AUTO_SUBMIT."""
+    import app.api.automation as automation_module
+
+    application = MagicMock(application_id="app-1", user_id="user-1", ats_platform="greenhouse", autopilot_enabled=True)
+    monkeypatch.setattr(automation_module.application_repository, "get_by_id", lambda db, aid: application)
+    monkeypatch.setattr(automation_module.trust_level_repository, "resolve_trust_level", lambda db, uid, url: "FULL_MANUAL_REVIEW")
+
+    body = DecideRequest(application_id="app-1", overall_confidence=0.95)
+    response = decide(body, user=MagicMock(user_id="user-1"), db=MagicMock())
+
+    assert response.action != "AUTO_SUBMIT"
 
 
 def test_decide_never_auto_submits_without_autopilot_opted_in(monkeypatch):
@@ -138,6 +159,7 @@ def test_decide_never_auto_submits_without_autopilot_opted_in(monkeypatch):
 
     application = MagicMock(application_id="app-1", user_id="user-1", ats_platform="greenhouse", autopilot_enabled=False)
     monkeypatch.setattr(automation_module.application_repository, "get_by_id", lambda db, aid: application)
+    monkeypatch.setattr(automation_module.trust_level_repository, "resolve_trust_level", lambda db, uid, url: "TRUSTED_AUTO_SUBMIT")
 
     body = DecideRequest(application_id="app-1", overall_confidence=0.95)
     response = decide(body, user=MagicMock(user_id="user-1"), db=MagicMock())

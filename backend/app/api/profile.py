@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import logging
 
-from fastapi import APIRouter, Body, Depends, File, HTTPException, UploadFile
+from fastapi import APIRouter, Body, Depends, File, HTTPException, Response, UploadFile
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
@@ -28,6 +28,7 @@ from app.models.db_models import (
     VALID_GENDER_VALUES,
     VALID_LANGUAGE_PROFICIENCIES,
     VALID_REMOTE_PREFERENCES,
+    VALID_TRUST_LEVELS,
     VALID_VETERAN_STATUS_VALUES,
 )
 from app.models.profile import (
@@ -45,9 +46,15 @@ from app.models.profile import (
     MAX_EXPERIENCE_BATCH,
     ProfileResponse,
     ProfileUpsertRequest,
+    RetentionPolicyRequest,
+    RetentionPolicyResponse,
+    RetentionPurgeNowResponse,
+    SiteTrustLevelRequest,
+    SiteTrustLevelResponse,
     SkillsRequest,
 )
 from app.services import profile_repository as repo
+from app.services import retention_repository, retention_service, trust_level_repository
 from app.services.document_storage import (
     MAX_FILE_SIZE_MB,
     compute_file_hash,
@@ -362,9 +369,98 @@ def update_automation_settings(
     """The account-level autopilot kill switch: when `autopilot_globally_disabled`
     is `True`, every autopilot run for this user hard-stops (checked fresh from
     the DB at the top of every page in `ApplicationFlowManager`'s loop, fail
-    closed) regardless of any per-application `autopilot_enabled` flag."""
+    closed) regardless of any per-application `autopilot_enabled` flag.
+
+    `default_trust_level`, if given, is the §6.4 level applied to a domain
+    the FIRST time this user's automation ever sees it — validated here
+    (never trusted from the request body unchecked) before it can reach
+    `decide_action`'s auto-submit gate."""
+    if body.default_trust_level is not None and body.default_trust_level not in VALID_TRUST_LEVELS:
+        raise HTTPException(status_code=400, detail=f"Invalid trust level. Must be one of {sorted(VALID_TRUST_LEVELS)}.")
     profile = _get_owned_profile(db, user)
-    return repo.update_automation_settings(db, profile, autopilot_globally_disabled=body.autopilot_globally_disabled)
+    return repo.update_automation_settings(
+        db, profile,
+        autopilot_globally_disabled=body.autopilot_globally_disabled,
+        default_trust_level=body.default_trust_level,
+    )
+
+
+# ---------- site trust levels (§6.4) ----------
+
+@router.get("/site-trust-levels", response_model=list[SiteTrustLevelResponse])
+def list_site_trust_levels(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Every domain this user has explicitly set a trust level for — a
+    domain with no row here still has a real, effective trust level (the
+    account's `default_trust_level`), it's just not listed individually."""
+    return trust_level_repository.list_trust_levels(db, user.user_id)
+
+
+@router.put("/site-trust-levels/{domain}", response_model=SiteTrustLevelResponse)
+def set_site_trust_level(
+    domain: str,
+    body: SiteTrustLevelRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    try:
+        return trust_level_repository.set_trust_level(db, user.user_id, domain, body.trust_level)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.delete("/site-trust-levels/{domain}", status_code=204)
+def delete_site_trust_level(domain: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Removes the override — the domain reverts to the account's
+    `default_trust_level`, not to any hardcoded value."""
+    trust_level_repository.delete_trust_level(db, user.user_id, domain)
+    return Response(status_code=204)
+
+
+# ---------- data retention (§9) ----------
+
+def _policy_response(policy) -> RetentionPolicyResponse:
+    return RetentionPolicyResponse(
+        screenshot_retention_days=policy.screenshot_retention_days,
+        run_history_retention_days=policy.run_history_retention_days,
+        hitl_request_retention_days=policy.hitl_request_retention_days,
+    )
+
+
+@router.get("/retention-policy", response_model=RetentionPolicyResponse)
+def get_retention_policy(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """A user who has never customized this sees the global defaults, not a
+    404 — see `retention_repository.get_policy`."""
+    return _policy_response(retention_repository.get_policy(db, user.user_id))
+
+
+@router.put("/retention-policy", response_model=RetentionPolicyResponse)
+def update_retention_policy(
+    body: RetentionPolicyRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    for days, label in (
+        (body.screenshot_retention_days, "Screenshot"),
+        (body.run_history_retention_days, "Run history"),
+        (body.hitl_request_retention_days, "Verification-request"),
+    ):
+        if days is not None and days < 1:
+            raise HTTPException(status_code=400, detail=f"{label} retention must be at least 1 day.")
+    row = retention_repository.update_policy(
+        db, user.user_id,
+        screenshot_retention_days=body.screenshot_retention_days,
+        run_history_retention_days=body.run_history_retention_days,
+        hitl_request_retention_days=body.hitl_request_retention_days,
+    )
+    return _policy_response(row)
+
+
+@router.post("/retention-policy/purge-now", response_model=RetentionPurgeNowResponse)
+def purge_retention_now(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Runs this user's own retention windows immediately, scoped to their
+    own data only — the same purge logic the scheduled job runs for
+    everyone, see `app/services/retention_service.py`."""
+    return RetentionPurgeNowResponse(results=retention_service.run_purge_for_user(db, user.user_id))
 
 
 # ---------- documents ----------

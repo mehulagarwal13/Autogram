@@ -11,6 +11,7 @@ unencrypted phone number by bypassing this module.
 
 from __future__ import annotations
 
+import logging
 import uuid
 from datetime import datetime, timezone
 
@@ -18,6 +19,9 @@ from sqlalchemy.orm import Session
 
 from app.core.crypto import decrypt_field, encrypt_field
 from app.models.db_models import CandidateDemographics, CandidateProfile, EducationEntry, ExperienceEntry, ProfileDocument
+from automation.forms.field_mapper import FieldMapper
+
+logger = logging.getLogger(__name__)
 
 # Plaintext-facing fields that map onto encrypted columns.
 _ENCRYPTED_FIELD_MAP = {"phone": "phone_encrypted", "address": "address_encrypted"}
@@ -71,6 +75,7 @@ def profile_to_dict(profile: CandidateProfile) -> dict:
         "address": decrypt_field(profile.address_encrypted),
         "skills": profile.skills,
         "autopilot_globally_disabled": profile.autopilot_globally_disabled,
+        "default_trust_level": profile.default_trust_level,
         "created_at": profile.created_at,
         "updated_at": profile.updated_at,
     }
@@ -102,13 +107,88 @@ def update_profile(db: Session, profile: CandidateProfile, data: dict) -> Candid
     return profile
 
 
-def update_automation_settings(db: Session, profile: CandidateProfile, *, autopilot_globally_disabled: bool) -> CandidateProfile:
+#: Confidence floor for accepting a write-back — the same tier
+#: `FieldMapper.map_field` returns for a `<label>` match. A human-answered
+#: screening question is prose, not a raw field name/placeholder attribute,
+#: so only the label-confidence tier (or better) is ever reachable here.
+_WRITE_BACK_MIN_CONFIDENCE = 0.75
+
+#: Spec §13's own example list (address, phone, country, state, city,
+#: postal code, LinkedIn, portfolio) — deliberately an EXPLICIT allowlist,
+#: not "whatever `FieldMapper.map_field` can resolve": `FIELD_SYNONYMS` also
+#: maps to compliance/screening-adjacent facts (visa_status,
+#: requires_sponsorship, willing_background_check, security_clearance,
+#: current_salary, ...) that this codebase treats elsewhere as
+#: never-silently-inferred (see `CandidateProfile`'s tri-state screening
+#: fields and Profile.jsx's "never asked" default) — those must stay
+#: per-application, human-reviewed facts, never silently promoted to a
+#: permanent profile value from a single answered question.
+_WRITE_BACK_SAFE_ATTRIBUTES = frozenset({
+    "full_name", "preferred_name", "first_name", "middle_name", "last_name",
+    "email", "phone", "location", "city", "state", "postal_code", "country",
+    "address", "time_zone", "linkedin_url", "github_url", "portfolio_url",
+    "website_url", "current_company", "current_role",
+})
+
+
+def write_back_stable_answer(db: Session, user_id: str, question_text: str, value: str) -> bool:
+    """Spec §13: when a human answers a screening question that turns out to
+    be a plain contact/professional-link fact (phone, city, LinkedIn, ...)
+    rather than a one-off application-specific question, save it to the
+    candidate's profile too — so it is never re-asked on the next
+    application.
+
+    Reuses `FieldMapper.map_field`, the same classifier already used to
+    resolve an on-page field's label to a `CandidateProfile` attribute for
+    autofill — same mapping, opposite direction — but only ever ACTS on a
+    result in `_WRITE_BACK_SAFE_ATTRIBUTES` (see that constant's docstring
+    for why the full `FIELD_SYNONYMS` range is not trusted here).
+
+    Best-effort: returns `False` on no match / no profile / any failure,
+    never raises — a missed write-back is a convenience lost, not a
+    correctness problem, and must never break the HITL response that
+    triggered it."""
+    if not value or not value.strip():
+        return False
+    match = FieldMapper.map_field(label=question_text)
+    if match is None:
+        return False
+    attribute, confidence = match
+    if confidence < _WRITE_BACK_MIN_CONFIDENCE:
+        return False
+    if attribute not in _WRITE_BACK_SAFE_ATTRIBUTES:
+        return False
+    try:
+        profile = get_by_user_id(db, user_id)
+        if profile is None:
+            return False
+        update_profile(db, profile, {attribute: value.strip()})
+        return True
+    except Exception:  # noqa: BLE001 — a missed write-back must never break the caller's own response
+        logger.exception("write_back_stable_answer: failed to write %r for user %s", attribute, user_id)
+        return False
+
+
+def update_automation_settings(
+    db: Session, profile: CandidateProfile, *,
+    autopilot_globally_disabled: bool, default_trust_level: str | None = None,
+) -> CandidateProfile:
     """The account-level autopilot kill switch (PHASE2_ARCHITECTURE.md
-    Initiative 3) — deliberately its own function, not folded into
-    `update_profile`/`_apply_profile_fields`, so it can never be flipped as a
+    Initiative 3) plus, optionally, the §6.4 default trust level for
+    newly-seen sites — deliberately its own function, not folded into
+    `update_profile`/`_apply_profile_fields`, so neither can be flipped as a
     side effect of an unrelated `PATCH /profile` call. The only write path is
-    `PUT /profile/automation-settings`."""
+    `PUT /profile/automation-settings`.
+
+    `default_trust_level=None` (the default) leaves the stored value
+    unchanged — the request model makes this field optional for exactly that
+    reason, so the kill-switch-only caller this endpoint originally served
+    keeps working without having to also resend a trust level it doesn't
+    know about. Caller (the API route) is responsible for validating the
+    value against `VALID_TRUST_LEVELS` before calling this."""
     profile.autopilot_globally_disabled = autopilot_globally_disabled
+    if default_trust_level is not None:
+        profile.default_trust_level = default_trust_level
     profile.updated_at = datetime.now(timezone.utc)
     db.commit()
     db.refresh(profile)

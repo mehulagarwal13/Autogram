@@ -1,0 +1,9 @@
+# Copy to .dev.vars for `npm run dev`; never commit .dev.vars.
+DATABASE_URL=postgresql://USER:PASSWORD@HOST/DATABASE?sslmode=require
+OPENAI_API_KEY=replace-me
+ADZUNA_APP_ID=replace-me
+ADZUNA_APP_KEY=replace-me
+JWT_SECRET=replace-with-a-long-random-value
+ENCRYPTION_KEY=replace-with-a-fernet-key
+CORS_ORIGINS=http://localhost:5173
+# CORS_ORIGIN_REGEX=

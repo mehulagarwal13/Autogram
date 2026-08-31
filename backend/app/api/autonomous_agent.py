@@ -577,6 +577,7 @@ def approve_submission(task_id: str, user: User = Depends(get_current_user), db:
     if not task_repo.try_claim_for_resume(db, task, from_status="WAITING_FOR_APPROVAL"):
         raise HTTPException(status_code=409, detail=f"Task is not waiting for approval (status: {task.current_status}).")
     task_repo.approve_submission(db, task)
+    publish_task_event(task_id, "HUMAN_ACTION_COMPLETED", action="approved")
     if not signal_resume(task_id):
         start_task_background(task_id)
     return task_repo.get_by_id(db, task_id)
