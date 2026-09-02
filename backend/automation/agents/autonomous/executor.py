@@ -35,7 +35,6 @@ import re
 from playwright.sync_api import Error as PlaywrightError, Page
 
 from automation.agents.autonomous.action_semantics import (
-    SUBMIT_BUTTON_PATTERNS,
     is_submit_control_name,
 )
 from automation.agents.autonomous.actions import ActionResult, AgentAction
