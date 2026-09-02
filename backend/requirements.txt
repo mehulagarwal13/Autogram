@@ -15,12 +15,10 @@ pgvector
 apscheduler>=3.10,<4.0
 pyjwt
 email-validator
-pytest
 cryptography      # field-level encryption for candidate profile PII (phone, address)
 
 # --- Object storage (STORAGE_BACKEND=s3 — see app/services/storage/) ---
 boto3             # only actually connects to S3 when STORAGE_BACKEND=s3; harmless to install otherwise
-moto[s3]          # test-only: mocks S3 for tests/test_storage_backends.py, no real AWS calls made
 
 # --- Optional: OCR fallback for scanned/image PDFs ---
 # Uncomment the two lines below AND install the Tesseract engine binary
@@ -36,8 +34,4 @@ playwright            # Phase 2: browser automation engine (automation/browser/*
 # --- Auto-apply platform (Phase 4+, not yet wired up — see ARCHITECTURE.md) ---
 # redis               # Phase 4: apply-job queue
 # celery              # Phase 4: async worker (or arq, still under evaluation)
-# langgraph           # Phase 6: AI agent orchestration layer
-
-# --- Developer tooling (not needed at runtime) ---
-ruff              # bug-focused linting; config in ruff.toml. `ruff check .`
-mypy              # type checking, scoped to the workflow modules in mypy.ini
+# langgraph           # Phase 6: AI agent orchestration layer aws ecr lamda

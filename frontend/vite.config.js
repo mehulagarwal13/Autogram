@@ -11,7 +11,8 @@ export default defineConfig(({ mode }) => {
   return {
     plugins: [react()],
     build: {
-      // Cloudflare Pages output directory (relative to frontend/).
+      // Static output directory (relative to frontend/); the Dockerfile's nginx
+      // stage serves this.
       outDir: "dist",
     },
     test: {

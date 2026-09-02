@@ -35,7 +35,6 @@ Autogram/
 ├── frontend/           # React + Vite app
 │   └── src/{components,pages,__tests__}
 │
-├── worker/             # backend-only Cloudflare Container routing adapter
 ├── extension/          # browser extension
 ├── src/                # Remotion demo-video project (its own package.json)
 └── docker-compose.yml
@@ -62,18 +61,22 @@ there. Moving either one alone would break every import in the other.
 
 ## Deployment
 
-Production is split into two independent Cloudflare projects sourced from the
-same GitHub repository:
+Production is split into two independent services built from the same GitHub
+repository and deployed on **Railway**:
 
-- `frontend/` is a Vite SPA deployed by Cloudflare Pages (`npm run build`,
-  output `dist`). `VITE_API_URL` selects the backend origin at build time.
-- `backend/` runs as one Cloudflare Container behind the backend-only Worker in
-  `worker/`. A path-filtered GitHub Action applies migrations and deploys it.
+- `frontend/` is a Vite SPA — `frontend/Dockerfile` builds it (`npm run build`,
+  output `dist`) and serves the static files with nginx. `VITE_API_URL` selects
+  the backend origin at build time.
+- `backend/` runs as one Docker service (`backend/Dockerfile`) and accepts HTTP
+  and WebSocket traffic directly. `backend/railway.json` pins it to a single
+  replica.
 
 The backend is containerized because Playwright/Chromium, CPython native
-packages, background threads, and process-local automation sessions are not
-compatible with a native Worker rewrite. See [DEPLOYMENT.md](./DEPLOYMENT.md)
-for Pages settings, secrets, preview behavior, rollout checks, and rollback.
+packages, background threads, and process-local automation sessions need a
+long-lived container, not a serverless function.
+
+See [RAILWAY.md](./RAILWAY.md) for the full setup: services, root directories,
+secrets, CORS wiring, volumes, verification, and continuous deploys.
 
 ---
 
@@ -235,7 +238,7 @@ python -m venv venv
 venv\Scripts\activate        # Windows  (source venv/bin/activate on Linux/Mac)
 
 # 3. Dependencies
-pip install -r backend/requirements.txt
+pip install -r backend/requirements-dev.txt
 
 # 4. Configure keys
 copy backend\.env.example backend\.env
