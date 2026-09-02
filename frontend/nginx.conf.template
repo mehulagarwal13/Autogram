@@ -1,0 +1,31 @@
+# Rendered by the nginx image's envsubst entrypoint: ${PORT} is filled from the
+# environment (Railway sets it), everything else ($uri, $host) is left alone.
+server {
+    listen       ${PORT};
+    server_name  _;
+
+    root   /usr/share/nginx/html;
+    index  index.html;
+
+    # gzip text assets on the fly.
+    gzip              on;
+    gzip_types        text/plain text/css application/javascript application/json image/svg+xml;
+    gzip_min_length   1024;
+
+    # Fingerprinted build assets never change — cache them hard.
+    location /assets/ {
+        try_files $uri =404;
+        expires   1y;
+        add_header Cache-Control "public, immutable";
+    }
+
+    # SPA fallback: React Router paths must resolve to index.html on direct load
+    # and refresh (this replaces the Cloudflare Pages public/_redirects rule).
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+
+    location = /index.html {
+        add_header Cache-Control "no-cache";
+    }
+}

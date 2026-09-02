@@ -3,7 +3,7 @@
 
 const TOKEN_KEY = "ajagent_token";
 
-// Production uses a separate backend origin (Cloudflare Worker/Container).
+// Production points at the separate backend service origin (VITE_API_URL).
 // Local development intentionally falls back to /api so Vite can proxy to
 // FastAPI without requiring CORS. VITE_API_URL is public build configuration,
 // never a secret, and should not end with a slash.
