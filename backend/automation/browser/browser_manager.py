@@ -244,7 +244,16 @@ class BrowserManager:
         """The original Phase 2 path, kept for CI and headless servers: a fresh
         browser plus an empty context seeded from the encrypted storage-state
         for this (user, ATS), if any."""
-        self._browser = self._playwright.chromium.launch(headless=self.headless)
+        # The Docker image installs ONLY `chromium-headless-shell` (Dockerfile:
+        # `playwright install --only-shell`), not full Chromium. Since Playwright
+        # 1.49 a bare `chromium.launch(headless=True)` runs full Chromium in the
+        # new headless mode — absent from the image — so request the shell
+        # channel explicitly. A non-headless launch (manual_login_session) still
+        # needs full Chromium and an image that carries it.
+        self._browser = self._playwright.chromium.launch(
+            headless=self.headless,
+            channel="chromium-headless-shell" if self.headless else None,
+        )
         storage_state = self._session_store.load(self.user_id, self.ats_platform)
         self._owns_browser = True
         return (

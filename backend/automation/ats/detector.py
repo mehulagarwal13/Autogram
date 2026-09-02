@@ -178,7 +178,13 @@ def detect_ats_for_url(url: str, *, headless: bool = True) -> dict:
         return result.as_dict()
 
     with sync_playwright() as playwright:
-        browser = playwright.chromium.launch(headless=headless)
+        # `channel` mirrors BrowserManager._launch_throwaway_context: the Docker
+        # image ships only `chromium-headless-shell`, and since Playwright 1.49 a
+        # bare headless launch wants full Chromium, which isn't installed.
+        browser = playwright.chromium.launch(
+            headless=headless,
+            channel="chromium-headless-shell" if headless else None,
+        )
         try:
             page = browser.new_page()
             page.goto(url, wait_until="domcontentloaded")
