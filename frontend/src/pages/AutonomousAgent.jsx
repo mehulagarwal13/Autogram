@@ -477,6 +477,63 @@ function ActionChecklist({ actionHistory }) {
   );
 }
 
+//: The right rail of the run workspace — what the agent is working with and
+//: everything it has done — sitting alongside the conversation rather than
+//: stacked under it. Progress prefers the executor's own field tally
+//: (`application_progress`, when populated) and otherwise falls back to a
+//: verified-action count so the card is never blank on an in-flight run.
+function RunSidebar({ task }) {
+  const actions = task.action_history || [];
+  const verified = actions.filter((a) => a.success).length;
+  const documentCount = (task.uploaded_documents || []).length;
+  const { completed_fields: done, total_fields: total } = task.application_progress || {};
+  const hasFieldProgress = Number.isFinite(done) && Number.isFinite(total) && total > 0;
+  const pct = hasFieldProgress ? Math.min(100, Math.round((done / total) * 100)) : 0;
+
+  return (
+    <aside className="space-y-4">
+      <div className="card p-5">
+        <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">Progress</p>
+        {hasFieldProgress ? (
+          <>
+            <div className="mt-3 flex items-baseline justify-between">
+              <span className="text-2xl font-semibold text-slate-900">
+                {done}<span className="text-sm font-normal text-slate-400">/{total}</span>
+              </span>
+              <span className="text-xs text-slate-500">fields completed</span>
+            </div>
+            <div className="mt-2 h-1.5 w-full overflow-hidden rounded-full bg-slate-100">
+              <div className="h-full rounded-full bg-brand-gradient transition-all" style={{ width: `${pct}%` }} />
+            </div>
+          </>
+        ) : (
+          <p className="mt-3 flex items-baseline gap-1.5">
+            <span className="text-2xl font-semibold text-slate-900">{verified}</span>
+            <span className="text-xs text-slate-500">verified action{verified === 1 ? "" : "s"} so far</span>
+          </p>
+        )}
+        <dl className="mt-4 space-y-1.5 border-t border-slate-100 pt-3 text-xs">
+          <div className="flex items-center justify-between">
+            <dt className="text-slate-500">Steps taken</dt>
+            <dd className="font-medium text-slate-700">{actions.length}</dd>
+          </div>
+          <div className="flex items-center justify-between">
+            <dt className="text-slate-500">Documents available</dt>
+            <dd className="font-medium text-slate-700">{documentCount}</dd>
+          </div>
+        </dl>
+      </div>
+
+      <div className="card p-5">
+        <p className="mb-3 text-xs font-semibold uppercase tracking-wide text-slate-500">Activity</p>
+        <div className="max-h-[420px] overflow-y-auto pr-1">
+          <ActionChecklist actionHistory={task.action_history} />
+        </div>
+      </div>
+    </aside>
+  );
+}
+
 function TaskView({ taskId, toast, onBack }) {
   const [task, setTask] = useState(null);
   const [busy, setBusy] = useState(false);
@@ -615,80 +672,82 @@ function TaskView({ taskId, toast, onBack }) {
         />
       )}
 
+      {/* Operations workspace: the conversation and whatever the agent needs
+          from a human on the left; persistent run context and the audit trail
+          on the right, where they stay visible as the transcript scrolls. */}
       <div className="grid items-start gap-5 xl:grid-cols-[minmax(0,1fr)_340px]">
         <div className="min-w-0 space-y-5">
-      {status === "WAITING_FOR_HUMAN" && task.human_intervention
-        && !isSecretRequest(task.human_intervention)
-        && !["ANSWER_REQUIRED", "FILE_UPLOAD_REQUIRED"].includes(requestTypeOf(task.human_intervention)) && (
-        <InterventionCard
-          intervention={task.human_intervention}
-          busy={busy}
-          onResume={() => withBusy(() => api.resumeAgentTask(taskId))}
-          onAnswer={(question, answer) => withBusy(() => api.answerAgentTask(taskId, { question, answer }))}
-        />
-      )}
+          {status === "WAITING_FOR_HUMAN" && task.human_intervention
+            && !isSecretRequest(task.human_intervention)
+            && !["ANSWER_REQUIRED", "FILE_UPLOAD_REQUIRED"].includes(requestTypeOf(task.human_intervention)) && (
+            <InterventionCard
+              intervention={task.human_intervention}
+              busy={busy}
+              onResume={() => withBusy(() => api.resumeAgentTask(taskId))}
+              onAnswer={(question, answer) => withBusy(() => api.answerAgentTask(taskId, { question, answer }))}
+            />
+          )}
 
-      {/* The conversation for this task. Rendered for every status, not just
-          while paused: the transcript is the user's history of what the
-          automation did and asked, and hiding it once the task resumes would
-          make the one durable explanation of a run disappear exactly when
-          someone wants to look back at it. */}
-      <ChatPanel
-        scope="tasks"
-        resourceId={taskId}
-        activeRequest={
-          status === "WAITING_FOR_HUMAN" && task.human_intervention && !isSecretRequest(task.human_intervention)
-            ? task.human_intervention
-            : null
-        }
-        busy={busy}
-        documents={task.uploaded_documents || []}
-        onAttach={attachAndContinue}
-        onRespond={(answer) =>
-          withBusy(() =>
-            api.answerAgentTask(taskId, {
-              question: task.human_intervention?.message || "Autogram asked for more information.",
-              answer,
-            }),
-          )
-        }
-      />
+          {/* The conversation for this task. Rendered for every status, not just
+              while paused: the transcript is the user's history of what the
+              automation did and asked, and hiding it once the task resumes would
+              make the one durable explanation of a run disappear exactly when
+              someone wants to look back at it. */}
+          <ChatPanel
+            scope="tasks"
+            resourceId={taskId}
+            activeRequest={
+              status === "WAITING_FOR_HUMAN" && task.human_intervention && !isSecretRequest(task.human_intervention)
+                ? task.human_intervention
+                : null
+            }
+            busy={busy}
+            documents={task.uploaded_documents || []}
+            onAttach={attachAndContinue}
+            onRespond={(answer) =>
+              withBusy(() =>
+                api.answerAgentTask(taskId, {
+                  question: task.human_intervention?.message || "Autogram asked for more information.",
+                  answer,
+                }),
+              )
+            }
+          />
 
-      {status === "WAITING_FOR_APPROVAL" && (
-        <ReadyForSubmissionCard
-          task={task}
-          busy={busy}
-          onApprove={() => withBusy(() => api.approveAgentTask(taskId))}
-          onCancel={() => withBusy(() => api.cancelAgentTask(taskId))}
-        />
-      )}
+          {status === "WAITING_FOR_APPROVAL" && (
+            <ReadyForSubmissionCard
+              task={task}
+              busy={busy}
+              onApprove={() => withBusy(() => api.approveAgentTask(taskId))}
+              onCancel={() => withBusy(() => api.cancelAgentTask(taskId))}
+            />
+          )}
 
-      {status === "COMPLETED" && (
-        <div className="card border-l-4 border-l-emerald-500 p-5">
-          <p className="text-sm font-semibold text-slate-900">Application submitted</p>
-          <p className="mt-1 text-sm text-slate-600">{task.final_result?.evidence}</p>
+          {status === "COMPLETED" && (
+            <div className="card border-l-4 border-l-emerald-500 p-5">
+              <p className="text-sm font-semibold text-slate-900">Application submitted</p>
+              <p className="mt-1 text-sm text-slate-600">{task.final_result?.evidence}</p>
+            </div>
+          )}
+
+          {status === "FAILED" && (
+            <div className="card border-l-4 border-l-red-500 p-5">
+              <p className="text-sm font-semibold text-slate-900">The agent could not finish this task</p>
+              <p className="mt-1 text-sm text-slate-600">{task.error || task.final_result?.evidence}</p>
+            </div>
+          )}
+
+          {!["COMPLETED", "FAILED", "CANCELLED"].includes(status) && status !== "WAITING_FOR_APPROVAL" && (
+            <div className="flex justify-end">
+              <button onClick={() => withBusy(() => api.cancelAgentTask(taskId))} disabled={busy}
+                className="btn-secondary flex items-center gap-2 text-xs">
+                <Ban size={13} /> Cancel task
+              </button>
+            </div>
+          )}
         </div>
-      )}
 
-      {status === "FAILED" && (
-        <div className="card border-l-4 border-l-red-500 p-5">
-          <p className="text-sm font-semibold text-slate-900">The agent could not finish this task</p>
-          <p className="mt-1 text-sm text-slate-600">{task.error || task.final_result?.evidence}</p>
-        </div>
-      )}
-
-      {!["COMPLETED", "FAILED", "CANCELLED"].includes(status) && status !== "WAITING_FOR_APPROVAL" && (
-        <div className="flex justify-end">
-          <button onClick={() => withBusy(() => api.cancelAgentTask(taskId))} disabled={busy}
-            className="btn-secondary flex items-center gap-2 text-xs">
-            <Ban size={13} /> Cancel task
-          </button>
-        </div>
-      )}
-
-      <div className="card p-5">
-        <p className="mb-3 text-xs font-semibold uppercase tracking-wide text-slate-500">Steps so far</p>
-        <ActionChecklist actionHistory={task.action_history} />
+        <RunSidebar task={task} />
       </div>
     </div>
   );

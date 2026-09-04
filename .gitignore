@@ -40,6 +40,8 @@ backend/logs/
 trace.zip
 *.trace
 screenshot*.png
+task-refine*.png
+_render_*.png
 test-results/
 playwright-report/
 
