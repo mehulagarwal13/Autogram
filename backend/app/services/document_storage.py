@@ -30,10 +30,21 @@ __all__ = [
     "compute_file_hash",
     "delete_document_file",
     "save_document_file",
+    "stage_stored_file_for_agent",
+    "save_task_upload_file",
 ]
 
 STORAGE_DIR = Path("storage/documents")
 STORAGE_DIR.mkdir(parents=True, exist_ok=True)  # local-mode default; ignored under STORAGE_BACKEND=s3
+
+# Files supplied while an autonomous task is paused have a deliberately
+# different lifecycle from the user's permanent document library.  Playwright
+# needs a real local path (not an s3:// locator), and the autonomous runner is
+# currently in-process, so these are staged locally and namespaced by task.
+# The random stored name also means an untrusted browser filename is never used
+# as a path component.
+TASK_UPLOAD_DIR = Path("storage/task_uploads")
+AGENT_UPLOAD_CACHE_DIR = TASK_UPLOAD_DIR / "stored_document_cache"
 
 ALLOWED_EXTENSIONS_BY_TYPE: dict[str, set[str]] = {
     "resume": {".pdf", ".docx"},
@@ -95,6 +106,47 @@ def save_document_file(document_type: str, filename: str, content: bytes) -> tup
     stored_path = get_storage_backend().save(key, content)
 
     return document_id, stored_path
+
+
+def save_task_upload_file(
+    task_id: str, document_type: str, filename: str, content: bytes
+) -> tuple[str, str]:
+    """Validate and stage a document for one live autonomous task.
+
+    Unlike ``save_document_file``, this always produces a local path because
+    Playwright's file-input API cannot consume an object-store URI.  The path
+    is still safe to hand to the model-driven executor: it is added to that
+    task's explicit upload allowlist, and no other local path is accepted.
+    """
+    ext = validate_extension(document_type, filename)
+    validate_content(ext, content)
+
+    document_id = str(uuid.uuid4())
+    task_dir = TASK_UPLOAD_DIR / task_id
+    task_dir.mkdir(parents=True, exist_ok=True)
+    path = task_dir / f"{document_id}{ext}"
+    path.write_bytes(content)
+    return document_id, str(path.resolve())
+
+
+def stage_stored_file_for_agent(
+    cache_key: str, document_type: str, filename: str, stored_path: str
+) -> str:
+    """Materialize a stored document as a stable local Playwright upload.
+
+    Object-storage locators cannot be supplied directly to a browser file
+    input. Download through the configured storage backend and keep a local
+    runner cache; the executor still accepts only the exact path allowlisted
+    on the current task.
+    """
+    ext = validate_extension(document_type, filename)
+    content = get_storage_backend().read(stored_path)
+    validate_content(ext, content)
+
+    AGENT_UPLOAD_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    path = AGENT_UPLOAD_CACHE_DIR / f"{cache_key}{ext}"
+    path.write_bytes(content)
+    return str(path.resolve())
 
 
 def delete_document_file(stored_path: str) -> None:

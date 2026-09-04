@@ -19,11 +19,15 @@ Covers both halves of the fix:
 
 from __future__ import annotations
 
+import asyncio
+import io
 import threading
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 
 import app.api.autonomous_agent as agent_api
 import automation.agents.autonomous.loop as loop_mod
+from fastapi import UploadFile
 from automation.agents.autonomous.actions import AgentAction
 from automation.agents.autonomous.decision import Decision
 from automation.agents.autonomous.loop import AutonomousAgentLoop, TaskHandle, _uploadable_paths
@@ -75,18 +79,103 @@ def test_a_missing_file_is_not_offered(tmp_path):
     assert docs == []
 
 
-def test_an_s3_locator_is_not_offered():
-    """Under `STORAGE_BACKEND=s3`, `stored_path` is an `s3://` URI, which
-    `set_input_files` cannot upload. Offering it would turn a clean
-    "please attach it yourself" pause into a confusing browser error."""
+def test_an_s3_locator_is_materialized_before_it_is_offered(monkeypatch, tmp_path):
+    """Playwright receives a real local cache path, never an s3:// URI."""
+    local_copy = tmp_path / "materialized.pdf"
+    local_copy.write_bytes(b"%PDF-1.7 fake")
+    monkeypatch.setattr(
+        agent_api,
+        "stage_stored_file_for_agent",
+        lambda *_args: str(local_copy.resolve()),
+    )
     docs = agent_api._build_uploadable_documents(
         FakeResumeRecord(stored_path="s3://autogram-bucket/storage/resumes/abc.pdf")
     )
-    assert docs == []
+    assert docs[0]["file_path"] == str(local_copy.resolve())
+    assert docs[0]["source"] == "stored_resume"
 
 
 def test_empty_stored_path_is_not_offered():
     assert agent_api._build_uploadable_documents(FakeResumeRecord(stored_path="")) == []
+
+
+def test_public_task_response_never_exposes_upload_allowlist_paths():
+    response = agent_api.TaskResponse.model_validate({
+        "task_id": "task_1",
+        "user_id": "user_1",
+        "job_url": "https://example.com/jobs/1",
+        "original_objective": "Apply",
+        "current_status": "WAITING_FOR_HUMAN",
+        "uploaded_documents": [{
+            "document_id": "doc_1",
+            "label": "resume",
+            "original_filename": "resume.pdf",
+            "file_path": "/srv/private/storage/task_uploads/task_1/doc_1.pdf",
+            "file_hash": "internal-only",
+        }],
+    })
+
+    public_document = response.model_dump()["uploaded_documents"][0]
+    assert public_document["original_filename"] == "resume.pdf"
+    assert "file_path" not in public_document
+    assert "file_hash" not in public_document
+
+
+def test_paused_task_receives_document_and_resumes_in_one_request(monkeypatch, tmp_path):
+    task = SimpleNamespace(
+        task_id="task_1",
+        user_id="user_1",
+        current_status="WAITING_FOR_HUMAN",
+        human_intervention={"request_type": "FILE_UPLOAD_REQUIRED"},
+        uploaded_documents=[],
+    )
+
+    class Db:
+        def commit(self):
+            pass
+
+        def refresh(self, _task):
+            pass
+
+    class TaskRepo:
+        @staticmethod
+        def get_by_id(_db, task_id):
+            return task if task_id == task.task_id else None
+
+        @staticmethod
+        def try_claim_for_resume(_db, claimed_task, *, from_status):
+            assert claimed_task.current_status == from_status
+            claimed_task.current_status = "RESUMING"
+            claimed_task.human_intervention = None
+            return True
+
+    staged = tmp_path / "staged.pdf"
+    monkeypatch.setattr(agent_api, "task_repo", TaskRepo())
+    monkeypatch.setattr(
+        agent_api,
+        "save_task_upload_file",
+        lambda *_args: ("doc_1", str(staged)),
+    )
+    monkeypatch.setattr(agent_api.chat_repository, "record_user_reply", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(agent_api.audit_log_repository, "record_event", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(agent_api, "publish_task_event", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(agent_api, "signal_resume", lambda *_args: True)
+    monkeypatch.setattr(agent_api, "_resolve_active_request", lambda *_args, **_kwargs: None)
+
+    upload = UploadFile(filename="resume.pdf", file=io.BytesIO(b"%PDF-1.7 test"))
+    result = asyncio.run(agent_api.attach_task_document(
+        "task_1", upload, "resume", user=SimpleNamespace(user_id="user_1"), db=Db(),
+    ))
+
+    assert result.current_status == "RESUMING"
+    assert result.uploaded_documents == [{
+        "document_id": "doc_1",
+        "label": "resume",
+        "document_type": "resume",
+        "original_filename": "resume.pdf",
+        "file_path": str(staged),
+        "source": "task_upload",
+    }]
 
 
 # ---------------------------------------------------------------------------

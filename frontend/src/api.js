@@ -220,6 +220,12 @@ export const api = {
     request("/agent/tasks", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }),
   listAgentTasks: () => request("/agent/tasks"),
   getAgentTask: (id) => request(`/agent/tasks/${id}`),
+  attachAgentTaskDocument: (id, file, documentType = "other") => {
+    const form = new FormData();
+    form.append("file", file);
+    form.append("document_type", documentType);
+    return request(`/agent/tasks/${id}/documents`, { method: "POST", body: form });
+  },
   resumeAgentTask: (id) => request(`/agent/tasks/${id}/resume`, { method: "POST" }),
   answerAgentTask: (id, body) =>
     request(`/agent/tasks/${id}/answer`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }),

@@ -143,6 +143,38 @@ describe("workflow-aware input", () => {
     expect(screen.queryByPlaceholderText(/Type your answer/i)).toBeNull();
   });
 
+  it("offers a secure attachment control for a file-upload pause", async () => {
+    vi.spyOn(api, "getChatTranscript").mockResolvedValue([]);
+    const onAttach = vi.fn().mockResolvedValue(undefined);
+    const { container } = render(
+      <ChatPanel
+        scope="tasks"
+        resourceId="t1"
+        activeRequest={{ request_type: "FILE_UPLOAD_REQUIRED", message: "Please attach your resume." }}
+        onAttach={onAttach}
+      />,
+    );
+
+    expect(await screen.findByText("A document is required to continue")).toBeInTheDocument();
+    expect(screen.queryByPlaceholderText(/Type your answer/i)).toBeNull();
+    const file = new File(["%PDF-1.7 test"], "resume.pdf", { type: "application/pdf" });
+    await userEvent.upload(container.querySelector('input[type="file"]'), file);
+    await waitFor(() => expect(onAttach).toHaveBeenCalledWith(file, "resume"));
+  });
+
+  it("shows documents already available to the agent", async () => {
+    vi.spyOn(api, "getChatTranscript").mockResolvedValue([]);
+    render(
+      <ChatPanel
+        scope="tasks"
+        resourceId="t1"
+        documents={[{ document_id: "d1", original_filename: "mehul-resume.pdf", label: "resume" }]}
+      />,
+    );
+    expect(await screen.findByText("mehul-resume.pdf")).toBeInTheDocument();
+    expect(screen.getByText("Agent has")).toBeInTheDocument();
+  });
+
   it("hands the typed answer to the caller and clears the box", async () => {
     vi.spyOn(api, "getChatTranscript").mockResolvedValue([]);
     const onRespond = vi.fn();

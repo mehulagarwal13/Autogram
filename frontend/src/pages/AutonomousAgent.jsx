@@ -3,6 +3,7 @@ import { Link, useNavigate, useParams } from "react-router-dom";
 import {
   Bot, Loader2, Link2, FileText, ShieldAlert, CheckCircle2,
   XCircle, PlayCircle, ArrowLeft, Send, ThumbsUp, Ban, ExternalLink,
+  Paperclip, ArrowRight, Clock3, History,
 } from "lucide-react";
 import { api } from "../api";
 import VerificationModal from "../components/VerificationModal";
@@ -59,6 +60,7 @@ function StartForm({ toast, onStarted }) {
   // the run that already owns the job — a toast alone leaves the user stuck
   // wondering where it is.
   const [conflict, setConflict] = useState(null);
+  const selectedResume = resumes.find((resume) => resume.resume_id === resumeId) || resumes[0];
 
   useEffect(() => {
     api.listResumes().then((r) => setResumes(r?.resumes || [])).catch(() => {});
@@ -117,13 +119,14 @@ function StartForm({ toast, onStarted }) {
   }
 
   return (
-    <div className="card mx-auto max-w-xl p-6">
+    <div className="card mx-auto max-w-3xl p-6">
       <div className="mb-4 flex items-center gap-2.5">
         <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-brand-gradient shadow-xs">
           <Bot size={18} className="text-white" />
         </div>
         <div>
-          <h2 className="text-base font-semibold text-slate-900">Autonomous Agent</h2>
+          <p className="text-[10px] font-semibold uppercase tracking-[0.14em] text-brand-600">New agent run</p>
+          <h2 className="text-base font-semibold text-slate-900">Launch a supervised application</h2>
           <p className="text-xs text-slate-500">General-purpose: observes the page, decides, acts — no per-site scripting.</p>
         </div>
       </div>
@@ -139,12 +142,27 @@ function StartForm({ toast, onStarted }) {
       <div className="relative mb-5">
         <FileText size={15} className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
         <select className="input !pl-9" value={resumeId} onChange={(e) => setResumeId(e.target.value)}>
-          <option value="">Use my default resume</option>
+          <option value="">Use my most recent resume</option>
           {resumes.map((r) => (
             <option key={r.resume_id} value={r.resume_id}>{r.original_filename}</option>
           ))}
         </select>
       </div>
+
+      {selectedResume ? (
+        <div className="mb-5 flex items-center gap-3 rounded-xl border border-emerald-200 bg-emerald-50/70 p-3">
+          <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-white text-emerald-600 shadow-xs"><FileText size={15} /></span>
+          <div className="min-w-0 flex-1">
+            <p className="truncate text-xs font-semibold text-slate-800">{selectedResume.original_filename}</p>
+            <p className="text-[10px] text-emerald-700">Already selected — the agent will use this for context and browser uploads.</p>
+          </div>
+          <CheckCircle2 size={15} className="text-emerald-600" />
+        </div>
+      ) : (
+        <div className="mb-5 rounded-xl border border-amber-200 bg-amber-50 p-3 text-xs text-amber-800">
+          No resume is stored yet. The agent may pause if the application requires one. <Link to="/resumes" className="font-semibold underline">Add a resume</Link>
+        </div>
+      )}
 
       {/* `() => start()` deliberately, NOT `onClick={start}`: React would pass
           the click event as the first argument, which `start` would then treat
@@ -153,7 +171,7 @@ function StartForm({ toast, onStarted }) {
           normal start must never even look like an override attempt. */}
       <button onClick={() => start()} disabled={busy} className="btn-primary flex w-full items-center justify-center gap-2">
         {busy ? <Loader2 size={15} className="animate-spin" /> : <PlayCircle size={15} />}
-        Start
+        Launch agent
       </button>
 
       {conflict && (
@@ -251,6 +269,13 @@ function StartForm({ toast, onStarted }) {
         pause and ask you whenever it needs a login, CAPTCHA, or information it can't safely
         confirm on its own.
       </p>
+      <div className="mt-4 grid gap-2 border-t border-slate-100 pt-4 sm:grid-cols-3">
+        {["Resume context locked", "Human checks stay manual", "Approval before submit"].map((label) => (
+          <span key={label} className="flex items-center gap-1.5 text-[10px] font-medium text-slate-500">
+            <CheckCircle2 size={11} className="text-emerald-500" /> {label}
+          </span>
+        ))}
+      </div>
     </div>
   );
 }
@@ -297,6 +322,12 @@ const INTERVENTION_COPY = {
     instruction: "This application asks something Autogram can't answer from your profile or resume, "
       + "and it won't guess. Your answer is used for this application only.",
     browserAction: false,
+  },
+  FILE_UPLOAD_REQUIRED: {
+    title: "Document required",
+    instruction: "Attach the requested document in the conversation below. It becomes available only to this task, then the agent continues from the same page.",
+    browserAction: false,
+    attachmentAction: true,
   },
   UNKNOWN_BLOCKER: {
     title: "Autogram isn't sure how to continue",
@@ -364,7 +395,11 @@ function InterventionCard({ intervention, onResume, onAnswer, busy }) {
         </div>
       </div>
 
-      {copy.browserAction ? (
+      {copy.attachmentAction ? (
+        <div className="mt-4 flex items-center gap-2 rounded-lg border border-brand-100 bg-brand-50 px-3 py-2.5 text-xs text-brand-800">
+          <Paperclip size={14} /> Use the secure attachment control in the conversation below.
+        </div>
+      ) : copy.browserAction ? (
         <div className="mt-4">
           <button onClick={onResume} disabled={busy} className="btn-primary flex items-center gap-2">
             {busy ? <Loader2 size={14} className="animate-spin" /> : <PlayCircle size={14} />}
@@ -512,19 +547,38 @@ function TaskView({ taskId, toast, onBack }) {
     }
   }
 
+  async function attachAndContinue(file, documentType) {
+    setBusy(true);
+    try {
+      await api.attachAgentTaskDocument(taskId, file, documentType);
+      toast(`${file.name} is now available to this task.`, "success");
+      await load();
+    } catch (error) {
+      throw error;
+    } finally {
+      setBusy(false);
+    }
+  }
+
   if (!task) {
     return <div className="flex justify-center py-20"><Loader2 size={26} className="animate-spin text-brand-600" /></div>;
   }
 
   const status = task.current_status;
+  let jobHost = task.job_url;
+  try { jobHost = new URL(task.job_url).hostname.replace(/^www\./, ""); } catch { /* show the original URL */ }
 
   return (
     <div className="space-y-5">
-      <button onClick={onBack} className="flex items-center gap-1.5 text-xs text-slate-500 hover:text-slate-800">
-        <ArrowLeft size={14} /> Back
+      <button onClick={onBack} className="flex items-center gap-1.5 text-xs font-medium text-slate-500 hover:text-slate-900">
+        <ArrowLeft size={14} /> All agent runs
       </button>
 
-      <div className="card p-5">
+      <div className="card overflow-hidden">
+        <div className="border-b border-slate-100 bg-slate-50/70 px-5 py-2.5 text-[10px] font-semibold uppercase tracking-[0.14em] text-slate-400">
+          Live application workspace · {jobHost}
+        </div>
+        <div className="p-5">
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div>
             <p className="text-xs text-slate-500">Goal</p>
@@ -542,6 +596,7 @@ function TaskView({ taskId, toast, onBack }) {
           </div>
         )}
         {task.error && <p className="mt-3 text-xs text-red-600">{task.error}</p>}
+        </div>
       </div>
 
       {status === "WAITING_FOR_HUMAN" && task.human_intervention && isSecretRequest(task.human_intervention) && (
@@ -560,7 +615,11 @@ function TaskView({ taskId, toast, onBack }) {
         />
       )}
 
-      {status === "WAITING_FOR_HUMAN" && task.human_intervention && !isSecretRequest(task.human_intervention) && (
+      <div className="grid items-start gap-5 xl:grid-cols-[minmax(0,1fr)_340px]">
+        <div className="min-w-0 space-y-5">
+      {status === "WAITING_FOR_HUMAN" && task.human_intervention
+        && !isSecretRequest(task.human_intervention)
+        && !["ANSWER_REQUIRED", "FILE_UPLOAD_REQUIRED"].includes(requestTypeOf(task.human_intervention)) && (
         <InterventionCard
           intervention={task.human_intervention}
           busy={busy}
@@ -583,6 +642,8 @@ function TaskView({ taskId, toast, onBack }) {
             : null
         }
         busy={busy}
+        documents={task.uploaded_documents || []}
+        onAttach={attachAndContinue}
         onRespond={(answer) =>
           withBusy(() =>
             api.answerAgentTask(taskId, {
@@ -633,6 +694,53 @@ function TaskView({ taskId, toast, onBack }) {
   );
 }
 
+function RecentAgentRuns({ toast }) {
+  const [tasks, setTasks] = useState([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    api.listAgentTasks()
+      .then((items) => setTasks((items || []).slice(0, 6)))
+      .catch((error) => toast(error.message, "error"))
+      .finally(() => setLoading(false));
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  if (!loading && tasks.length === 0) return null;
+
+  return (
+    <section className="mx-auto max-w-3xl">
+      <div className="mb-3 flex items-center justify-between">
+        <div>
+          <h2 className="flex items-center gap-2 text-sm font-semibold text-slate-900"><History size={15} /> Recent agent runs</h2>
+          <p className="mt-0.5 text-[11px] text-slate-500">Resume any active application or review its audit trail.</p>
+        </div>
+      </div>
+      <div className="card divide-y divide-slate-100 overflow-hidden">
+        {loading ? (
+          <div className="flex items-center justify-center py-8 text-xs text-slate-500"><Loader2 size={14} className="mr-2 animate-spin" />Loading runs...</div>
+        ) : tasks.map((task) => {
+          let host = task.job_url;
+          try { host = new URL(task.job_url).hostname.replace(/^www\./, ""); } catch { /* keep raw value */ }
+          const needsAttention = ["WAITING_FOR_HUMAN", "WAITING_FOR_APPROVAL"].includes(task.current_status);
+          return (
+            <Link key={task.task_id} to={`/agent/${task.task_id}`} className="group flex items-center gap-3 px-5 py-3.5 transition-colors hover:bg-slate-50">
+              <span className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-xl ${needsAttention ? "bg-amber-50 text-amber-600" : "bg-brand-50 text-brand-600"}`}>
+                {needsAttention ? <Clock3 size={16} /> : <Bot size={16} />}
+              </span>
+              <div className="min-w-0 flex-1">
+                <p className="truncate text-sm font-semibold text-slate-800">{host}</p>
+                <p className="mt-0.5 text-[11px] text-slate-500">{task.action_history?.length || 0} verified actions</p>
+              </div>
+              <span className={`badge ${STATUS_STYLES[task.current_status] || "badge-neutral"}`}>{STATUS_LABELS[task.current_status] || task.current_status}</span>
+              <ArrowRight size={14} className="text-slate-300 transition-transform group-hover:translate-x-0.5 group-hover:text-brand-500" />
+            </Link>
+          );
+        })}
+      </div>
+    </section>
+  );
+}
+
 export default function AutonomousAgent({ toast }) {
   const { id } = useParams();
   const navigate = useNavigate();
@@ -655,6 +763,7 @@ export default function AutonomousAgent({ toast }) {
         </p>
       </div>
       <StartForm toast={toast} onStarted={(taskId) => navigate(`/agent/${taskId}`)} />
+      <RecentAgentRuns toast={toast} />
     </div>
   );
 }

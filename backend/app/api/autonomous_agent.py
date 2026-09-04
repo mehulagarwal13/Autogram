@@ -25,8 +25,8 @@ import logging
 from datetime import date, datetime
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, ConfigDict
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -45,6 +45,11 @@ from app.services import automation_ownership
 from app.services import autonomous_task_repository as task_repo
 from app.services import human_interaction_repository as human_interaction_repo
 from app.services import profile_repository, resume_repository
+from app.services.document_storage import (
+    MAX_FILE_SIZE_MB,
+    save_task_upload_file,
+    stage_stored_file_for_agent,
+)
 from app.services.event_bus import publish_task_event
 from automation.agents.autonomous.runner import (
     request_cancel,
@@ -96,6 +101,24 @@ class AnswerRequest(BaseModel):
     answer: str
 
 
+class TaskDocumentResponse(BaseModel):
+    """Public document metadata.
+
+    ``AutonomousTask.uploaded_documents`` is also the executor's local-path
+    allowlist.  Returning those absolute server paths to a browser is both
+    unnecessary and an infrastructure leak, so this narrow response model
+    intentionally drops ``file_path`` and ``file_hash``.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    document_id: str | None = None
+    label: str
+    original_filename: str
+    document_type: str | None = None
+    source: str | None = None
+
+
 class TaskResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -109,7 +132,7 @@ class TaskResponse(BaseModel):
     application_progress: dict = {}
     human_intervention: dict | None = None
     confirmed_answers: dict = {}
-    uploaded_documents: list = []
+    uploaded_documents: list[TaskDocumentResponse] = Field(default_factory=list)
     final_result: dict | None = None
     error: str | None = None
     auto_submit_approved: bool = False
@@ -254,13 +277,9 @@ def _build_uploadable_documents(resume_record: ResumeRecord | None) -> list[dict
 
     Deliberately conservative:
 
-    - Only files that resolve to an EXISTING LOCAL path are offered.
-      `ResumeRecord.stored_path` is a local path under the default
-      `STORAGE_BACKEND=local`, but an `s3://…` URI under `STORAGE_BACKEND=s3`
-      (see `app/services/file_storage.py`), and Playwright's
-      `set_input_files` cannot upload the latter. Offering it anyway would
-      turn a clean "please attach it yourself" pause into a confusing
-      mid-run browser error.
+    - Existing local files are used directly. Object-storage locators are
+      materialized through the storage abstraction into a runner-local cache,
+      because Playwright's `set_input_files` requires a filesystem path.
     - Nothing else on disk is ever added, because this list IS the
       exfiltration allowlist.
     """
@@ -268,19 +287,28 @@ def _build_uploadable_documents(resume_record: ResumeRecord | None) -> list[dict
         return []
     path = Path(str(resume_record.stored_path))
     try:
-        if not path.is_file():
-            logger.info(
-                "Autonomous task: resume %s is not an uploadable local file (%s) — the agent will "
-                "ask the human to attach it instead.",
-                resume_record.resume_id, resume_record.stored_path,
+        if path.is_file():
+            upload_path = str(path.resolve())
+        else:
+            upload_path = stage_stored_file_for_agent(
+                resume_record.resume_id,
+                "resume",
+                resume_record.original_filename,
+                str(resume_record.stored_path),
             )
-            return []
-    except OSError:  # pragma: no cover - defensive (e.g. an s3:// style value)
+    except Exception:  # noqa: BLE001 - unavailable storage must become an honest pause
+        logger.warning(
+            "Autonomous task: resume %s could not be materialized for browser upload.",
+            resume_record.resume_id,
+            exc_info=True,
+        )
         return []
     return [{
         "label": "resume",
+        "document_type": "resume",
         "original_filename": resume_record.original_filename,
-        "file_path": str(path.resolve()),
+        "file_path": upload_path,
+        "source": "stored_resume",
     }]
 
 
@@ -484,6 +512,110 @@ def list_tasks(user: User = Depends(get_current_user), db: Session = Depends(get
 @router.get("/tasks/{task_id}", response_model=TaskResponse)
 def get_task(task_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     return _get_owned_task(db, task_id, user)
+
+
+@router.post("/tasks/{task_id}/documents", response_model=TaskResponse)
+async def attach_task_document(
+    task_id: str,
+    file: UploadFile = File(...),
+    document_type: str = Form("other"),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Stage a user-supplied file for the currently paused task.
+
+    This fills the UI/API gap behind ``FILE_UPLOAD_REQUIRED``.  The upload is
+    accepted only while the task is genuinely waiting for the human, is
+    validated by extension *and* magic bytes, and becomes one more path in
+    this task's executor allowlist. The same request then claims and resumes
+    the paused task, avoiding a fragile two-request "upload, then continue"
+    sequence in the browser client.
+    """
+    task = _get_owned_task(db, task_id, user)
+    if task.current_status != "WAITING_FOR_HUMAN":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Documents can only be attached while the task is waiting for you (status: {task.current_status}).",
+        )
+    _reject_if_active_request_is_secret(task)
+
+    content = await file.read()
+    size_mb = len(content) / (1024 * 1024)
+    if size_mb > MAX_FILE_SIZE_MB:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File too large ({size_mb:.1f} MB). Max {MAX_FILE_SIZE_MB} MB.",
+        )
+    if not content:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+
+    safe_name = Path(file.filename or "document").name
+    try:
+        document_id, local_path = save_task_upload_file(
+            task_id, document_type, safe_name, content
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    entry = {
+        "document_id": document_id,
+        "label": document_type.replace("_", " "),
+        "document_type": document_type,
+        "original_filename": safe_name,
+        "file_path": local_path,
+        "source": "task_upload",
+    }
+    task.uploaded_documents = [*(task.uploaded_documents or []), entry]
+    db.commit()
+    db.refresh(task)
+
+    request_type = (task.human_intervention or {}).get("request_type")
+    try:
+        chat_repository.record_user_reply(
+            db,
+            user_id=user.user_id,
+            autonomous_task_id=task_id,
+            content=f'Attached "{safe_name}" for this application.',
+            request_type=request_type,
+        )
+    except Exception:
+        logger.exception("Task %s: could not add document attachment to transcript.", task_id)
+    try:
+        audit_log_repository.record_event(
+            db,
+            user_id=user.user_id,
+            autonomous_task_id=task_id,
+            event_type="document_attached",
+            actor=user.user_id,
+            metadata={
+                "document_id": document_id,
+                "document_type": document_type,
+                "original_filename": safe_name,
+            },
+        )
+    except Exception:
+        logger.exception("Task %s: could not audit document attachment.", task_id)
+    publish_task_event(
+        task_id,
+        "DOCUMENT_ATTACHED",
+        document_id=document_id,
+        document_type=document_type,
+    )
+    if not task_repo.try_claim_for_resume(db, task, from_status="WAITING_FOR_HUMAN"):
+        # Another tab may have resumed it between upload and claim. The file is
+        # safely attached either way; return the authoritative state instead
+        # of turning a successful upload into a misleading client error.
+        return task_repo.get_by_id(db, task_id)
+    _resolve_active_request(db, task_id)
+    publish_task_event(
+        task_id,
+        "HUMAN_ACTION_COMPLETED",
+        request_type=request_type or "FILE_UPLOAD_REQUIRED",
+        action="DOCUMENT_ATTACHED",
+    )
+    if not signal_resume(task_id):
+        start_task_background(task_id)
+    return task_repo.get_by_id(db, task_id)
 
 
 def _reject_if_active_request_is_secret(task) -> None:
