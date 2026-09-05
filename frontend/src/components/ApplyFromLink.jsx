@@ -85,8 +85,8 @@ export default function ApplyFromLink({ toast }) {
           </span>
           <h2 className="text-xl font-semibold tracking-tight text-white">Turn any job link into an application</h2>
           <p className="mt-1 max-w-2xl text-sm leading-relaxed text-slate-400">
-            Paste any job posting URL — the automation opens it, detects the ATS platform, fills the
-            application from your profile, and hands it back to you for a final review before submitting.
+            Bring a job you’re excited about. Autogram helps fill the application from your
+            saved profile and pauses according to your review settings.
           </p>
         </div>
       </div>
@@ -95,6 +95,7 @@ export default function ApplyFromLink({ toast }) {
         <input
           className="min-w-0 flex-1 rounded-xl border-0 bg-transparent px-3.5 py-3 text-sm text-slate-900 outline-none placeholder:text-slate-400 focus:ring-0"
           type="url"
+          aria-label="Job posting URL"
           placeholder="https://company.com/careers/software-engineer"
           value={jobUrl}
           onChange={(e) => setJobUrl(e.target.value)}

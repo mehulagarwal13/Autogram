@@ -51,14 +51,15 @@ export default function Metrics({ toast }) {
   if (loading) {
     return <div className="flex justify-center py-20"><Loader2 size={26} className="animate-spin text-brand-600" /></div>;
   }
-  if (!summary) return null;
+  if (!summary) return <div className="empty-state"><h1 className="page-title">Metrics unavailable</h1><p className="page-subtitle">We couldn’t load your activity. Please try again.</p><button className="btn-ghost mt-5" onClick={() => window.location.reload()}>Try again</button></div>;
 
   const { deterministic: d, autonomous: a } = summary;
 
   return (
     <div className="animate-fade-up space-y-5">
       <div>
-        <h1 className="page-title flex items-center gap-2"><Gauge size={22} className="text-brand-600" /> Success Metrics</h1>
+        <p className="page-kicker"><Gauge size={14} /> A little perspective</p>
+        <h1 className="page-title">Your progress</h1>
         <p className="page-subtitle">
           How well the automation is actually working, computed from real run history — not a target, a measurement.
         </p>

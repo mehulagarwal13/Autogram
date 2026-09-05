@@ -74,6 +74,8 @@ async function request(path, options = {}) {
 }
 
 export const api = {
+  getWorkflow: () => request("/profile/workflow"),
+  getProfileDraft: (documentId) => request(`/profile/documents/${documentId}/profile-draft`, { method: "POST" }),
   health: () => request("/health"),
 
   // Auth

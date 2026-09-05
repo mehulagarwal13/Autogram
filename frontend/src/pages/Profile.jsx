@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { useLocation, useNavigate } from "react-router-dom";
 import { Loader2, Save, Plus, Trash2, GraduationCap, Briefcase, Sparkles, UserCircle2 } from "lucide-react";
 import { api } from "../api";
 
@@ -51,6 +52,9 @@ function SectionTitle({ icon: Icon, children }) {
 }
 
 export default function Profile({ toast }) {
+  const location = useLocation();
+  const navigate = useNavigate();
+  const [reviewingDraft, setReviewingDraft] = useState(Boolean(location.state?.resumeDraft));
   const [profile, setProfile] = useState(null);
   const [exists, setExists] = useState(true);
   const [education, setEducation] = useState([]);
@@ -64,14 +68,20 @@ export default function Profile({ toast }) {
   async function load() {
     try {
       const p = await api.getProfile();
-      setProfile(p);
+      const draft = location.state?.resumeDraft || {};
+      setProfile({ ...p, ...Object.fromEntries(Object.entries(draft).filter(([key]) => !p[key])) });
       setSkillsText(Object.fromEntries(SKILL_KEYS.map((k) => [k, (p.skills?.[k] || []).join(", ")])));
       const [edu, exp] = await Promise.all([api.listEducation(), api.listExperience()]);
       setEducation(edu);
       setExperience(exp);
-    } catch {
-      setExists(false);
-      setProfile({});
+    } catch (error) {
+      if (error.status === 404) {
+        setExists(false);
+        setProfile({});
+        setSkillsText(Object.fromEntries(SKILL_KEYS.map((key) => [key, ""])));
+      } else {
+        toast(error.message, "error");
+      }
     } finally {
       setLoading(false);
     }
@@ -95,6 +105,8 @@ export default function Profile({ toast }) {
         setExists(true);
       }
       toast("Profile saved.", "success");
+      setReviewingDraft(false);
+      navigate("/profile", { replace: true, state: null });
     } catch (e) {
       toast(e.message, "error");
     } finally {
@@ -141,18 +153,25 @@ export default function Profile({ toast }) {
   }
 
   if (loading) return <div className="flex justify-center py-20"><Loader2 size={26} className="animate-spin text-brand-600" /></div>;
+  if (!profile) return <button className="btn-primary" onClick={() => { setLoading(true); load(); }}>Retry loading profile</button>;
 
   return (
     <div className="animate-fade-up space-y-5">
+      {reviewingDraft && <div className="card border-brand-200 p-4 text-sm" role="status">Review the contact details extracted from your resume, then select Save Profile. Your existing details have been kept. Experience, education, and screening answers can be added below.</div>}
       <div>
-        <h1 className="page-title">Profile</h1>
+        <p className="page-kicker">Your foundation</p>
+        <h1 className="page-title">Your master profile</h1>
         <p className="page-subtitle">
           The source of truth automation fills applications from. Nothing here is ever guessed — only what you enter or upload.
         </p>
       </div>
 
-      {FIELD_GROUPS.map((group) => (
-        <div key={group.title} className="card p-6">
+      <nav className="section-nav" aria-label="Profile sections">
+        {FIELD_GROUPS.map((group, index) => <a key={group.title} href={`#profile-section-${index}`}>{group.title}</a>)}
+        <a href="#profile-screening">Screening</a><a href="#profile-education">Education</a><a href="#profile-experience">Experience</a><a href="#profile-skills">Skills</a>
+      </nav>
+      {FIELD_GROUPS.map((group, index) => (
+        <div id={`profile-section-${index}`} key={group.title} className="card p-6">
           <SectionTitle icon={UserCircle2}>{group.title}</SectionTitle>
           <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
             {group.fields.map(([key, label, type]) => (
@@ -166,7 +185,7 @@ export default function Profile({ toast }) {
         </div>
       ))}
 
-      <div className="card p-6">
+      <div id="profile-screening" className="card p-6">
         <h2 className="mb-1 font-semibold text-slate-900">Yes/No Screening Facts</h2>
         <p className="mb-3 text-xs text-slate-500">Left blank ("never asked") until you set it — automation never guesses these.</p>
         <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
@@ -189,7 +208,7 @@ export default function Profile({ toast }) {
       </button>
 
       {/* Education */}
-      <div className="card p-6">
+      <div id="profile-education" className="card p-6">
         <SectionTitle icon={GraduationCap}>Education</SectionTitle>
         <div className="mb-4 grid gap-2 sm:grid-cols-5">
           <input className="input" placeholder="Degree" value={newEdu.degree} onChange={(e) => setNewEdu({ ...newEdu, degree: e.target.value })} />
@@ -215,7 +234,7 @@ export default function Profile({ toast }) {
       </div>
 
       {/* Experience */}
-      <div className="card p-6">
+      <div id="profile-experience" className="card p-6">
         <SectionTitle icon={Briefcase}>Work Experience</SectionTitle>
         <div className="mb-4 grid gap-2 sm:grid-cols-5">
           <input className="input" placeholder="Company" value={newExp.company_name} onChange={(e) => setNewExp({ ...newExp, company_name: e.target.value })} />
@@ -238,7 +257,7 @@ export default function Profile({ toast }) {
       </div>
 
       {/* Skills */}
-      <div className="card p-6">
+      <div id="profile-skills" className="card p-6">
         <SectionTitle icon={Sparkles}>Skills</SectionTitle>
         <div className="grid gap-3 sm:grid-cols-2">
           {SKILL_KEYS.map((k) => (

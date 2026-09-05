@@ -136,8 +136,9 @@ export default function Settings({ toast }) {
   return (
     <div className="animate-fade-up space-y-5">
       <div>
-        <h1 className="page-title">Settings</h1>
-        <p className="page-subtitle">Safety controls for the automation platform.</p>
+        <p className="page-kicker">On your terms</p>
+        <h1 className="page-title">Your controls</h1>
+        <p className="page-subtitle">Decide when Autogram helps, when it pauses, and how your data is kept.</p>
       </div>
 
       {!profile ? (

@@ -69,28 +69,31 @@ export default function Applications({ toast }) {
 
   return (
     <div className="animate-fade-up space-y-5">
-      <div>
+      <div className="page-heading">
+        <div>
         <h1 className="page-title">Applications</h1>
         <p className="page-subtitle">
           {loading ? "Loading your application history…" : `Every application the automation has ever touched — ${applications.length} total.`}
         </p>
+        </div>
+        <Link to="/#apply-from-link" className="btn-primary">New application <ArrowRight size={15} /></Link>
       </div>
 
       <div className="card overflow-hidden">
         <div className="flex flex-col gap-3 border-b border-slate-200 p-4 sm:flex-row sm:items-center">
           <div className="relative flex-1">
             <Search size={15} className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
-            <input className="input !pl-9" placeholder="Search by company or position..."
+            <input aria-label="Search applications" className="input !pl-9" placeholder="Search by company or position..."
               value={search} onChange={(e) => setSearch(e.target.value)} disabled={loading} />
           </div>
           <div className="flex flex-wrap gap-1 overflow-x-auto rounded-lg bg-slate-100 p-1">
-            <button onClick={() => setStatusFilter("")}
+            <button aria-pressed={statusFilter === ""} onClick={() => setStatusFilter("")}
               className={`shrink-0 rounded-md px-3 py-1.5 text-xs font-medium transition-colors ${
                 statusFilter === "" ? "bg-white text-slate-900 shadow-sm" : "text-slate-500 hover:text-slate-700"}`}>
               All ({applications.length})
             </button>
             {Object.entries(statusCounts).map(([status, count]) => (
-              <button key={status} onClick={() => setStatusFilter(status)}
+              <button key={status} aria-pressed={statusFilter === status} onClick={() => setStatusFilter(status)}
                 className={`shrink-0 rounded-md px-3 py-1.5 text-xs font-medium transition-colors ${
                   statusFilter === status ? "bg-white text-slate-900 shadow-sm" : "text-slate-500 hover:text-slate-700"}`}>
                 {STATUS_LABELS[status] || status} ({count})
@@ -117,6 +120,7 @@ export default function Applications({ toast }) {
             <p className="font-medium text-slate-700">
               {applications.length === 0 ? "No applications yet" : "No applications match your filters"}
             </p>
+            {applications.length === 0 ? <Link to="/#apply-from-link" className="btn-primary mt-5">Start your first application <ArrowRight size={14} /></Link> : <button className="btn-ghost mt-5" onClick={() => { setSearch(""); setStatusFilter(""); }}>Clear filters</button>}
             <p className="mt-1 max-w-sm text-xs text-slate-500">
               {applications.length === 0
                 ? 'Head to Home and use "Apply from a job link", or find a match on the Job Search page.'
@@ -125,7 +129,7 @@ export default function Applications({ toast }) {
           </div>
         ) : (
           <div className="overflow-x-auto">
-            <table className="w-full text-left text-sm">
+            <table className="w-full min-w-[720px] text-left text-sm">
               <thead>
                 <tr className="table-head-row">
                   <th className="px-5 py-2.5 font-semibold">Company</th>

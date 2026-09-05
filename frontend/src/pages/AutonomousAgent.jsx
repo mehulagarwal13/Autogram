@@ -815,7 +815,8 @@ export default function AutonomousAgent({ toast }) {
   return (
     <div className="animate-fade-up space-y-5">
       <div>
-        <h1 className="page-title">Autonomous Agent</h1>
+        <p className="page-kicker">A helping hand</p>
+        <h1 className="page-title">Your application assistant</h1>
         <p className="page-subtitle">
           Paste a job link and let the agent observe, decide, and act through the whole application —
           pausing for logins, CAPTCHAs, and anything it can't safely answer on its own.

@@ -5,7 +5,7 @@ import { api, auth } from "../api";
 const VALUE_PROPS = [
   { icon: Target, title: "AI-matched roles", desc: "Every listing scored against your resume — semantic fit, skills, and ATS keywords." },
   { icon: Sparkles, title: "Autonomous applications", desc: "Paste a job link and the agent fills the form, page by page, on its own." },
-  { icon: ShieldCheck, title: "You stay in control", desc: "Nothing submits without your review — the agent pauses for logins, CAPTCHAs, and anything uncertain." },
+  { icon: ShieldCheck, title: "You stay in control", desc: "Choose your approval settings. Step in for verification and review anything that needs your input." },
 ];
 
 export default function AuthPage({ onAuthed }) {
@@ -54,7 +54,7 @@ export default function AuthPage({ onAuthed }) {
 
         <div className="relative">
           <h1 className="text-3xl font-semibold leading-tight tracking-tight">
-            Your resume, matched against the live job market.
+            One resume.<br />A world of possibility.
           </h1>
           <p className="mt-3 max-w-md text-sm leading-relaxed text-white/75">
             Autogram sources real listings, ranks them against your profile, and drives the
@@ -117,19 +117,19 @@ export default function AuthPage({ onAuthed }) {
             <form onSubmit={submit} className="space-y-4">
               <div className="relative">
                 <Mail size={16} className="pointer-events-none absolute left-3.5 top-1/2 -translate-y-1/2 text-slate-400" />
-                <input className="input !pl-10" type="email" placeholder="you@example.com"
+                <input className="input !pl-10" type="email" placeholder="you@example.com" aria-label="Email address" required disabled={busy}
                   value={email} onChange={(e) => setEmail(e.target.value)} autoComplete="email" />
               </div>
               <div className="relative">
                 <Lock size={16} className="pointer-events-none absolute left-3.5 top-1/2 -translate-y-1/2 text-slate-400" />
-                <input className="input !pl-10" type="password"
+                <input className="input !pl-10" type="password" aria-label="Password" required minLength={mode === "signup" ? 8 : undefined} disabled={busy}
                   placeholder={mode === "signup" ? "Password (min 8 characters)" : "Password"}
                   value={password} onChange={(e) => setPassword(e.target.value)}
                   autoComplete={mode === "signup" ? "new-password" : "current-password"} />
               </div>
 
               {error && (
-                <p className="animate-fade-up rounded-lg border border-red-200 bg-red-50 px-3.5 py-2.5 text-xs text-red-700">
+                <p role="alert" className="animate-fade-up rounded-lg border border-red-200 bg-red-50 px-3.5 py-2.5 text-xs text-red-700">
                   {error}
                 </p>
               )}

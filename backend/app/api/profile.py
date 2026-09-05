@@ -67,6 +67,28 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/profile", tags=["profile"])
 
 
+@router.get("/workflow")
+def get_workflow(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Report application prerequisites from the authenticated user's saved data.
+
+    Readiness means a profile and an application resume exist; individual job
+    questions may still require the user's input during automation.
+    """
+    profile = repo.get_by_user_id(db, user.user_id)
+    documents = repo.list_documents(db, profile.profile_id, document_type="resume") if profile else []
+    resume = next((document for document in documents if document.is_default), None)
+    if resume is None and documents:
+        resume = documents[0]
+    return {
+        "profile_ready": profile is not None,
+        "resume_ready": resume is not None,
+        "ready_to_apply": profile is not None and resume is not None,
+        "resume_name": resume.original_filename if resume else None,
+        "default_trust_level": profile.default_trust_level if profile else "FULL_MANUAL_REVIEW",
+        "autopilot_disabled": bool(profile.autopilot_globally_disabled) if profile else True,
+    }
+
+
 def _get_owned_profile(db: Session, user: User) -> CandidateProfile:
     profile = repo.get_by_user_id(db, user.user_id)
     if not profile:
@@ -478,7 +500,7 @@ async def upload_document(
     `document_type` must be one of: resume, cover_letter, certificate, other.
     Use `job_type_tag` (e.g. "backend", "data-science") so the right resume
     version can later be auto-selected per job."""
-    profile = _get_owned_profile(db, user)
+    profile = repo.get_by_user_id(db, user.user_id)
 
     if document_type not in VALID_DOCUMENT_TYPES:
         raise HTTPException(status_code=400, detail=f"Invalid document_type. Must be one of {sorted(VALID_DOCUMENT_TYPES)}.")
@@ -491,7 +513,7 @@ async def upload_document(
         raise HTTPException(status_code=400, detail="Uploaded file is empty.")
 
     file_hash = compute_file_hash(content)
-    existing = repo.get_document_by_hash(db, profile.profile_id, document_type, file_hash)
+    existing = repo.get_document_by_hash(db, profile.profile_id, document_type, file_hash) if profile else None
     if existing:
         return existing
 
@@ -499,6 +521,9 @@ async def upload_document(
         _, stored_path = save_document_file(document_type, file.filename, content)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+    if profile is None:
+        profile = repo.create_profile(db, user.user_id, {})
 
     return repo.create_document(
         db=db,
@@ -518,10 +543,30 @@ def list_documents(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    profile = _get_owned_profile(db, user)
+    profile = repo.get_by_user_id(db, user.user_id)
     if document_type and document_type not in VALID_DOCUMENT_TYPES:
         raise HTTPException(status_code=400, detail=f"Invalid document_type. Must be one of {sorted(VALID_DOCUMENT_TYPES)}.")
+    if profile is None:
+        return []
     return repo.list_documents(db, profile.profile_id, document_type=document_type)
+
+
+@router.post("/documents/{document_id}/profile-draft", response_model=ProfileUpsertRequest, response_model_exclude_unset=True)
+def preview_profile_from_resume(
+    document_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    profile = _get_owned_profile(db, user)
+    document = _get_owned_document(db, document_id, profile)
+    if document.document_type != "resume":
+        raise HTTPException(status_code=400, detail="Choose a resume to build your profile.")
+    from app.services.profile_draft import draft_from_document
+    try:
+        return ProfileUpsertRequest(**draft_from_document(document))
+    except Exception:
+        logger.exception("Resume profile draft failed")
+        raise HTTPException(status_code=422, detail="We could not read details from this resume. Try another file or enter your profile manually.")
 
 
 @router.patch("/documents/{document_id}/set-default", response_model=DocumentResponse)

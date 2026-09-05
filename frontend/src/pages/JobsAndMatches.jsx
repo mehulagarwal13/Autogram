@@ -43,7 +43,7 @@ export default function JobsAndMatches({ resume, setResume, toast }) {
         </p>
       </div>
 
-      <main className="grid gap-6 lg:grid-cols-[400px_1fr]">
+      <div className="grid items-start gap-6 xl:grid-cols-[340px_minmax(0,1fr)]">
         <div className="space-y-6">
           <StepPanel step={1} title="Upload your resume" done={hasResume}>
             <UploadPanel resume={resume} setResume={setResume} toast={toast} />
@@ -67,7 +67,7 @@ export default function JobsAndMatches({ resume, setResume, toast }) {
         >
           <MatchesPanel resume={resume} toast={toast} />
         </StepPanel>
-      </main>
+      </div>
     </div>
   );
 }

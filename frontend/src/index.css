@@ -12,7 +12,7 @@ body {
   @apply text-slate-900 antialiased;
   min-height: 100vh;
   margin: 0;
-  background: #f5f7fb;
+  background: #f6f7f4;
   font-feature-settings: "cv02", "cv03", "cv04", "cv11";
 }
 
@@ -20,15 +20,13 @@ button, input, select, textarea { font: inherit; }
 button, a { -webkit-tap-highlight-color: transparent; }
 
 .app-shell {
-  background:
-    radial-gradient(circle at 94% 4%, rgba(99, 102, 241, 0.055), transparent 25rem),
-    #f5f7fb;
+  background: #f6f7f4;
 }
 
 .sidebar {
   background:
-    radial-gradient(circle at 30% 0%, rgba(99, 102, 241, 0.16), transparent 20rem),
-    #0c1222;
+    radial-gradient(circle at 30% 0%, rgba(64, 174, 147, 0.12), transparent 20rem),
+    #142823;
   box-shadow: 16px 0 40px rgba(15, 23, 42, 0.05);
 }
 
@@ -40,13 +38,14 @@ button, a { -webkit-tap-highlight-color: transparent; }
 
 .brand-mark {
   @apply flex h-9 w-9 shrink-0 items-center justify-center rounded-xl;
-  background: linear-gradient(135deg, #818cf8 0%, #5b5bd6 48%, #4338ca 100%);
-  box-shadow: 0 8px 22px rgba(79, 70, 229, 0.28), inset 0 1px 0 rgba(255,255,255,.24);
+  background: #238e76;
+  box-shadow: inset 0 1px 0 rgba(255,255,255,.24);
 }
 
 /* ---------- Surfaces ---------- */
 .card {
-  @apply rounded-2xl border border-slate-200/80 bg-white shadow-card;
+  @apply rounded-2xl border border-slate-200/80 bg-white;
+  box-shadow: 0 2px 8px rgba(20, 40, 35, .025);
 }
 
 /* Interactive card: a deliberate, subtle lift on hover — used for anything
@@ -74,11 +73,11 @@ button, a { -webkit-tap-highlight-color: transparent; }
 }
 
 .page-title {
-  @apply text-2xl font-semibold tracking-[-0.035em] text-slate-950;
+  @apply text-3xl font-semibold tracking-[-0.045em] text-slate-950 sm:text-4xl;
 }
 
 .page-subtitle {
-  @apply mt-0.5 text-sm text-slate-500;
+  @apply mt-2 max-w-2xl text-sm leading-relaxed text-slate-500;
 }
 
 /* ---------- Buttons ---------- */
@@ -111,7 +110,7 @@ button, a { -webkit-tap-highlight-color: transparent; }
 }
 
 .field-label {
-  @apply mb-1.5 block text-xs font-medium text-slate-500;
+  @apply mb-2 block text-xs font-semibold text-slate-600;
 }
 
 .select {
@@ -185,7 +184,27 @@ button, a { -webkit-tap-highlight-color: transparent; }
 ::-webkit-scrollbar-thumb { background: rgb(203 213 225); border-radius: 8px; }
 ::-webkit-scrollbar-thumb:hover { background: rgb(148 163 184); }
 
-::selection { background: rgb(224 231 255); color: rgb(49 46 129); }
+::selection { background: #d5f2e9; color: #123e36; }
+
+:focus-visible { outline: 2px solid #238e76; outline-offset: 4px; }
+html { scroll-behavior: smooth; scroll-padding-top: 100px; }
+.page-heading { @apply flex flex-wrap items-end justify-between gap-4 pb-3; }
+.page-kicker { @apply mb-3 flex items-center gap-2 text-xs font-semibold uppercase tracking-[0.16em] text-brand-600; }
+.section-nav { @apply flex flex-wrap gap-2 rounded-2xl border border-slate-200 bg-white p-3; }
+.section-nav a { @apply rounded-lg px-3 py-2 text-xs font-medium text-slate-600 transition hover:bg-brand-50 hover:text-brand-700; }
+.journey-grid { @apply grid gap-3 md:grid-cols-5; }
+.journey-step { @apply flex h-full min-w-0 items-start gap-3 rounded-xl border border-slate-100 p-4 transition hover:border-brand-200 hover:bg-brand-50/50 md:flex-col; }
+.empty-state { @apply flex flex-col items-center justify-center px-6 py-14 text-center; }
+.empty-state-icon { @apply mb-4 flex h-14 w-14 items-center justify-center rounded-2xl border border-brand-100 bg-brand-50 text-brand-600; }
+.skip-link { @apply fixed left-4 top-4 z-[100] -translate-y-24 rounded-xl bg-brand-700 px-5 py-3 text-white focus:translate-y-0; }
+.input:disabled { @apply cursor-not-allowed bg-slate-50 text-slate-500; }
+button:disabled { cursor: not-allowed; }
+dialog::backdrop { background: rgb(15 23 42 / .45); backdrop-filter: blur(4px); }
+@media (max-width: 640px) {
+  .card-header { flex-wrap: wrap; gap: 12px; }
+  .input { font-size: 16px; }
+  .card.p-6 { padding: 1.15rem; }
+}
 
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after {

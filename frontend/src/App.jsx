@@ -1,5 +1,5 @@
 import { useEffect, useState, useCallback } from "react";
-import { NavLink, Route, Routes, useLocation } from "react-router-dom";
+import { Link, NavLink, Route, Routes, useLocation } from "react-router-dom";
 import {
   CheckCircle2, AlertCircle, Info, X, LogOut, Loader2,
   Home as HomeIcon, Search, LayoutDashboard, UserCircle2, FileText, Settings as SettingsIcon,
@@ -51,6 +51,24 @@ export default function App() {
   const [toasts, setToasts] = useState([]);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const location = useLocation();
+
+  useEffect(() => {
+    setMobileMenuOpen(false);
+    window.scrollTo(0, 0);
+    const page = NAV_LINKS.find((item) => item.end ? location.pathname === item.to : location.pathname.startsWith(item.to));
+    document.title = `${page?.label || "Workspace"} · Autogram`;
+  }, [location.pathname]);
+
+  useEffect(() => {
+    if (location.hash) requestAnimationFrame(() => document.getElementById(location.hash.slice(1))?.scrollIntoView());
+  }, [location.pathname, location.hash]);
+
+  useEffect(() => {
+    if (!mobileMenuOpen) return;
+    const close = (event) => { if (event.key === "Escape") setMobileMenuOpen(false); };
+    window.addEventListener("keydown", close);
+    return () => window.removeEventListener("keydown", close);
+  }, [mobileMenuOpen]);
 
   const toast = useCallback((message, type = "info") => {
     const id = ++toastId;
@@ -121,6 +139,7 @@ export default function App() {
 
   return (
     <div className="app-shell flex min-h-screen">
+      <a href="#main-content" className="skip-link">Skip to content</a>
       {/* Sidebar */}
       <aside className="sidebar fixed inset-y-0 left-0 z-40 hidden w-[272px] flex-col lg:flex">
         <div className="flex h-[76px] items-center gap-3 border-b border-white/[0.07] px-6">
@@ -193,7 +212,7 @@ export default function App() {
       <div className="flex min-h-screen w-full flex-1 flex-col lg:pl-[272px]">
         <header className="topbar sticky top-0 z-30 flex h-[76px] items-center justify-between px-4 sm:px-8">
           <div className="flex items-center gap-3">
-            <button onClick={() => setMobileMenuOpen((value) => !value)} className="btn-icon lg:hidden" aria-label="Toggle navigation">
+            <button onClick={() => setMobileMenuOpen((value) => !value)} className="btn-icon lg:hidden" aria-label="Toggle navigation" aria-expanded={mobileMenuOpen} aria-controls="mobile-navigation">
               {mobileMenuOpen ? <PanelLeftClose size={19} /> : <Menu size={19} />}
             </button>
             <div className="flex items-center gap-2 lg:hidden">
@@ -209,6 +228,7 @@ export default function App() {
             </div>
           </div>
           <div className="flex items-center gap-2">
+            <Link to="/#apply-from-link" className="btn-primary !py-2 text-xs">+ New application</Link>
             {resume && <div className="hidden items-center gap-2 rounded-full border border-emerald-200 bg-emerald-50 px-3 py-1.5 text-[11px] font-medium text-emerald-700 sm:flex"><CheckCircle2 size={13} /> Resume ready</div>}
             <button className="hidden items-center gap-2 rounded-xl border border-slate-200 bg-white px-2.5 py-1.5 text-xs font-medium text-slate-700 shadow-xs sm:flex lg:hidden" onClick={logout} title="Log out">
               <span className="flex h-6 w-6 items-center justify-center rounded-lg bg-brand-50 font-bold text-brand-700">{user.email?.[0]?.toUpperCase()}</span>
@@ -218,7 +238,7 @@ export default function App() {
         </header>
 
         {mobileMenuOpen && (
-          <nav className="fixed inset-x-3 top-[68px] z-50 grid gap-1 rounded-2xl border border-slate-200 bg-white p-2 shadow-popover lg:hidden">
+          <nav id="mobile-navigation" aria-label="Mobile navigation" className="fixed inset-x-3 top-[76px] z-50 grid max-h-[calc(100dvh-90px)] gap-1 overflow-y-auto rounded-2xl border border-slate-200 bg-white p-2 shadow-popover lg:hidden">
             {NAV_LINKS.map(({ to, label, icon: Icon, end }) => (
               <NavLink key={to} to={to} end={end} onClick={() => setMobileMenuOpen(false)} className={({ isActive }) => `flex items-center gap-3 rounded-xl px-3 py-2.5 text-sm font-medium ${isActive ? "bg-brand-50 text-brand-700" : "text-slate-600 hover:bg-slate-50"}`}>
                 <Icon size={16} /> {label}
@@ -230,7 +250,7 @@ export default function App() {
           </nav>
         )}
 
-        <main className="mx-auto w-full max-w-[1440px] flex-1 px-4 py-7 sm:px-8 lg:px-10 lg:py-9">
+        <main id="main-content" tabIndex={-1} className="mx-auto min-w-0 w-full max-w-[1440px] flex-1 px-4 py-7 sm:px-8 lg:px-10 lg:py-9">
           <Routes>
             <Route path="/" element={<Home user={user} resume={resume} toast={toast} />} />
             <Route path="/search" element={<JobsAndMatches resume={resume} setResume={setResume} toast={toast} />} />
@@ -242,12 +262,13 @@ export default function App() {
             <Route path="/profile" element={<Profile toast={toast} />} />
             <Route path="/resumes" element={<ResumeManagement toast={toast} />} />
             <Route path="/settings" element={<Settings toast={toast} />} />
+            <Route path="*" element={<div className="empty-state"><h1 className="page-title">Page not found</h1><p className="page-subtitle">Let’s get you back to your workspace.</p><Link to="/" className="btn-primary mt-6">Back to home</Link></div>} />
           </Routes>
         </main>
       </div>
 
       {/* Toasts */}
-      <div className="fixed bottom-5 right-5 z-[60] flex w-80 flex-col gap-2.5">
+      <div aria-live="polite" className="fixed bottom-5 right-4 z-[60] flex w-80 max-w-[calc(100vw-2rem)] flex-col gap-2.5">
         {toasts.map((t) => (
           <div key={t.id}
             className="animate-slide-in relative flex items-start gap-2.5 overflow-hidden rounded-xl border border-slate-200 bg-white p-3.5 text-sm shadow-popover">
@@ -258,7 +279,7 @@ export default function App() {
               {t.type === "info" && <Info size={13} className="text-brand-600" />}
             </div>
             <span className="flex-1 pt-0.5 leading-snug text-slate-700">{t.message}</span>
-            <button onClick={() => setToasts((x) => x.filter((y) => y.id !== t.id))}
+            <button aria-label="Dismiss notification" onClick={() => setToasts((x) => x.filter((y) => y.id !== t.id))}
               className="text-slate-400 transition hover:text-slate-700">
               <X size={14} />
             </button>
